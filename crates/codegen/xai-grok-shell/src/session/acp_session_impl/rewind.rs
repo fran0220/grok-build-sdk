@@ -37,6 +37,9 @@ impl SessionActor {
             Some(ref s) => (s.prompt_texts.clone(), s.prompt_index),
             None => (vec![], 0),
         };
+        let origin_root =
+            crate::origin_runtime::resolve_root_session(self.session_info.id.0.as_ref(), None)
+                .is_some();
 
         // Build a lookup of which prompt indices have file snapshots.
         let file_meta_map: std::collections::HashMap<
@@ -76,6 +79,11 @@ impl SessionActor {
                     num_file_snapshots,
                     has_file_changes: num_file_snapshots > 0,
                     prompt_preview,
+                    origin_prompt_digest: origin_root.then(|| {
+                        crate::origin_runtime::prompt_digest(
+                            prompts.get(idx).map(String::as_str).unwrap_or_default(),
+                        )
+                    }),
                 }
             })
             .collect();

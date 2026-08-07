@@ -231,6 +231,30 @@ impl ModelsManagerBuilder {
 }
 
 impl ModelsManager {
+    /// Origin embedded boundary: install exactly the caller's catalog without
+    /// cache reads, network fetches, or bundled-model merging.
+    pub fn from_origin_fixed(
+        models: IndexMap<String, ModelEntry>,
+        auth_manager: Arc<AuthManager>,
+        cfg: config::Config,
+    ) -> Result<Self, String> {
+        let first = models
+            .keys()
+            .next()
+            .cloned()
+            .ok_or_else(|| "Origin fixed model catalog must not be empty".to_string())?;
+        validate_selectable(&cfg, &models)?;
+        let manager = Self::new(
+            Some(models.clone()),
+            models,
+            acp::ModelId::new(Arc::from(first)),
+            auth_manager,
+            cfg,
+        );
+        manager.inner.catalog.write().has_fetched_real_catalog = true;
+        Ok(manager)
+    }
+
     pub(crate) fn new(
         prefetched: Option<IndexMap<String, ModelEntry>>,
         models: IndexMap<String, ModelEntry>,

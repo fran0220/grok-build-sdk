@@ -2680,7 +2680,38 @@ pub(crate) async fn new(
     session_summary_model: String,
     registry_title_sync: Option<RegistryGeneratedTitleSync>,
 ) -> io::Result<PersistenceHandle> {
-    let root_dir = grok_home();
+    new_with_storage_root(
+        info,
+        model_id,
+        sampling_client,
+        storage_mode,
+        auth_manager,
+        relay_sync,
+        gateway,
+        session_summary_model,
+        registry_title_sync,
+        true,
+        None,
+    )
+    .await
+}
+
+/// Origin embedded boundary: persistence rooted without consulting GROK_HOME.
+pub(crate) async fn new_with_storage_root(
+    info: &Info,
+    model_id: acp::ModelId,
+    sampling_client: OaiCompatClient,
+    storage_mode: StorageMode,
+    auth_manager: Option<Arc<crate::auth::AuthManager>>,
+    relay_sync: Option<crate::relay::RelaySync>,
+    gateway: Option<GatewaySender>,
+    session_summary_model: String,
+    registry_title_sync: Option<RegistryGeneratedTitleSync>,
+    generate_session_title: bool,
+    storage_root: Option<PathBuf>,
+) -> io::Result<PersistenceHandle> {
+    // Origin embedded boundary: an injected root never consults process GROK_HOME.
+    let root_dir = storage_root.unwrap_or_else(grok_home);
     let storage: Box<dyn StorageAdapter> = Box::new(JsonlStorageAdapter::with_root(root_dir));
 
     // Initialize session in storage
@@ -2711,6 +2742,7 @@ pub(crate) async fn new(
                 crate::session::summary::SummaryConfig {
                     sampling_client,
                     model: session_summary_model,
+                    enabled: generate_session_title,
                     persistence_tx: summary_tx,
                 },
             ),
@@ -2742,6 +2774,7 @@ pub(crate) async fn new_with_explicit_dir(
     model_id: acp::ModelId,
     sampling_client: OaiCompatClient,
     session_summary_model: String,
+    generate_session_title: bool,
 ) -> io::Result<PersistenceHandle> {
     let summary_path = target_dir.join("summary.json");
     let storage: Box<dyn StorageAdapter> =
@@ -2779,6 +2812,7 @@ pub(crate) async fn new_with_explicit_dir(
                 crate::session::summary::SummaryConfig {
                     sampling_client,
                     model: session_summary_model,
+                    enabled: generate_session_title,
                     persistence_tx: summary_tx,
                 },
             ),
@@ -2888,6 +2922,7 @@ pub(crate) async fn load(
             crate::session::summary::SummaryConfig {
                 sampling_client,
                 model: session_summary_model,
+                enabled: true,
                 persistence_tx: summary_tx,
             },
         );
@@ -2927,8 +2962,10 @@ pub(crate) async fn load_light(
     gateway: Option<GatewaySender>,
     session_summary_model: String,
     registry_title_sync: Option<RegistryGeneratedTitleSync>,
+    generate_session_title: bool,
+    storage_root: Option<PathBuf>,
 ) -> io::Result<(PersistedInfoLight, PersistenceHandle)> {
-    let root_dir = grok_home();
+    let root_dir = storage_root.unwrap_or_else(grok_home);
     let storage: Box<dyn StorageAdapter> =
         Box::new(JsonlStorageAdapter::with_root(root_dir.clone()));
 
@@ -2973,6 +3010,7 @@ pub(crate) async fn load_light(
             crate::session::summary::SummaryConfig {
                 sampling_client,
                 model: session_summary_model,
+                enabled: generate_session_title,
                 persistence_tx: summary_tx,
             },
         );

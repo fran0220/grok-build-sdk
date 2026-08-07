@@ -725,6 +725,10 @@ struct RetainedResources {
 /// `resident_roster_titles`.
 type RosterDisplayCache = HashMap<String, (Option<String>, Option<String>)>;
 pub struct MvpAgent {
+    /// Origin embedded boundary: suppresses ambient Grok startup workers.
+    pub(crate) origin_embedded: bool,
+    /// Origin embedded boundary: explicit persistence root, independent of GROK_HOME.
+    storage_root: Option<PathBuf>,
     /// LEADER-SAFE(shared): `Send + Sync` mirror of per-session activity for the
     /// leader's auto-update checker, which cannot read the `!Send` maps. Expires
     /// when the actor exits. See [`crate::agent::activity::AgentActivity`].

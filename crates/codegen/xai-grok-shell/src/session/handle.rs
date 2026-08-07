@@ -91,6 +91,10 @@ pub struct SessionHandle {
     /// this seed so disabled-vendor servers rejected at ingress cannot reappear
     /// merely because on-disk attribution vanished mid-session.
     pub initial_client_mcp_servers: Vec<acp::McpServer>,
+    /// Immutable plugin snapshot used to construct this session. Embedded
+    /// Origin sessions retain their snapshot here so native descendants inherit
+    /// it without consulting ambient discovery.
+    pub plugin_registry: Option<std::sync::Arc<xai_grok_agent::plugins::PluginRegistry>>,
     /// Stable display path for forked sessions (original project path).
     ///
     /// When set, the hunk tracker extension handler rewrites worktree paths

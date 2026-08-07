@@ -224,11 +224,19 @@ pub unsafe fn install_namespace_lockdown_filter() -> std::io::Result<()> {
 }
 
 #[cfg(not(target_os = "linux"))]
+/// No-op counterpart for platforms without the Linux seccomp filter.
+///
+/// # Safety
+/// This function is a no-op on non-Linux targets.
 pub unsafe fn install_child_network_filter() -> std::io::Result<()> {
     Ok(())
 }
 
 #[cfg(not(target_os = "linux"))]
+/// No-op counterpart for platforms without the Linux seccomp filter.
+///
+/// # Safety
+/// This function is a no-op on non-Linux targets.
 pub unsafe fn install_namespace_lockdown_filter() -> std::io::Result<()> {
     Ok(())
 }

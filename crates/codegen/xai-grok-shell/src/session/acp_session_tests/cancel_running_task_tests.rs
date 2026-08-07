@@ -79,6 +79,7 @@ async fn persist_ack_waits_for_disk_flush_before_success() {
                 acp::ModelId::new("test-model"),
                 sampling_client,
                 crate::test_support::TEST_MODEL.to_owned(),
+                true,
             )
             .await
             .expect("persistence actor should start");
@@ -396,6 +397,7 @@ async fn first_turn_memory_injection_persists_to_chat_history() {
                     acp::ModelId::new("test-model"),
                     sampling_client,
                     crate::test_support::TEST_MODEL.to_owned(),
+                    true,
                 )
                 .await
                 .expect("persistence actor should start");
@@ -530,6 +532,7 @@ async fn first_turn_memory_injection_disabled_does_not_persist_to_chat_history()
                 acp::ModelId::new("test-model"),
                 sampling_client,
                 crate::test_support::TEST_MODEL.to_owned(),
+                true,
             )
             .await
             .expect("persistence actor should start");

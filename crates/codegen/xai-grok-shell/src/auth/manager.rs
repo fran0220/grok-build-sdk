@@ -285,6 +285,21 @@ enum LockOutcome {
 // ── Construction + builders ──────────────────────────────────────────
 
 impl AuthManager {
+    /// Origin embedded boundary: construct an unauthenticated manager for one exact
+    /// private path. Unlike `new`, this never consults GROK_AUTH or GROK_AUTH_PATH.
+    pub fn new_origin_embedded(auth_path: PathBuf, grok_com_config: GrokComConfig) -> Self {
+        let scope = grok_com_config.auth_scope();
+        let proxy_base_url = String::new();
+        Self::assemble(
+            None,
+            auth_path,
+            scope,
+            grok_com_config,
+            proxy_base_url,
+            Some(DiskAuthState::FileMissing),
+        )
+    }
+
     pub fn new(grok_home: &Path, grok_com_config: GrokComConfig) -> Self {
         let scope = grok_com_config.auth_scope();
         let proxy_base_url =

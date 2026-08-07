@@ -341,7 +341,7 @@ impl SessionActor {
             wire_name,
             parsed,
         )
-        .and_then(|v| v.as_object().cloned())
+        .and_then(|value| value.as_object().cloned())
     }
     #[tracing::instrument(
         name = "tools.execute",
@@ -619,7 +619,7 @@ impl SessionActor {
             Result<ToolRunResult, xai_tool_runtime::ToolError>,
             u64,
         )>();
-        let drainer = tokio::spawn(
+        let drainer = tokio::task::spawn_local(
             async move {
                 while let Some(item) = dispatch_stream.next().await {
                     if dispatch_tx.send(item).is_err() {
@@ -1045,6 +1045,21 @@ impl SessionActor {
                 return Ok(Err(ToolLoop::ToolParsingError));
             }
         };
+        // Grok 1.0.0 normally discovers MCP tools through the stable
+        // `use_tool` meta-tool. Its wire name is not itself qualified, so the
+        // older direct-name check above cannot recognize that this call needs
+        // the SDK MCP handshake. Embedded sessions are blocking by contract:
+        // finish discovery before permission classification and dispatch.
+        if self.rebuild_spec.origin_embedded
+            && matches!(
+                &tool_input,
+                ToolInput::UseTool(input) if input.tool_name.contains("__")
+            )
+            && !self.mcp_state.lock().await.is_initialized()
+        {
+            let _span = tracing::info_span!("tool.wait_mcp_init", via = "use_tool").entered();
+            self.wait_for_mcp_initialized().await;
+        }
         let access_kind = AccessKind::from(&tool_input);
         let plan_gate = plan_mode_edit_gate(&self.plan_mode.lock(), &tool_input, &access_kind);
         if plan_gate != PlanEditGate::Allow {
@@ -1709,7 +1724,7 @@ impl SessionActor {
             ),
             ToolInput::SearchReplace(sr) => {
                 let display_path = self.tool_context.cwd.join(&sr.file_path).to_path_buf();
-                let meta = if !sr.old_string.is_empty() {
+                let meta = if !self.rebuild_spec.origin_embedded && !sr.old_string.is_empty() {
                     let _span = tracing::info_span!("tool.sr_line_lookup").entered();
                     self.tool_context
                         .fs

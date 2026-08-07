@@ -309,7 +309,9 @@ impl SessionActor {
                 self.signals_handle().record_edit_and_retry();
             }
         }
-        if let Some(bash_command) = Self::extract_bash_command(&prompt_blocks) {
+        if !self.rebuild_spec.origin_embedded
+            && let Some(bash_command) = Self::extract_bash_command(&prompt_blocks)
+        {
             return self
                 .handle_direct_bash_command(prompt_id, bash_command, &prompt_blocks)
                 .await;
@@ -336,14 +338,19 @@ impl SessionActor {
         } else {
             LoopFireMode::InSession
         };
-        let prompt_blocks = match slash_commands::resolve(
-            prompt_blocks,
-            &slash_skills,
-            availability,
-            skill_rewrite,
-            &named_workflows,
-            loop_fire_mode,
-        ) {
+        let resolved_slash = if self.rebuild_spec.origin_embedded {
+            Ok(prompt_blocks)
+        } else {
+            slash_commands::resolve(
+                prompt_blocks,
+                &slash_skills,
+                availability,
+                skill_rewrite,
+                &named_workflows,
+                loop_fire_mode,
+            )
+        };
+        let prompt_blocks = match resolved_slash {
             Ok(blocks) => blocks,
             Err(SlashCommandOutcome::Builtin(action)) => {
                 let text_block =

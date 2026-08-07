@@ -203,7 +203,7 @@ impl MvpAgent {
         parent_session_id: &str,
     ) -> crate::agent::subagent::SubagentValidationContext {
         let parent_sid = acp::SessionId::new(parent_session_id);
-        let (parent_cwd, allowed_subagent_types) = {
+        let (parent_cwd, allowed_subagent_types, plugin_registry) = {
             let ps = self.resident_handle(&parent_sid);
             warn_on_missing_parent_session_for_validate_type(parent_session_id, ps.is_some());
             (
@@ -211,6 +211,7 @@ impl MvpAgent {
                     .map(|h| std::path::PathBuf::from(&h.info.cwd))
                     .unwrap_or_default(),
                 ps.as_ref().and_then(|h| h.allowed_subagent_types.clone()),
+                ps.as_ref().and_then(|h| h.plugin_registry.clone()),
             )
         };
         let (cli_agent_names, subagent_toggle) = {
@@ -222,10 +223,11 @@ impl MvpAgent {
         };
         crate::agent::subagent::SubagentValidationContext {
             parent_cwd,
-            plugin_registry: self.plugin_registry_handle.snapshot(),
+            plugin_registry,
             subagent_toggle,
             allowed_subagent_types,
             cli_agent_names,
+            origin_embedded: self.origin_embedded,
         }
     }
     /// Test-only infallible wrapper around
@@ -460,7 +462,9 @@ impl MvpAgent {
             backend_tools_enabled: self.cfg.borrow().resolve_backend_tools().value,
             respect_gitignore: self.cfg.borrow().respect_gitignore,
             path_not_found_hints: self.cfg.borrow().path_not_found_hints,
-            plugin_registry: self.plugin_registry_handle.snapshot(),
+            plugin_registry: parent_handle
+                .as_ref()
+                .and_then(|session| session.plugin_registry.clone()),
             models_manager: self.models_manager.clone(),
             file_tool_overrides: {
                 let cfg = self.cfg.borrow();

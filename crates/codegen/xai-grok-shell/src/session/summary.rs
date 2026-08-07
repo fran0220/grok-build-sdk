@@ -26,6 +26,9 @@ enum State {
 pub(crate) struct SummaryConfig {
     pub(crate) sampling_client: OaiCompatClient,
     pub(crate) model: String,
+    /// False for embedded sessions, whose host owns presentation metadata and
+    /// forbids unrequested background inference.
+    pub(crate) enabled: bool,
     /// Channel back to the persistence actor for sequential storage writes.
     /// Weak: a strong sender here would keep the actor's own channel and task alive.
     pub(crate) persistence_tx: mpsc::WeakUnboundedSender<PersistenceMsg>,
@@ -45,7 +48,11 @@ pub(crate) struct SummaryGenerator {
 impl SummaryGenerator {
     pub(crate) fn new(config: SummaryConfig) -> Self {
         Self {
-            state: State::Idle,
+            state: if config.enabled {
+                State::Idle
+            } else {
+                State::Done
+            },
             config,
         }
     }
@@ -143,4 +150,38 @@ pub(crate) fn session_info_update(
             acp::SessionInfoUpdate::new().title(title.to_owned()),
         ),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use xai_grok_test_support::MockInferenceServer;
+
+    #[tokio::test]
+    async fn disabled_generator_neither_samples_nor_generates_a_title() {
+        let server = MockInferenceServer::start().await.expect("mock server");
+        let sampling_client = OaiCompatClient::new(xai_grok_sampler::SamplerConfig {
+            api_key: Some("test-key".into()),
+            base_url: server.url(),
+            model: "test-model".into(),
+            ..Default::default()
+        })
+        .expect("sampling client");
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut generator = SummaryGenerator::new(SummaryConfig {
+            sampling_client,
+            model: "test-model".into(),
+            enabled: false,
+            persistence_tx: tx.downgrade(),
+        });
+
+        generator.update("the first embedded user prompt".into());
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        assert!(server.requests().is_empty());
+        assert!(matches!(
+            rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+    }
 }

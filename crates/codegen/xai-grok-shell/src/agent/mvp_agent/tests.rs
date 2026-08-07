@@ -1164,6 +1164,7 @@ fn make_test_handle(
         gateway_enabled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
         mcp_servers: vec![],
         initial_client_mcp_servers: vec![],
+        plugin_registry: None,
         display_cwd: None,
         feedback_manager: std::sync::Arc::new(
             crate::session::feedback_manager::FeedbackManager::local_only("test"),

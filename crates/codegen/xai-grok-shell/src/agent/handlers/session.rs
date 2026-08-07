@@ -36,6 +36,12 @@ pub(crate) async fn handle(
     match args.method.as_ref() {
         "x.ai/session/info" => handle_session_info(agent, args).await,
         "x.ai/session/close" => handle_session_close(agent, args).await,
+        "origin/session/unload" if agent.origin_embedded => {
+            handle_origin_session_unload(agent, args).await
+        }
+        "origin/session/sync" if agent.origin_embedded => {
+            handle_origin_session_sync(agent, args).await
+        }
         "x.ai/session/list" => handle_session_list(agent, args).await,
         "x.ai/sessions/list" => handle_roster_list(agent, args).await,
         m if m.starts_with("x.ai/session_summaries/") => {
@@ -43,6 +49,54 @@ pub(crate) async fn handle(
         }
         _ => Err(acp::Error::method_not_found()),
     }
+}
+
+async fn handle_origin_session_sync(
+    agent: &MvpAgent,
+    args: &acp::ExtRequest,
+) -> Result<acp::ExtResponse, acp::Error> {
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct SyncRequest {
+        session_id: String,
+    }
+    let req: SyncRequest = serde_json::from_str(args.params.get())
+        .map_err(|e| acp::Error::invalid_params().data(format!("invalid params: {e}")))?;
+    agent
+        .flush_session(&acp::SessionId::new(req.session_id))
+        .await
+        .map_err(|reason| acp::Error::internal_error().data(reason))?;
+    crate::extensions::to_raw_response(&serde_json::json!({ "success": true }))
+}
+
+/// Origin's embedded host unloads resident resources without semantically
+/// completing or deleting the durable Grok session.
+async fn handle_origin_session_unload(
+    agent: &MvpAgent,
+    args: &acp::ExtRequest,
+) -> Result<acp::ExtResponse, acp::Error> {
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct UnloadRequest {
+        session_id: String,
+    }
+
+    let req: UnloadRequest = serde_json::from_str(args.params.get())
+        .map_err(|e| acp::Error::invalid_params().data(format!("invalid params: {e}")))?;
+    let sid = acp::SessionId::new(req.session_id);
+    if !agent.is_resident(&sid) {
+        return Err(acp::Error::resource_not_found(Some(
+            "session is not resident".into(),
+        )));
+    }
+    let drained = agent
+        .unload_session(&sid)
+        .await
+        .map_err(|reason| acp::Error::internal_error().data(reason))?;
+    crate::extensions::to_raw_response(&serde_json::json!({
+        "success": true,
+        "drained": drained,
+    }))
 }
 
 /// `x.ai/sessions/list` — the FleetView roster. Returns every

@@ -466,6 +466,12 @@ impl MvpAgent {
     /// walk once; per-session `build_for_cwd` still re-resolves project-scoped
     /// plugins for each session's own cwd.
     pub(super) fn ensure_plugin_registry(&self) {
+        if self.origin_embedded {
+            // Embedded sessions receive a construction-time registry and never
+            // scan ambient project, user, Claude, marketplace, or install roots.
+            self.plugin_registry_initialized.set(true);
+            return;
+        }
         if self.plugin_registry_initialized.replace(true) {
             return;
         }
@@ -496,6 +502,15 @@ impl MvpAgent {
         Vec<acp::McpServer>,
         Option<chrono::DateTime<chrono::Utc>>,
     ) {
+        if self.origin_embedded {
+            if !client_servers.is_empty() {
+                tracing::warn!(
+                    count = client_servers.len(),
+                    "dropping external MCP transports at the Origin embedded boundary"
+                );
+            }
+            return (Vec::new(), Vec::new(), None);
+        }
         self.ensure_plugin_registry();
         let managed = self.get_managed_mcp_configs().await;
         let expires_at = managed.iter().filter_map(|c| c.token_expires_at).min();
@@ -2434,6 +2449,35 @@ impl MvpAgent {
         auth_manager: Arc<AuthManager>,
         models_manager: crate::agent::models::ModelsManager,
     ) -> Self {
+        Self::with_models_mode(gateway, cfg, auth_manager, models_manager, None)
+    }
+
+    /// Origin embedded boundary: construct from fixed models without reading
+    /// process config or starting unrelated Grok startup workers.
+    pub fn with_origin_embedded_models(
+        gateway: GatewaySender,
+        cfg: &AgentConfig,
+        auth_manager: Arc<AuthManager>,
+        models_manager: crate::agent::models::ModelsManager,
+        storage_root: PathBuf,
+    ) -> Self {
+        Self::with_models_mode(
+            gateway,
+            cfg,
+            auth_manager,
+            models_manager,
+            Some(storage_root),
+        )
+    }
+
+    fn with_models_mode(
+        gateway: GatewaySender,
+        cfg: &AgentConfig,
+        auth_manager: Arc<AuthManager>,
+        models_manager: crate::agent::models::ModelsManager,
+        storage_root: Option<PathBuf>,
+    ) -> Self {
+        let origin_embedded = storage_root.is_some();
         models_manager.set_gateway(gateway.clone());
         let sampling_config = models_manager.sampling_config();
         if !cfg.grok_com_config.api_key_auth_disabled() {
@@ -2444,17 +2488,24 @@ impl MvpAgent {
                     byok_from_models(&models, None, current.0.as_ref()),
                 );
         }
-        crate::upload::trace::spawn_purge_stale_upload_scratch();
+        if !origin_embedded {
+            crate::upload::trace::spawn_purge_stale_upload_scratch();
+        }
         let storage_mode = cfg.storage_mode;
         let default_yolo_mode = cfg.default_yolo_mode;
         let default_auto_mode = cfg.default_auto_mode;
         let tui_mode = cfg.mode == crate::agent::config::AgentMode::Tui;
-        let relay_config_enabled = crate::util::config::load_relay_sync_enabled_sync();
+        let relay_config_enabled = !origin_embedded
+            && crate::util::config::load_relay_sync_enabled_sync();
         let has_xai_auth = auth_manager
             .current_or_expired()
             .is_some_and(|a| a.is_xai_auth());
         let relay_sync_enabled = tui_mode && relay_config_enabled && has_xai_auth;
-        let config_root = crate::config::load_effective_config().ok();
+        let config_root = if origin_embedded {
+            None
+        } else {
+            crate::config::load_effective_config().ok()
+        };
         let empty_config = toml::Value::Table(toml::map::Map::new());
         let raw = config_root.as_ref().unwrap_or(&empty_config);
         let (worktree_type, wt_source) = crate::util::config::resolve_worktree_type(
@@ -2492,6 +2543,8 @@ impl MvpAgent {
         let (subagent_event_tx, subagent_event_rx) = tokio::sync::mpsc::unbounded_channel();
         let activity = crate::agent::activity::AgentActivity::default();
         let instance = Self {
+            origin_embedded,
+            storage_root,
             activity,
             session_registry: SessionRegistry::default(),
             resident_roster_titles: RefCell::new(HashMap::new()),
@@ -2510,7 +2563,7 @@ impl MvpAgent {
                 let chat_modes = crate::agent::chat_modes::ChatModesManager::new(
                     auth_manager.clone(),
                 );
-                if crate::agent::chat_modes::process_chat_mode_enabled() {
+                if !origin_embedded && crate::agent::chat_modes::process_chat_mode_enabled() {
                     chat_modes.warm_in_background();
                 }
                 chat_modes
@@ -2596,17 +2649,17 @@ impl MvpAgent {
             #[cfg(test)]
             post_auth_settings_spawn_count: std::cell::Cell::new(0),
         };
-        instance
-            .auth_manager
-            .configure_refresher(
+        if !origin_embedded {
+            instance.auth_manager.configure_refresher(
                 instance.cfg.borrow().grok_com_config.auth_provider_command.clone(),
                 instance.diagnostic_upload_config(),
             );
-        crate::auth::credential_provider::wire_otel_auth_manager(
-            instance.auth_manager.clone(),
-        );
-        if let Some(ref dk) = instance.cfg.borrow().endpoints.deployment_key {
-            crate::auth::credential_provider::wire_otel_deployment_key(dk.clone());
+            crate::auth::credential_provider::wire_otel_auth_manager(
+                instance.auth_manager.clone(),
+            );
+            if let Some(ref dk) = instance.cfg.borrow().endpoints.deployment_key {
+                crate::auth::credential_provider::wire_otel_deployment_key(dk.clone());
+            }
         }
         instance
     }
@@ -2728,20 +2781,21 @@ impl MvpAgent {
     ///
     /// Uses async polling (never blocks the `LocalSet` runtime) with a 5s deadline
     /// to handle slow shutdowns (e.g., embedding API timeouts).
-    pub(super) async fn drain_old_session_thread(&self, session_id: &acp::SessionId) {
-        self.drain_old_session_thread_within(session_id, DRAIN_OLD_THREAD_WAIT).await;
+    pub(super) async fn drain_old_session_thread(&self, session_id: &acp::SessionId) -> bool {
+        self.drain_old_session_thread_within(session_id, DRAIN_OLD_THREAD_WAIT)
+            .await
     }
     /// [`Self::drain_old_session_thread`] under a caller-supplied budget.
     pub(super) async fn drain_old_session_thread_within(
         &self,
         session_id: &acp::SessionId,
         budget: std::time::Duration,
-    ) {
+    ) -> bool {
         match self.session_registry.thread_is_finished(session_id) {
-            None => return,
+            None => return true,
             Some(true) => {
                 self.session_registry.clear_thread(session_id);
-                return;
+                return true;
             }
             Some(false) => {}
         }
@@ -2752,25 +2806,24 @@ impl MvpAgent {
         let deadline = tokio::time::Instant::now() + budget;
         loop {
             match self.session_registry.thread_is_finished(session_id) {
-                None => return,
+                None => return true,
                 Some(true) => {
                     self.session_registry.clear_thread(session_id);
                     tracing::debug!(
                         session_id = %session_id.0,
                         "Old session thread finished cleanly"
                     );
-                    return;
+                    return true;
                 }
                 Some(false) => {}
             }
             if tokio::time::Instant::now() >= deadline {
-                tracing::warn!(
+                tracing::error!(
                     session_id = %session_id.0,
                     budget_ms = budget.as_millis() as u64,
-                    "Old session thread still running at the drain budget; proceeding. \
-                     Session data may be incomplete if the old actor is still writing."
+                    "Old session thread still running at the drain budget"
                 );
-                return;
+                return false;
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
@@ -4254,6 +4307,7 @@ impl MvpAgent {
         tool_ctx.monitor_event_buffer = Some(self.monitor_event_buffer.clone());
         tool_ctx.subagent_depth = 0;
         tool_ctx.auto_wake_enabled = self.cfg.borrow().auto_wake_enabled;
+        tool_ctx.origin_embedded = self.origin_embedded;
         let support_permission = self.cfg.borrow().features.support_permission;
         let telemetry_enabled = self.product_analytics_enabled();
         let origin_client = self.origin_client_info_from_meta(init.meta.as_ref());
@@ -4316,11 +4370,18 @@ impl MvpAgent {
         );
         let skills = self.cfg.borrow().skills.clone();
         let compat = self.cfg.borrow().compat_resolved;
-        let acp_agent_profile = parse_agent_profile_from_meta(session_meta);
+        let acp_agent_profile = (!self.origin_embedded)
+            .then(|| parse_agent_profile_from_meta(session_meta))
+            .flatten();
         let session_default_agent_profile = acp_agent_profile
             .as_ref()
             .map(|d| d.name.clone());
-        let mut agent_definition = {
+        let mut agent_definition = if self.origin_embedded {
+            // The embedding host selects one generic native harness. Ambient
+            // env, project agent files, and transport metadata must not swap
+            // prompts or toolsets underneath Forge's fixed policy.
+            xai_grok_agent::AgentDefinition::default_grok_build()
+        } else {
             let cfg = self.cfg.borrow();
             Self::resolve_agent_definition(
                 cwd.as_path(),
@@ -4343,6 +4404,10 @@ impl MvpAgent {
                     "cli agent overrides applied"
                 );
             }
+        }
+        if self.origin_embedded {
+            agent_definition.agents_md = false;
+            agent_definition.discover_skills = false;
         }
         let pinned_model: Option<(acp::ModelId, ModelEntry)> = match &agent_definition
             .model
@@ -4403,7 +4468,8 @@ impl MvpAgent {
                 agent_definition.override_file_tools(file_tools);
             }
         }
-        let lsp_tools_enabled = self.cfg.borrow().resolve_lsp_tools().value;
+        let lsp_tools_enabled = !self.origin_embedded
+            && self.cfg.borrow().resolve_lsp_tools().value;
         if lsp_tools_enabled && tool_ctx.lsp.is_none() {
             let snapshot = self.plugin_registry_handle.snapshot();
             let active: Vec<_> = snapshot
@@ -4497,11 +4563,33 @@ impl MvpAgent {
             .cfg
             .borrow()
             .workflow_max_concurrent_agents;
+        let session_cwd = std::path::Path::new(&session_info.cwd);
+        let session_plugin_registry = if self.origin_embedded {
+            // Today's generic Forge baseline has no Product Plugin activation.
+            // Keep an explicit immutable snapshot so descendants inherit the
+            // same authority without falling back to the ambient shared handle.
+            Some(std::sync::Arc::new(
+                xai_grok_agent::plugins::PluginRegistry::empty(),
+            ))
+        } else {
+            let disk_cfg =
+                crate::config::resolve_effective_plugins_config(session_cwd).to_discovery_config();
+            self.plugin_registry_handle.refresh_and_build_for_cwd(
+                session_cwd,
+                &disk_cfg,
+                &parse_session_plugin_dirs(session_meta),
+                folder_trust::project_scope_allowed(session_cwd),
+            )
+        };
         let ask_user_question_enabled = crate::upload::turn::parse_ask_user_question_from_meta(
                 session_meta,
             )
             .unwrap_or_else(|| self.cfg.borrow().resolve_ask_user_question().value);
-        let client_hooks = crate::extensions::hooks::parse_client_hooks(session_meta);
+        let client_hooks = if self.origin_embedded {
+            crate::extensions::hooks::ClientHooks::default()
+        } else {
+            crate::extensions::hooks::parse_client_hooks(session_meta)
+        };
         let disable_web_search = self.cfg.borrow().disable_web_search;
         let todo_gate = self.cfg.borrow().todo_gate;
         let remote_settings_for_spawn = self.cfg.borrow().remote_settings.clone();
@@ -4653,7 +4741,6 @@ impl MvpAgent {
                 .as_ref()
                 .and_then(|m| m.get("x.ai/gitHeadChanged"))
                 .and_then(|v| v.as_bool());
-            let session_cwd = std::path::Path::new(&session_info.cwd);
             let fs_watch_caps = crate::session::fs_watch::FsWatchCapabilities::resolve(crate::session::fs_watch::CapabilityInputs {
                 client_notify: fs_notify_config.is_some(),
                 hunk_tracking: hunk_plan.enabled(),
@@ -4749,20 +4836,8 @@ impl MvpAgent {
                     respect_gitignore,
                     path_not_found_hints,
                     tool_params_json,
-                    {
-                        let disk_cfg = crate::config::resolve_effective_plugins_config(
-                                session_cwd,
-                            )
-                            .to_discovery_config();
-                        self.plugin_registry_handle
-                            .refresh_and_build_for_cwd(
-                                session_cwd,
-                                &disk_cfg,
-                                &parse_session_plugin_dirs(session_meta),
-                                folder_trust::project_scope_allowed(session_cwd),
-                            )
-                    },
-                    Some(self.plugin_registry_handle.clone()),
+                    session_plugin_registry,
+                    (!self.origin_embedded).then(|| self.plugin_registry_handle.clone()),
                     self.models_manager.clone(),
                     None,
                     None,

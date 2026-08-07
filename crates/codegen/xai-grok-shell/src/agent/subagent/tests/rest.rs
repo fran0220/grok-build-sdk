@@ -2730,13 +2730,17 @@ fn resolve_inherited_pool_missing_parent_returns_none() {
 #[test]
 fn plugin_agents_inherit_parent_mcp_pool_by_default() {
     assert!(
-            !super::agent_owned_mcp_servers_allowed(true),
+            !super::agent_owned_mcp_servers_allowed(true, false),
             "plugin agents must not declare agent-owned mcpServers"
         );
     assert!(
-            super::agent_owned_mcp_servers_allowed(false),
+            super::agent_owned_mcp_servers_allowed(false, false),
             "non-plugin agents may declare agent-owned mcpServers"
         );
+    assert!(
+        !super::agent_owned_mcp_servers_allowed(false, true),
+        "Origin embedded agents must not launch their own MCP transports"
+    );
     let pool = make_pool(&["atlassian", "github"]);
     let inherited = super::resolve_inherited_mcp_pool(
             Some(pool),

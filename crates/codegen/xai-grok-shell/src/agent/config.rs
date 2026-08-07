@@ -1327,6 +1327,10 @@ pub struct ShellEnvironmentPolicyKnownKeys {
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Config {
+    /// True only for the in-process Origin boundary. This is runtime state,
+    /// never user configuration, and is propagated to native subagents.
+    #[serde(skip)]
+    pub origin_embedded: bool,
     pub features: Features,
     /// `[goal]` section: canonical `/goal` configuration. See [`GoalConfig`].
     #[serde(default)]
@@ -1786,8 +1790,16 @@ impl Default for RepoChangesDedupConfig {
 }
 impl Default for Config {
     fn default() -> Self {
+        let mut cfg = Self::defaults_without_env();
+        cfg.apply_env_overrides();
+        cfg
+    }
+}
+impl Config {
+    fn defaults_without_env() -> Self {
         let endpoints = EndpointsConfig::default();
-        let mut cfg = Self {
+        Self {
+            origin_embedded: false,
             features: Features::default(),
             goal: GoalConfig::default(),
             workflows: WorkflowsConfig::default(),
@@ -1881,9 +1893,69 @@ impl Default for Config {
             session_summary_model: None,
             image_description_model: None,
             prompt_suggest_model_pin: crate::config::PromptSuggestModelPin::Unpinned,
-        };
-        cfg.apply_env_overrides();
+        }
+    }
+
+    /// Origin embedded boundary: deterministic defaults with all optional
+    /// startup/network products disabled and no environment override pass.
+    pub fn origin_embedded() -> Self {
+        let mut cfg = Self::defaults_without_env();
+        cfg.origin_embedded = true;
+        cfg.features.telemetry = Some(TelemetryMode::Disabled);
+        cfg.features.feedback = Some(false);
+        cfg.features.managed_config = Some(false);
+        cfg.features.web_fetch = Some(false);
+        cfg.features.session_recap = Some(false);
+        cfg.features.turn_summary = Some(false);
+        cfg.telemetry.trace_upload = Some(false);
+        cfg.workflows.enabled = Some(false);
+        cfg.cli.auto_update = Some(false);
+        cfg.disable_web_search = true;
+        cfg.cli_no_memory = true;
+        cfg.memory_config = None;
+        cfg.managed_mcps_enabled = false;
+        cfg.managed_mcp_gateway_tools_enabled = false;
+        cfg.auto_wake_enabled = false;
+        cfg.remote_settings = None;
+        cfg.announcements.clear();
+        cfg.marketplace.sources.clear();
+        // Origin fixes one generic Grok Build harness. Its native toolset runs
+        // unrestricted under the launching OS user's authority.
+        cfg.agent.name = Some("grok-build".into());
         cfg
+    }
+}
+
+#[cfg(test)]
+mod origin_embedded_tests {
+    use super::*;
+
+    #[test]
+    fn origin_embedded_disables_ambient_products() {
+        let cfg = Config::origin_embedded();
+        assert!(cfg.origin_embedded);
+        assert_eq!(cfg.features.telemetry, Some(TelemetryMode::Disabled));
+        assert_eq!(cfg.features.feedback, Some(false));
+        assert_eq!(cfg.features.managed_config, Some(false));
+        assert_eq!(cfg.features.web_fetch, Some(false));
+        assert_eq!(cfg.features.session_recap, Some(false));
+        assert_eq!(cfg.features.turn_summary, Some(false));
+        assert_eq!(cfg.telemetry.trace_upload, Some(false));
+        assert!(cfg.disable_web_search);
+        assert!(!cfg.managed_mcps_enabled);
+        assert!(!cfg.auto_wake_enabled);
+        assert!(cfg.marketplace.sources.is_empty());
+        assert_eq!(cfg.workflows.enabled, Some(false));
+        assert_eq!(cfg.agent.name.as_deref(), Some("grok-build"));
+        assert!(cfg.cli_agent_overrides.tools.is_none());
+    }
+
+    #[test]
+    fn normal_defaults_keep_normal_startup_gates() {
+        let cfg = Config::default();
+        assert!(cfg.managed_mcps_enabled);
+        assert!(cfg.auto_wake_enabled);
+        assert!(!cfg.disable_web_search);
     }
 }
 /// Config paths read by raw-layer resolvers, not [`Config`] serde fields, so
@@ -4387,7 +4459,7 @@ impl ModelEntry {
     pub fn info(&self) -> &ModelInfo {
         &self.info
     }
-    pub(crate) fn from_config_entry(entry: &ModelEntryConfig) -> Self {
+    pub fn from_config_entry(entry: &ModelEntryConfig) -> Self {
         Self {
             info: ModelInfo::from_config(entry),
             api_key: entry.api_key.clone(),

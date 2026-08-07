@@ -335,10 +335,18 @@ pub(crate) async fn spawn_session_actor(
         mcp_servers.len()
     );
     let _ = support_permission;
-    let owns_permission_manager = inherited_permission_handle.is_none();
-    let (permissions, permission_events_rx, deny_read_globs) = if let Some(handle) =
-        inherited_permission_handle
-    {
+    let owns_permission_manager =
+        !tool_context.origin_embedded && inherited_permission_handle.is_none();
+    let (permissions, permission_events_rx, deny_read_globs) = if tool_context.origin_embedded {
+        // Embedded Grok runs with the launching OS user's authority. Do not
+        // construct the CLI permission actor or consult ambient policy.
+        let (_dummy_tx, dummy_rx) = mpsc::unbounded_channel::<PermissionEvent>();
+        (
+            xai_grok_workspace::permission::PermissionHandle::allow_all(),
+            dummy_rx,
+            Vec::new(),
+        )
+    } else if let Some(handle) = inherited_permission_handle {
         let (_dummy_tx, dummy_rx) = mpsc::unbounded_channel::<PermissionEvent>();
         let deny_read_globs = handle.deny_read_globs();
         (handle, dummy_rx, deny_read_globs)
@@ -418,6 +426,8 @@ pub(crate) async fn spawn_session_actor(
         } else {
             None
         };
+        let remember_tool_approvals = crate::util::config::remember_tool_approvals_from_disk();
+        let auto_permission_mode = crate::util::config::auto_permission_mode_enabled_from_disk();
         let (permissions, permission_events_rx) =
             xai_grok_workspace::permission::spawn_permission_manager_with_hub(
                 session_info.id.clone(),
@@ -429,11 +439,11 @@ pub(crate) async fn spawn_session_actor(
                 web_fetch_allowed_domains,
                 session_yolo_mode,
                 session_client_identifier.clone(),
-                crate::util::config::remember_tool_approvals_from_disk(),
+                remember_tool_approvals,
                 hub_permission,
             );
         if crate::util::config::auto_mode_session_active(
-            crate::util::config::auto_permission_mode_enabled_from_disk(),
+            auto_permission_mode,
             session_auto_mode,
             session_yolo_mode,
         ) {
@@ -511,10 +521,14 @@ pub(crate) async fn spawn_session_actor(
         },
         |mc| mc.pruning.clone(),
     );
-    let context_window_override = std::env::var("GROK_DEBUG_CONTEXT_WINDOW")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .and_then(std::num::NonZeroU64::new);
+    let context_window_override = if tool_context.origin_embedded {
+        None
+    } else {
+        std::env::var("GROK_DEBUG_CONTEXT_WINDOW")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .and_then(std::num::NonZeroU64::new)
+    };
     let baseline_context_window = std::num::NonZeroU64::new(sampling_config.context_window)
         .unwrap_or_else(|| {
             std::num::NonZeroU64::new(DEFAULT_CONTEXT_WINDOW)
@@ -584,10 +598,14 @@ pub(crate) async fn spawn_session_actor(
         front_message_committed: false,
         nudges_used_this_session: 0,
     });
-    let mcp_strategy = match std::env::var("MCP_INIT_STRATEGY") {
-        Ok(v) if !v.trim().is_empty() => McpInitStrategy::from(v),
-        _ if startup_hints.non_interactive => McpInitStrategy::Blocking,
-        _ => McpInitStrategy::Progressive,
+    let mcp_strategy = if tool_context.origin_embedded {
+        McpInitStrategy::Blocking
+    } else {
+        match std::env::var("MCP_INIT_STRATEGY") {
+            Ok(v) if !v.trim().is_empty() => McpInitStrategy::from(v),
+            _ if startup_hints.non_interactive => McpInitStrategy::Blocking,
+            _ => McpInitStrategy::Progressive,
+        }
     };
     let file_state_tracker = Arc::new(match rewind_points_path {
         Some(path) => FileStateTracker::with_lazy_source(path),
@@ -939,6 +957,7 @@ pub(crate) async fn spawn_session_actor(
         Arc::new(TokioMutex::new(state))
     };
     let rebuild_spec = std::sync::Arc::new(crate::session::agent_rebuild::AgentRebuildSpec {
+        origin_embedded: tool_context.origin_embedded,
         working_directory: tool_context.cwd.as_path().to_path_buf(),
         terminal_backend: terminal_backend.clone(),
         fs_backend: fs_backend.clone(),
@@ -2104,6 +2123,7 @@ pub(crate) async fn spawn_session_actor(
             gateway_enabled,
             mcp_servers,
             initial_client_mcp_servers,
+            plugin_registry,
             display_cwd: None,
             feedback_manager: feedback_manager.clone(),
             upload_queue: upload_queue.clone(),

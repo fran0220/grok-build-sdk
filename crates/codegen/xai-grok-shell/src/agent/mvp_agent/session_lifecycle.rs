@@ -40,6 +40,38 @@ impl MvpAgent {
                 .send(SessionCommand::Shutdown(ShutdownKind::Graceful));
         }
     }
+    /// Stop and drain a resident actor without finalizing or deleting its
+    /// durable session, then release all resident resources.
+    pub(crate) async fn unload_session(&self, id: &acp::SessionId) -> Result<bool, &'static str> {
+        let deadline = tokio::time::Instant::now() + CLOSE_TOTAL_BUDGET;
+        self.wait_for_load_to_settle(id, stage_budget(deadline, CLOSE_ATTACH_SETTLE_WAIT))
+            .await;
+        let Some(target) = self.resident_handle(id).map(|h| h.cmd_tx.clone()) else {
+            return Err("session is not resident");
+        };
+        let intake = self.dispatch_lock(id);
+        let intake_guard =
+            tokio::time::timeout(stage_budget(deadline, CLOSE_INTAKE_WAIT), intake.lock())
+                .await
+                .map_err(|_| "session prompt intake did not settle within the teardown bound")?;
+        match self.resident_handle(id).map(|h| h.cmd_tx.clone()) {
+            None => return Err("session is not resident"),
+            Some(current) if !current.same_channel(&target) => {
+                return Err("session actor was replaced during unload");
+            }
+            Some(_) => {}
+        }
+        if !self.hard_stop_resident(id, CancelTrigger::Shutdown) {
+            return Err("session is not resident");
+        }
+        drop(intake_guard);
+        self.remove_session(id);
+        let drained = self
+            .drain_old_session_thread_within(id, stage_budget(deadline, DRAIN_OLD_THREAD_WAIT))
+            .await;
+        xai_grok_shared::session::unregister_session_tree(id.0.as_ref());
+        Ok(drained)
+    }
     /// ACP `session/close` and its pre-ACP spelling. Orders behind prompt
     /// intake; every wait spends from [`CLOSE_TOTAL_BUDGET`].
     pub(crate) async fn close_active_session(&self, id: &acp::SessionId) -> CloseOutcome {

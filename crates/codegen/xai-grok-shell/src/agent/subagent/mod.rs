@@ -1481,8 +1481,8 @@ fn filter_pool_by_inheritance(
 /// Plugin agents cannot: untrusted packages must not spawn MCP processes or
 /// open network MCP endpoints. Parent-pool inheritance is independent and
 /// always available subject to [`McpInheritance`].
-fn agent_owned_mcp_servers_allowed(is_plugin_agent: bool) -> bool {
-    !is_plugin_agent
+fn agent_owned_mcp_servers_allowed(is_plugin_agent: bool, origin_embedded: bool) -> bool {
+    !origin_embedded && !is_plugin_agent
 }
 /// Resolve a subagent type name to its `AgentDefinition`, with the parent
 /// session's CLI tool/permission overrides already applied (so the spawn path
@@ -1491,26 +1491,41 @@ fn resolve_agent_definition(
     subagent_type: &str,
     ctx: &SubagentSpawnContext,
 ) -> Option<xai_grok_agent::config::AgentDefinition> {
+    let origin_embedded = ctx
+        .agent_config
+        .as_ref()
+        .is_some_and(|config| config.origin_embedded);
     let cli_agents = ctx
         .agent_config
         .as_ref()
         .map(|config| config.cli_agents.as_slice())
         .unwrap_or_default();
-    let resolution_context = xai_grok_subagent_resolution::DefinitionResolutionContext {
-        cwd: &ctx.parent_cwd,
-        plugins: ctx.plugin_registry.as_deref(),
-        cli_agents,
-        toggles: &ctx.subagent_toggle,
-        allowed_types: ctx.allowed_subagent_types.as_deref(),
-    };
-    let mut def = xai_grok_subagent_resolution::discover_agent_definition(
-        subagent_type,
-        &resolution_context,
-    )?;
+    let mut def = if origin_embedded {
+        xai_grok_agent::discovery::by_name_in_builtins_or_plugins(
+            subagent_type,
+            ctx.plugin_registry.as_deref(),
+        )
+    } else {
+        let resolution_context = xai_grok_subagent_resolution::DefinitionResolutionContext {
+            cwd: &ctx.parent_cwd,
+            plugins: ctx.plugin_registry.as_deref(),
+            cli_agents,
+            toggles: &ctx.subagent_toggle,
+            allowed_types: ctx.allowed_subagent_types.as_deref(),
+        };
+        xai_grok_subagent_resolution::discover_agent_definition(subagent_type, &resolution_context)
+    }?;
     ctx.apply_session_cli_overrides(&mut def);
     Some(def)
 }
 fn available_agent_names(ctx: &SubagentSpawnContext) -> Vec<String> {
+    if ctx
+        .agent_config
+        .as_ref()
+        .is_some_and(|config| config.origin_embedded)
+    {
+        return origin_available_agent_names(ctx.plugin_registry.as_deref());
+    }
     let cli_agents = ctx
         .agent_config
         .as_ref()
@@ -1535,6 +1550,7 @@ pub(crate) struct SubagentValidationContext {
     pub subagent_toggle: HashMap<String, bool>,
     pub allowed_subagent_types: Option<Vec<String>>,
     pub cli_agent_names: Vec<String>,
+    pub origin_embedded: bool,
 }
 /// Synchronously validate a subagent type against discovery + toggle + allow-list.
 /// `Unknown { available }` is sorted by `str::cmp` for stable rendering.
@@ -1542,6 +1558,36 @@ pub(crate) fn validate_subagent_type(
     subagent_type: &str,
     ctx: &SubagentValidationContext,
 ) -> SubagentValidateTypeOutcome {
+    if ctx.origin_embedded {
+        if xai_grok_agent::discovery::by_name_in_builtins_or_plugins(
+            subagent_type,
+            ctx.plugin_registry.as_deref(),
+        )
+        .is_none()
+        {
+            return SubagentValidateTypeOutcome::Unknown {
+                available: origin_available_agent_names(ctx.plugin_registry.as_deref()),
+            };
+        }
+        if !ctx
+            .subagent_toggle
+            .get(subagent_type)
+            .copied()
+            .unwrap_or(true)
+        {
+            return SubagentValidateTypeOutcome::Disabled;
+        }
+        if let Some(allowed) = &ctx.allowed_subagent_types
+            && !allowed
+                .iter()
+                .any(|candidate| candidate.eq_ignore_ascii_case(subagent_type))
+        {
+            return SubagentValidateTypeOutcome::NotAllowed {
+                allowed: allowed.clone(),
+            };
+        }
+        return SubagentValidateTypeOutcome::Ok;
+    }
     let context = xai_grok_subagent_resolution::DefinitionValidationContext {
         cwd: &ctx.parent_cwd,
         plugins: ctx.plugin_registry.as_deref(),
@@ -1565,6 +1611,28 @@ pub(crate) fn validate_subagent_type(
             | xai_grok_subagent_resolution::ResolutionError::ResumeValidation(_),
         ) => SubagentValidateTypeOutcome::ValidationUnavailable,
     }
+}
+
+fn origin_available_agent_names(
+    plugins: Option<&xai_grok_agent::plugins::PluginRegistry>,
+) -> Vec<String> {
+    let mut available = xai_grok_agent::discovery::builtin_subagents()
+        .into_iter()
+        .map(|definition| definition.name)
+        .collect::<Vec<_>>();
+    if let Some(registry) = plugins {
+        for plugin in registry.enabled_plugins() {
+            available.extend(
+                plugin
+                    .agent_names
+                    .iter()
+                    .map(|name| format!("{}:{name}", plugin.name)),
+            );
+        }
+    }
+    available.sort();
+    available.dedup();
+    available
 }
 /// Gate an already-resolved subagent type against the `[subagents.toggle]`
 /// disable map and the parent's allow-list.
