@@ -727,6 +727,8 @@ type RosterDisplayCache = HashMap<String, (Option<String>, Option<String>)>;
 pub struct MvpAgent {
     /// Origin embedded boundary: suppresses ambient Grok startup workers.
     pub(crate) origin_embedded: bool,
+    /// Feature policy, independent from the embedded persistence/process boundary.
+    pub(crate) origin_profile: crate::agent::config::OriginEmbeddedProfile,
     /// Origin embedded boundary: explicit persistence root, independent of GROK_HOME.
     storage_root: Option<PathBuf>,
     /// LEADER-SAFE(shared): `Send + Sync` mirror of per-session activity for the

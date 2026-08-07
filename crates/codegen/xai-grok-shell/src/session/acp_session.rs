@@ -1081,6 +1081,9 @@ pub(crate) struct SessionActor {
     /// Resolved vision model ID for auxiliary image processing.
     /// Populated from `Config.image_description_model` at spawn.
     pub(crate) image_description_model: String,
+    /// Whether image blocks are transcribed through the auxiliary model
+    /// instead of being persisted as paths for the main agent.
+    pub(crate) transcribe_user_images: bool,
     /// Cache auxiliary image outputs by content and prompt fingerprint.
     pub(crate) image_describe_cache: Arc<crate::session::image_describe::ImageDescribeCache>,
     /// Per-subagent token state keyed by `subagent_id`; sums into

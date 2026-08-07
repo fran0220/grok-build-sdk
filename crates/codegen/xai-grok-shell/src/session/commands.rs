@@ -754,10 +754,10 @@ pub enum SessionCommand {
     ///
     /// Fired by the client after a turn completes. The session builds a
     /// compact text-only transcript of the recent conversation, makes one
-    /// tool-free model call (default `grok-build-0.1` when available via
-    /// `model_override`, else the session model), sanitizes the output, and
-    /// returns the predicted prompt via `respond_to`. Best-effort: any
-    /// failure returns `None`.
+    /// tool-free call through the selected model's catalog provider, sanitizes
+    /// the output, and returns the predicted prompt via `respond_to`. It never
+    /// falls back to the session model. Best-effort: any failure returns
+    /// `None`.
     SuggestPrompt {
         model_override: Option<String>,
         respond_to: oneshot::Sender<Option<String>>,

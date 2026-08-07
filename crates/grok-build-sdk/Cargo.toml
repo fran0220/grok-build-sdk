@@ -1,13 +1,21 @@
 [package]
-name = "origin-grok-runtime"
+name = "grok-build-sdk"
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true
+description = "Embeddable Rust SDK for the Grok Build agent runtime"
+repository = "https://github.com/fran0220/grok-build-sdk"
+homepage = "https://github.com/fran0220/grok-build-sdk"
+documentation = "https://github.com/fran0220/grok-build-sdk/tree/main/crates/grok-build-sdk"
+readme = "README.md"
+keywords = ["agent", "desktop", "grok", "mcp", "sdk"]
+categories = ["api-bindings", "development-tools"]
 publish = false
 
 [dependencies]
 agent-client-protocol = { workspace = true }
 async-trait = { workspace = true }
+base64 = { workspace = true }
 indexmap = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
@@ -21,6 +29,7 @@ xai-grok-shell = { workspace = true }
 xai-grok-tools = { workspace = true }
 
 [dev-dependencies]
+axum = { workspace = true }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

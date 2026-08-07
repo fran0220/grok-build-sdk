@@ -227,7 +227,8 @@ impl MvpAgent {
             subagent_toggle,
             allowed_subagent_types,
             cli_agent_names,
-            origin_embedded: self.origin_embedded,
+            // Downstream validation uses this as a feature restriction gate.
+            origin_embedded: self.origin_restricted(),
         }
     }
     /// Test-only infallible wrapper around
@@ -402,6 +403,7 @@ impl MvpAgent {
             .as_ref()
             .and_then(|ps| ps.resolved_tool_overrides.load_full().map(|o| (*o).clone()));
         Some(crate::agent::subagent::SubagentSpawnContext {
+            origin_restricted: self.origin_restricted(),
             lsp: parent_lsp,
             process_scope: parent_process_scope,
             client_hooks: Default::default(),
@@ -483,10 +485,12 @@ impl MvpAgent {
             hook_registry: parent_hook_registry,
             permission_handle: parent_handle.as_ref().map(|h| h.permission_handle.clone()),
             worktree_type: self.worktree_type,
-            api_key_provider: Some(Arc::new(crate::auth::manager::SharedAuthKeyProvider(
-                am.clone(),
-            ))),
+            api_key_provider: (!self.origin_embedded).then(|| {
+                Arc::new(crate::auth::manager::SharedAuthKeyProvider(am.clone()))
+                    as xai_grok_tools::types::SharedApiKeyProvider
+            }),
             image_description_model: self.resolve_image_description_model(),
+            transcribe_user_images: self.cfg.borrow().transcribe_user_images,
             workspace_ops: parent_workspace_ops.clone(),
             auth_manager: am.clone(),
             attribution_callback: parent_attribution_callback,

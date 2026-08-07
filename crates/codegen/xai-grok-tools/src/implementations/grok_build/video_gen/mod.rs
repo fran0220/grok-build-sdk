@@ -140,6 +140,9 @@ pub struct VideoGenClient {
     http: reqwest::Client,
     download_http: reqwest::Client,
     base_url: String,
+    query_params: indexmap::IndexMap<String, String>,
+    image_to_video_model: String,
+    reference_to_video_model: String,
     writer: super::storage::SessionFileWriter,
     zdr_video_output_s3: Option<ZdrVideoOutputS3Config>,
     api_key_provider: Option<SharedApiKeyProvider>,
@@ -163,7 +166,11 @@ impl VideoGenClient {
             api_key,
             base_url,
             extra_headers,
+            query_params,
             zdr_video_output_s3,
+            image_to_video_model,
+            reference_to_video_model,
+            use_dynamic_api_key_provider,
             tier_restricted,
         } = config
         else {
@@ -226,12 +233,25 @@ impl VideoGenClient {
             http,
             download_http,
             base_url: base_url.clone(),
+            query_params: query_params.as_ref().clone(),
+            image_to_video_model: resolve_video_model(
+                image_to_video_model.as_deref(),
+                XAI_VIDEO_QUALITY_MODEL,
+            ),
+            reference_to_video_model: resolve_video_model(
+                reference_to_video_model.as_deref(),
+                XAI_VIDEO_BASE_MODEL,
+            ),
             writer: super::storage::SessionFileWriter::new(DEFAULT_VIDEO_DIR, "mp4"),
             zdr_video_output_s3: zdr_video_output_s3
                 .as_ref()
                 .map(|c| (**c).clone())
                 .filter(ZdrVideoOutputS3Config::is_valid),
-            api_key_provider,
+            api_key_provider: if *use_dynamic_api_key_provider {
+                api_key_provider
+            } else {
+                None
+            },
             attribution_callback: None,
             tier_restricted: *tier_restricted,
         })
@@ -242,6 +262,14 @@ impl VideoGenClient {
     /// SuperGrok upsell instead of issuing a doomed request.
     pub(crate) fn is_tier_restricted(&self) -> bool {
         self.tier_restricted
+    }
+
+    fn image_to_video_model(&self) -> &str {
+        &self.image_to_video_model
+    }
+
+    fn reference_to_video_model(&self) -> &str {
+        &self.reference_to_video_model
     }
 
     /// Wire a 401-attribution callback into this client. Idempotent;
@@ -264,7 +292,7 @@ impl VideoGenClient {
 
     pub async fn generate_with_images(
         &self,
-        model: &'static str,
+        model: &str,
         prompt: &str,
         duration: Option<u32>,
         aspect_ratio: Option<&str>,
@@ -299,6 +327,7 @@ impl VideoGenClient {
         let mut req = self
             .http
             .post(&start_url)
+            .query(&self.query_params)
             .timeout(std::time::Duration::from_secs(VIDEO_START_TIMEOUT_SECS))
             .json(&payload);
         if let Some(ref key) = sent_bearer {
@@ -370,7 +399,11 @@ impl VideoGenClient {
             }
 
             let poll_sent_bearer = self.current_bearer().await;
-            let mut poll_req = self.http.get(&poll_url).timeout(poll_timeout);
+            let mut poll_req = self
+                .http
+                .get(&poll_url)
+                .query(&self.query_params)
+                .timeout(poll_timeout);
             if let Some(ref key) = poll_sent_bearer {
                 poll_req = poll_req.header(AUTHORIZATION, format!("Bearer {key}"));
             }
@@ -670,6 +703,13 @@ fn is_http_url(raw: &str) -> bool {
         .unwrap_or(false)
 }
 
+fn resolve_video_model(configured: Option<&str>, default: &str) -> String {
+    configured
+        .filter(|model| !model.trim().is_empty())
+        .unwrap_or(default)
+        .to_owned()
+}
+
 /// Session-level configuration. Same shape as [`ImageGenConfig`].
 ///
 /// [`ImageGenConfig`]: super::image_gen::ImageGenConfig
@@ -681,7 +721,17 @@ pub enum VideoGenConfig {
         api_key: String,
         base_url: String,
         extra_headers: indexmap::IndexMap<String, String>,
+        query_params: Box<indexmap::IndexMap<String, String>>,
         zdr_video_output_s3: Option<Box<ZdrVideoOutputS3Config>>,
+        /// Optional model override used by the native `image_to_video` tool.
+        /// Missing or empty values preserve the current quality-model default.
+        image_to_video_model: Option<String>,
+        /// Optional model override used by the native `reference_to_video` tool.
+        /// Missing or empty values preserve the current base-model default.
+        reference_to_video_model: Option<String>,
+        /// Allow the session's rotating sampling credential to override the
+        /// static key. Custom embedded media providers set this to false.
+        use_dynamic_api_key_provider: bool,
         /// `true` when the user is on a tier the Imagine server zero-limits
         /// (free / X Basic). The video tools stay advertised but short-circuit
         /// at call time with the SuperGrok upsell prose. Set by the host from
@@ -723,7 +773,7 @@ pub enum VideoOutcome {
 
 #[derive(serde::Serialize)]
 struct GenerateVideoPayload<'a> {
-    model: &'static str,
+    model: &'a str,
     prompt: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     image: Option<VideoImageUrl>,
@@ -1055,7 +1105,7 @@ impl xai_tool_runtime::Tool for ImageToVideoTool {
 
         let outcome = client
             .generate_with_images(
-                XAI_VIDEO_QUALITY_MODEL,
+                client.image_to_video_model(),
                 &prompt,
                 Some(
                     input
@@ -1174,7 +1224,7 @@ impl xai_tool_runtime::Tool for ReferenceToVideoTool {
 
         let outcome = client
             .generate_with_images(
-                XAI_VIDEO_BASE_MODEL,
+                client.reference_to_video_model(),
                 &input.prompt,
                 Some(
                     input
@@ -1251,6 +1301,72 @@ mod tests {
         assert!(validate_imagine_duration(Some(6)).is_ok());
         assert!(validate_imagine_duration(Some(10)).is_ok());
         assert!(validate_imagine_duration(Some(8)).is_err());
+    }
+
+    fn video_gen_config(
+        image_to_video_model: Option<&str>,
+        reference_to_video_model: Option<&str>,
+    ) -> VideoGenConfig {
+        VideoGenConfig::Enabled {
+            api_key: "test-key".into(),
+            base_url: "https://api.x.ai/v1".into(),
+            extra_headers: indexmap::IndexMap::new(),
+            query_params: Box::default(),
+            zdr_video_output_s3: None,
+            image_to_video_model: image_to_video_model.map(String::from),
+            reference_to_video_model: reference_to_video_model.map(String::from),
+            use_dynamic_api_key_provider: true,
+            tier_restricted: false,
+        }
+    }
+
+    #[test]
+    fn client_resolves_video_model_defaults_and_empty_overrides() {
+        let client = VideoGenClient::new(&video_gen_config(None, None), None).unwrap();
+        assert_eq!(client.image_to_video_model(), XAI_VIDEO_QUALITY_MODEL);
+        assert_eq!(client.reference_to_video_model(), XAI_VIDEO_BASE_MODEL);
+
+        let client = VideoGenClient::new(&video_gen_config(Some(""), Some("   ")), None).unwrap();
+        assert_eq!(client.image_to_video_model(), XAI_VIDEO_QUALITY_MODEL);
+        assert_eq!(client.reference_to_video_model(), XAI_VIDEO_BASE_MODEL);
+    }
+
+    #[test]
+    fn explicit_video_model_overrides_reach_request_payloads() {
+        let client = VideoGenClient::new(
+            &video_gen_config(
+                Some("image-video-override"),
+                Some("reference-video-override"),
+            ),
+            None,
+        )
+        .unwrap();
+
+        let payload = GenerateVideoPayload {
+            model: client.image_to_video_model(),
+            prompt: "animate",
+            image: None,
+            duration: Some(6),
+            aspect_ratio: None,
+            resolution: DEFAULT_RESOLUTION,
+            reference_images: Vec::new(),
+            output: None,
+        };
+        let json = serde_json::to_value(&payload).unwrap();
+        assert_eq!(json["model"], "image-video-override");
+
+        let payload = GenerateVideoPayload {
+            model: client.reference_to_video_model(),
+            prompt: "blend",
+            image: None,
+            duration: Some(6),
+            aspect_ratio: Some("16:9"),
+            resolution: DEFAULT_RESOLUTION,
+            reference_images: Vec::new(),
+            output: None,
+        };
+        let json = serde_json::to_value(&payload).unwrap();
+        assert_eq!(json["model"], "reference-video-override");
     }
 
     #[test]

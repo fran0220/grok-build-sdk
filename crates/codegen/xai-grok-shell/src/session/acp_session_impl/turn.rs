@@ -714,7 +714,7 @@ impl SessionActor {
         self.inject_workflow_status_reminder().await;
         let user_message = if user_images.is_empty() {
             user_message
-        } else if self.is_cursor_harness() {
+        } else if self.is_cursor_harness() || self.transcribe_user_images {
             self.transcribe_user_images(user_message, &user_images)
                 .await?
         } else {

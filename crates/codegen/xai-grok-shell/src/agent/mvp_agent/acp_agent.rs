@@ -243,7 +243,8 @@ impl acp::Agent for MvpAgent {
             }),
             ),
         );
-        if !self.cfg.borrow().grok_com_config.api_key_auth_disabled()
+        if !self.origin_embedded
+            && !self.cfg.borrow().grok_com_config.api_key_auth_disabled()
             && auth_method::read_xai_api_key_env().is_err()
             && let Some(api_key) = crate::auth::read_api_key(
                 &crate::util::grok_home::grok_home(),
@@ -286,7 +287,9 @@ impl acp::Agent for MvpAgent {
             .models()
             .values()
             .any(crate::agent::config::ModelEntry::has_own_credentials);
-        let first_party_env_ok = if crate::auth::should_probe_first_party_env_key(
+        let first_party_env_ok = if self.origin_embedded {
+            true
+        } else if crate::auth::should_probe_first_party_env_key(
             disable_api_key_auth,
             has_byok,
             auth_method::has_xai_api_key_env(),
@@ -442,7 +445,7 @@ impl acp::Agent for MvpAgent {
         if self.cfg.borrow().managed_mcps_enabled && !fetch_managed_mcps {
             tracing::info!("Managed MCP fetch: DISABLED");
         }
-        if !self.origin_embedded {
+        if !self.origin_restricted() {
             self.spawn_initialize_launch_mcp_setup(fetch_managed_mcps);
             self.spawn_managed_gateway_tool_catalog_fetch();
             {
@@ -453,6 +456,8 @@ impl acp::Agent for MvpAgent {
             });
             }
             self.spawn_announcements_refresh();
+        }
+        if !self.origin_embedded {
             self.spawn_heap_profile_monitor();
         }
         let init_model_state = if crate::agent::chat_modes::process_chat_mode_enabled() {
@@ -492,7 +497,10 @@ impl acp::Agent for MvpAgent {
                                 .cloned(),
                         )
                         .prompt_capabilities(
-                            acp::PromptCapabilities::new().embedded_context(true),
+                            acp::PromptCapabilities::new()
+                                .image(true)
+                                .audio(true)
+                                .embedded_context(true),
                         )
                         .mcp_capabilities(
                             acp::McpCapabilities::new().http(true).sse(true),
@@ -2576,7 +2584,7 @@ impl acp::Agent for MvpAgent {
         args: acp::ExtNotification,
     ) -> Result<(), acp::Error> {
         tracing::info!("Received extension notification: method={}", args.method);
-        if !self.origin_embedded
+        if !self.origin_restricted()
             && args.method.as_ref() == "x.ai/yolo_mode_changed"
             && let Ok(params) = serde_json::from_str::<
                 serde_json::Value,

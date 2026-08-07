@@ -4793,6 +4793,30 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b40ca9252762c466af32d0b1002e91e4e1bc5398f77455e55474deb466355ff5"
 
 [[package]]
+name = "grok-build-sdk"
+version = "0.1.0"
+dependencies = [
+ "agent-client-protocol",
+ "async-trait",
+ "axum",
+ "base64",
+ "indexmap",
+ "rustls",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+ "xai-acp-lib",
+ "xai-file-utils",
+ "xai-grok-shell",
+ "xai-grok-test-support",
+ "xai-grok-tools",
+]
+
+[[package]]
 name = "group"
 version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7246,28 +7270,6 @@ dependencies = [
 [[package]]
 name = "ordered_hashmap"
 version = "0.0.3"
-
-[[package]]
-name = "origin-grok-runtime"
-version = "0.1.0"
-dependencies = [
- "agent-client-protocol",
- "async-trait",
- "indexmap",
- "rustls",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "tokio-util",
- "xai-acp-lib",
- "xai-file-utils",
- "xai-grok-shell",
- "xai-grok-test-support",
- "xai-grok-tools",
-]
 
 [[package]]
 name = "os_info"

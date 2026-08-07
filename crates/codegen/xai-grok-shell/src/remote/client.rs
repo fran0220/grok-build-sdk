@@ -889,6 +889,7 @@ pub(crate) fn parse_remote_model_value(
             .or_else(|| get_string(obj, "system_prompt_label"))
             .filter(|s| !s.trim().is_empty()),
         extra_headers: get_string_map(obj, "extraHeaders"),
+        query_params: get_string_map(obj, "queryParams"),
         api_base_url: get_string(obj, "apiBaseUrl")
             .or_else(|| get_string(obj, "api_base_url")),
         use_concise: obj

@@ -1680,6 +1680,7 @@ fn make_entry_config_with_id(
         auto_compact_threshold_percent: None,
         system_prompt_label: None,
         extra_headers: IndexMap::new(),
+        query_params: IndexMap::new(),
         api_base_url: None,
         use_concise: false,
         agent_type: config::default_agent_type(),

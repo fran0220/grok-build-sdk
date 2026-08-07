@@ -247,6 +247,7 @@ async fn create_test_actor(
         turn_stream_drained: parking_lot::Mutex::new(None),
         sampler_handle: xai_grok_sampler::SamplerHandle::noop(),
         image_description_model: crate::test_support::TEST_MODEL.to_owned(),
+        transcribe_user_images: false,
         image_describe_cache: Arc::new(crate::session::image_describe::ImageDescribeCache::new()),
         subagent_token_records: parking_lot::Mutex::new(HashMap::new()),
         workspace_ops: xai_grok_workspace::WorkspaceOps::for_test(),
@@ -709,6 +710,7 @@ async fn create_test_actor_with_memory(
         turn_stream_drained: parking_lot::Mutex::new(None),
         sampler_handle: xai_grok_sampler::SamplerHandle::noop(),
         image_description_model: crate::test_support::TEST_MODEL.to_owned(),
+        transcribe_user_images: false,
         image_describe_cache: Arc::new(crate::session::image_describe::ImageDescribeCache::new()),
         subagent_token_records: parking_lot::Mutex::new(HashMap::new()),
         workspace_ops: xai_grok_workspace::WorkspaceOps::for_test(),
@@ -1496,6 +1498,7 @@ async fn test_e2e_idle_resume_refreshes_model_metadata() {
                 attribution_callback: None,
                 sampler_handle: xai_grok_sampler::SamplerHandle::noop(),
                 image_description_model: crate::test_support::TEST_MODEL.to_owned(),
+                transcribe_user_images: false,
                 image_describe_cache: Arc::new(
                     crate::session::image_describe::ImageDescribeCache::new(),
                 ),

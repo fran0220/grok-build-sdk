@@ -10,6 +10,7 @@ pub struct WebSearchClient {
     http: reqwest::Client,
     base_url: String,
     model: String,
+    query_params: indexmap::IndexMap<String, String>,
     api_key_provider: Option<SharedApiKeyProvider>,
     /// Optional 401-attribution hook. Callers can wire this so a 401
     /// from the Responses API emits an `auth_401_attribution` event
@@ -29,6 +30,7 @@ impl WebSearchClient {
             base_url,
             model,
             extra_headers,
+            query_params,
             alpha_test_key,
         } = config
         else {
@@ -78,6 +80,7 @@ impl WebSearchClient {
             http,
             base_url: base_url.clone(),
             model: model.clone(),
+            query_params: query_params.as_ref().clone(),
             api_key_provider,
             attribution_callback: None,
         })
@@ -136,7 +139,11 @@ impl WebSearchClient {
             })?;
         let url = format!("{}/responses", self.base_url.trim_end_matches('/'));
         let sent_bearer = self.current_bearer().await;
-        let mut req = self.http.post(&url).json(&request);
+        let mut req = self
+            .http
+            .post(&url)
+            .query(&self.query_params)
+            .json(&request);
         if let Some(ref key) = sent_bearer {
             req = req.header(AUTHORIZATION, format!("Bearer {key}"));
         }
@@ -227,7 +234,11 @@ impl WebSearchClient {
             })?;
         let url = format!("{}/responses", self.base_url.trim_end_matches('/'));
         let sent_bearer = self.current_bearer().await;
-        let mut req = self.http.post(&url).json(&request);
+        let mut req = self
+            .http
+            .post(&url)
+            .query(&self.query_params)
+            .json(&request);
         if let Some(ref key) = sent_bearer {
             req = req.header(AUTHORIZATION, format!("Bearer {key}"));
         }
@@ -356,6 +367,7 @@ mod tests {
             base_url: "https://api.x.ai/v1".to_string(),
             model: "custom-enterprise-model".to_string(),
             extra_headers: IndexMap::new(),
+            query_params: Box::default(),
             alpha_test_key: None,
         };
         let client = WebSearchClient::new(&config, None).expect("client should build");
@@ -386,6 +398,7 @@ mod tests {
             base_url: "https://api.x.ai/v1".to_string(),
             model: "test-model".to_string(),
             extra_headers: IndexMap::new(),
+            query_params: Box::default(),
             alpha_test_key: None,
         };
         let client = WebSearchClient::new(&config, None)
@@ -410,6 +423,7 @@ mod tests {
             base_url: "https://api.x.ai/v1".to_string(),
             model: "test-model".to_string(),
             extra_headers: IndexMap::new(),
+            query_params: Box::default(),
             alpha_test_key: None,
         };
         let client = WebSearchClient::new(&config, None).expect("client should build");
@@ -663,6 +677,7 @@ mod tests {
             base_url: server.uri(),
             model: "test-model".to_string(),
             extra_headers: IndexMap::new(),
+            query_params: Box::default(),
             alpha_test_key: None,
         };
         let provider: SharedApiKeyProvider = std::sync::Arc::new(NoneProvider);
@@ -713,6 +728,7 @@ mod tests {
             base_url: server.uri(),
             model: "test-model".to_string(),
             extra_headers: IndexMap::new(),
+            query_params: Box::default(),
             alpha_test_key: None,
         };
         let provider: SharedApiKeyProvider = std::sync::Arc::new(FreshProvider);

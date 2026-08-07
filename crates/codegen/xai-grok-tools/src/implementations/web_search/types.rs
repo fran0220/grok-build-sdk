@@ -15,6 +15,8 @@ pub enum WebSearchConfig {
         model: String,
         #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
         extra_headers: IndexMap<String, String>,
+        #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
+        query_params: Box<IndexMap<String, String>>,
         #[serde(skip_serializing_if = "Option::is_none")]
         alpha_test_key: Option<String>,
     },
@@ -37,12 +39,14 @@ impl WebSearchConfig {
                 base_url,
                 model,
                 extra_headers,
+                query_params,
                 ..
             } => Self::Enabled {
                 api_key: "***REDACTED***".to_string(),
                 base_url: base_url.clone(),
                 model: model.clone(),
                 extra_headers: extra_headers.clone(),
+                query_params: query_params.clone(),
                 alpha_test_key: None,
             },
         }
@@ -66,6 +70,7 @@ mod tests {
             base_url: "https://api.x.ai/v1".to_string(),
             model: "test-web-search-model".to_string(),
             extra_headers: IndexMap::new(),
+            query_params: Box::default(),
             alpha_test_key: None,
         };
         assert!(config.is_enabled());
@@ -80,6 +85,7 @@ mod tests {
             base_url: "https://api.x.ai/v1".to_string(),
             model: "test-web-search-model".to_string(),
             extra_headers: headers,
+            query_params: Box::default(),
             alpha_test_key: Some("alpha-secret".to_string()),
         };
         let redacted = config.redacted();
@@ -89,12 +95,14 @@ mod tests {
                 base_url,
                 model,
                 extra_headers,
+                query_params,
                 alpha_test_key,
             } => {
                 assert_eq!(api_key, "***REDACTED***");
                 assert_eq!(base_url, "https://api.x.ai/v1");
                 assert_eq!(model, "test-web-search-model");
                 assert_eq!(extra_headers.get("X-Custom").unwrap(), "value");
+                assert!(query_params.is_empty());
                 assert!(alpha_test_key.is_none());
             }
             _ => panic!("Expected Enabled variant"),
@@ -108,6 +116,7 @@ mod tests {
             base_url: "https://api.x.ai/v1".to_string(),
             model: "test-web-search-model".to_string(),
             extra_headers: IndexMap::new(),
+            query_params: Box::default(),
             alpha_test_key: None,
         };
         let json = serde_json::to_string(&config).unwrap();

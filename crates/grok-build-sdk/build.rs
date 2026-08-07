@@ -19,7 +19,7 @@ fn git(root: &Path, arguments: &[&str]) -> Option<String> {
 fn full_commit(value: String) -> String {
     assert!(
         value.len() == 40 && value.bytes().all(|byte| byte.is_ascii_hexdigit()),
-        "Origin Grok fork commit must be a full Git object id"
+        "Grok Build SDK fork commit must be a full Git object id"
     );
     value
 }
@@ -37,30 +37,30 @@ fn main() {
     let root = manifest
         .ancestors()
         .nth(2)
-        .expect("origin-grok-runtime remains in the fork workspace");
+        .expect("grok-build-sdk remains in the fork workspace");
     let git_commit = git(root, &["rev-parse", "HEAD"]);
     let commit = full_commit(
-        std::env::var("ORIGIN_GROK_BUILD_COMMIT")
+        std::env::var("GROK_BUILD_SDK_COMMIT")
+            .or_else(|_| std::env::var("ORIGIN_GROK_BUILD_COMMIT"))
             .ok()
             .or(git_commit.clone())
-            .expect(
-                "source archives must set ORIGIN_GROK_BUILD_COMMIT to the exact Origin fork commit",
-            ),
+            .expect("source archives must set GROK_BUILD_SDK_COMMIT to the exact SDK fork commit"),
     );
     if let Some(git_commit) = git_commit {
         assert_eq!(
             commit,
             full_commit(git_commit),
-            "ORIGIN_GROK_BUILD_COMMIT does not match the checked-out Origin fork"
+            "GROK_BUILD_SDK_COMMIT does not match the checked-out SDK fork"
         );
     }
     let git_dirty = git(root, &["status", "--porcelain", "--untracked-files=all"])
         .map(|status| !status.is_empty());
-    let dirty = env_bool("ORIGIN_GROK_BUILD_DIRTY")
+    let dirty = env_bool("GROK_BUILD_SDK_DIRTY")
+        .or_else(|| env_bool("ORIGIN_GROK_BUILD_DIRTY"))
         .or(git_dirty)
-        .expect("source archives must set ORIGIN_GROK_BUILD_DIRTY to true or false");
-    println!("cargo:rustc-env=ORIGIN_GROK_BUILD_COMMIT={commit}");
-    println!("cargo:rustc-env=ORIGIN_GROK_BUILD_DIRTY={dirty}");
+        .expect("source archives must set GROK_BUILD_SDK_DIRTY to true or false");
+    println!("cargo:rustc-env=GROK_BUILD_SDK_COMMIT={commit}");
+    println!("cargo:rustc-env=GROK_BUILD_SDK_DIRTY={dirty}");
     println!(
         "cargo:rerun-if-changed={}",
         root.join(".git/HEAD").display()
@@ -69,6 +69,8 @@ fn main() {
         "cargo:rerun-if-changed={}",
         root.join(".git/index").display()
     );
+    println!("cargo:rerun-if-env-changed=GROK_BUILD_SDK_COMMIT");
+    println!("cargo:rerun-if-env-changed=GROK_BUILD_SDK_DIRTY");
     println!("cargo:rerun-if-env-changed=ORIGIN_GROK_BUILD_COMMIT");
     println!("cargo:rerun-if-env-changed=ORIGIN_GROK_BUILD_DIRTY");
 }

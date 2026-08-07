@@ -138,9 +138,12 @@ pub(crate) fn subagent_foreground_wait(
 /// Holds ACP gateway, cwd, hunk tracker, etc. for session infrastructure.
 #[derive(Clone)]
 pub struct ToolContext {
-    /// Trusted construction-time marker for the Origin in-process boundary.
-    /// This is never populated from model or session metadata.
+    /// Restricted feature-policy marker. This is separate from
+    /// `origin_runtime_embedded` because Desktop embeddings keep native tools.
     pub origin_embedded: bool,
+    /// Trusted construction-time marker for either Origin runtime profile.
+    /// Fixed provider credentials must never be refreshed from ambient config.
+    pub origin_runtime_embedded: bool,
     pub gateway: Option<GatewaySender>,
     pub session_id: Option<acp::SessionId>,
     pub fs: AsyncFsWrapper,
@@ -259,6 +262,7 @@ impl ToolContext {
         );
         Self {
             origin_embedded: false,
+            origin_runtime_embedded: false,
             gateway,
             session_id,
             fs: AsyncFsWrapper::new(fs),
@@ -301,6 +305,7 @@ impl ToolContext {
     ) -> Self {
         Self {
             origin_embedded: false,
+            origin_runtime_embedded: false,
             gateway,
             session_id,
             fs: AsyncFsWrapper::new(fs),
@@ -392,6 +397,7 @@ mod tests {
         ) -> Self {
             Self {
                 origin_embedded: false,
+                origin_runtime_embedded: false,
                 gateway: None,
                 session_id: None,
                 fs: AsyncFsWrapper::new(fs),

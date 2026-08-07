@@ -587,19 +587,19 @@ impl SessionActor {
     /// [`prompt_suggest::effective_suggest_model`]: env
     /// (`GROK_PROMPT_SUGGESTIONS_MODEL`) > `[models] prompt_suggestion`
     /// (config.toml) > remote `prompt_suggestion_model` (remote settings) >
-    /// (config.toml) > remote `prompt_suggestion_model` (remote settings) >
     /// [`prompt_suggest::DEFAULT_SUGGEST_MODEL`] (`grok-build-0.1`). Every
     /// tier except env is catalog-guarded against this shell's own model
     /// catalog — when the effective model is not sampleable here (e.g.
     /// `grok-build-0.1` for OAuth users) the request is **skipped
-    /// entirely** instead of fired doomed. The session model is never used:
-    /// a per-turn background call must stay on the small model.
+    /// entirely** instead of fired doomed. The selected catalog entry supplies
+    /// its own endpoint, credential, headers, backend, and wire model. The
+    /// session model is never used: a per-turn background call must stay on
+    /// the small model.
     /// Temperature, max_output_tokens, and
     /// reasoning_effort are left unset — mirrors [`Self::handle_recap`]: the
     /// proxy may inject provider defaults, a small token cap silently empties
     /// a reasoning model's response, and some models (e.g. `grok-build`)
     /// reject an explicit `reasoningEffort` with a 400. Output is filtered
-    /// through [`prompt_suggest::sanitize_suggestion`]; any failure returns
     /// through [`prompt_suggest::sanitize_suggestion`]; any failure returns
     /// `None`.
     pub(super) async fn handle_suggest_prompt(
@@ -629,10 +629,22 @@ impl SessionActor {
             return None;
         };
 
-        let sampling_client = match self.prepare_chat_completion(false).await {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::debug!(error = %e, "prompt suggest: sampling client unavailable");
+        let active_session_config = self.reconstruct_full_config().await;
+        let Some(mut suggest_config) = self.resolve_aux_sampler_config(&model).await else {
+            tracing::debug!(model = %model, "prompt suggest: model sampling config unavailable");
+            return None;
+        };
+        crate::agent::config::stamp_session_local_sampler_fields(
+            &mut suggest_config,
+            &active_session_config,
+            self.client_identifier.clone(),
+            Some(self.max_retries),
+        );
+        let model = suggest_config.model.clone();
+        let sampling_client = match xai_grok_sampler::SamplingClient::new(suggest_config) {
+            Ok(client) => client,
+            Err(error) => {
+                tracing::debug!(%error, "prompt suggest: sampling client unavailable");
                 return None;
             }
         };

@@ -36,6 +36,11 @@ fn should_warn_missing_session(ctx: MissingSessionCtx) -> bool {
     }
 }
 impl MvpAgent {
+    pub(crate) fn origin_restricted(&self) -> bool {
+        self.origin_embedded
+            && self.origin_profile
+                == crate::agent::config::OriginEmbeddedProfile::Restricted
+    }
     /// Announce a session's new title over ACP. ACP scopes `session/update` to
     /// sessions the client established, and a rename can name a history row it
     /// never loaded, so the liveness check belongs here rather than at each
@@ -466,7 +471,7 @@ impl MvpAgent {
     /// walk once; per-session `build_for_cwd` still re-resolves project-scoped
     /// plugins for each session's own cwd.
     pub(super) fn ensure_plugin_registry(&self) {
-        if self.origin_embedded {
+        if self.origin_restricted() {
             // Embedded sessions receive a construction-time registry and never
             // scan ambient project, user, Claude, marketplace, or install roots.
             self.plugin_registry_initialized.set(true);
@@ -502,7 +507,7 @@ impl MvpAgent {
         Vec<acp::McpServer>,
         Option<chrono::DateTime<chrono::Utc>>,
     ) {
-        if self.origin_embedded {
+        if self.origin_restricted() {
             if !client_servers.is_empty() {
                 tracing::warn!(
                     count = client_servers.len(),
@@ -2283,6 +2288,28 @@ impl MvpAgent {
         &self,
     ) -> xai_grok_tools::implementations::grok_build::image_gen::ImageGenConfig {
         use xai_grok_tools::implementations::grok_build::image_gen::ImageGenConfig;
+        if self.origin_restricted() {
+            return ImageGenConfig::Disabled;
+        }
+        if let Some(media) = self.cfg.borrow().origin_media.clone() {
+            if media.api_key.trim().is_empty() || media.base_url.trim().is_empty() {
+                return ImageGenConfig::Disabled;
+            }
+            return ImageGenConfig::Enabled {
+                api_key: media.api_key,
+                base_url: media.base_url,
+                extra_headers: media.extra_headers,
+                query_params: Box::new(media.query_params),
+                image_gen_enabled: media.image_gen_enabled,
+                image_edit_enabled: media.image_edit_enabled,
+                model_override: media.image_gen_model,
+                edit_model_override: media.image_edit_model,
+                use_dynamic_api_key_provider: false,
+                // Custom API providers are metered and authorized by the
+                // embedding host, not by Grok account subscription tiers.
+                tier_restricted: false,
+            };
+        }
         let sampling_config = self.sampling_config.borrow();
         let Some(ref api_key) = sampling_config.api_key else {
             return ImageGenConfig::Disabled;
@@ -2307,10 +2334,12 @@ impl MvpAgent {
             api_key: api_key.clone(),
             base_url,
             extra_headers: headers,
+            query_params: Box::default(),
             image_gen_enabled: cfg.resolve_image_gen().value,
             image_edit_enabled: cfg.resolve_image_edit().value,
             model_override: cfg.resolve_image_gen_model_override(),
             edit_model_override: cfg.resolve_image_edit_model_override(),
+            use_dynamic_api_key_provider: true,
             tier_restricted,
         }
     }
@@ -2326,7 +2355,31 @@ impl MvpAgent {
         &self,
     ) -> xai_grok_tools::implementations::grok_build::video_gen::VideoGenConfig {
         use xai_grok_tools::implementations::grok_build::video_gen::VideoGenConfig;
+        if self.origin_restricted() {
+            return VideoGenConfig::Disabled;
+        }
         let cfg = self.cfg.borrow();
+        if let Some(media) = cfg.origin_media.clone() {
+            if !media.video_gen_enabled
+                || media.api_key.trim().is_empty()
+                || media.base_url.trim().is_empty()
+            {
+                return VideoGenConfig::Disabled;
+            }
+            return VideoGenConfig::Enabled {
+                api_key: media.api_key,
+                base_url: media.base_url,
+                extra_headers: media.extra_headers,
+                query_params: Box::new(media.query_params),
+                image_to_video_model: media.image_to_video_model,
+                reference_to_video_model: media.reference_to_video_model,
+                zdr_video_output_s3: None,
+                use_dynamic_api_key_provider: false,
+                // Subscription tiers are a first-party account concept; a
+                // custom provider applies its own authorization policy.
+                tier_restricted: false,
+            };
+        }
         if !cfg.resolve_video_gen().value {
             return VideoGenConfig::Disabled;
         }
@@ -2361,14 +2414,20 @@ impl MvpAgent {
             api_key,
             base_url,
             extra_headers: headers,
+            query_params: Box::default(),
+            image_to_video_model: None,
+            reference_to_video_model: None,
             zdr_video_output_s3: zdr_video_output_s3.map(Box::new),
+            use_dynamic_api_key_provider: true,
             tier_restricted,
         }
     }
     pub(super) fn prepare_web_search_sampling_config(&self) -> Option<SamplingConfig> {
         let model_id = self.cfg.borrow().web_search_model.clone();
         let models = self.models_manager.models();
-        let session = self.current_or_buffered_auth();
+        let session = (!self.origin_embedded)
+            .then(|| self.current_or_buffered_auth())
+            .flatten();
         let alpha_test_key = self.cfg.borrow().endpoints.alpha_test_key.clone();
         let client_version = self.cfg.borrow().client_version.clone();
         let mut cfg = config::resolve_web_search_sampling_config(
@@ -2449,7 +2508,14 @@ impl MvpAgent {
         auth_manager: Arc<AuthManager>,
         models_manager: crate::agent::models::ModelsManager,
     ) -> Self {
-        Self::with_models_mode(gateway, cfg, auth_manager, models_manager, None)
+        Self::with_models_mode(
+            gateway,
+            cfg,
+            auth_manager,
+            models_manager,
+            None,
+            crate::agent::config::OriginEmbeddedProfile::Desktop,
+        )
     }
 
     /// Origin embedded boundary: construct from fixed models without reading
@@ -2461,13 +2527,25 @@ impl MvpAgent {
         models_manager: crate::agent::models::ModelsManager,
         storage_root: PathBuf,
     ) -> Self {
-        Self::with_models_mode(
+        Self::with_origin_embedded_profile_models(
             gateway,
             cfg,
             auth_manager,
             models_manager,
-            Some(storage_root),
+            storage_root,
+            crate::agent::config::OriginEmbeddedProfile::Restricted,
         )
+    }
+
+    pub fn with_origin_embedded_profile_models(
+        gateway: GatewaySender,
+        cfg: &AgentConfig,
+        auth_manager: Arc<AuthManager>,
+        models_manager: crate::agent::models::ModelsManager,
+        storage_root: PathBuf,
+        profile: crate::agent::config::OriginEmbeddedProfile,
+    ) -> Self {
+        Self::with_models_mode(gateway, cfg, auth_manager, models_manager, Some(storage_root), profile)
     }
 
     fn with_models_mode(
@@ -2476,6 +2554,7 @@ impl MvpAgent {
         auth_manager: Arc<AuthManager>,
         models_manager: crate::agent::models::ModelsManager,
         storage_root: Option<PathBuf>,
+        origin_profile: crate::agent::config::OriginEmbeddedProfile,
     ) -> Self {
         let origin_embedded = storage_root.is_some();
         models_manager.set_gateway(gateway.clone());
@@ -2544,6 +2623,7 @@ impl MvpAgent {
         let activity = crate::agent::activity::AgentActivity::default();
         let instance = Self {
             origin_embedded,
+            origin_profile,
             storage_root,
             activity,
             session_registry: SessionRegistry::default(),
@@ -3566,6 +3646,9 @@ impl MvpAgent {
     /// cross-client contamination in leader mode (where `current_model_id` is
     /// shared mutable state).
     pub(super) fn seed_client_config_auth_if_available(&self) {
+        if self.origin_embedded {
+            return;
+        }
         let mut sampling_config = self.sampling_config.borrow_mut();
         if sampling_config.api_key.is_none() {
             if let Some(auth) = self.auth_manager.current_or_expired() {
@@ -4300,7 +4383,10 @@ impl MvpAgent {
         tool_ctx.monitor_event_buffer = Some(self.monitor_event_buffer.clone());
         tool_ctx.subagent_depth = 0;
         tool_ctx.auto_wake_enabled = self.cfg.borrow().auto_wake_enabled;
-        tool_ctx.origin_embedded = self.origin_embedded;
+        // ToolContext's legacy flag controls permissions and feature policy,
+        // not persistence. Keep storage isolation on MvpAgent itself.
+        tool_ctx.origin_embedded = self.origin_restricted();
+        tool_ctx.origin_runtime_embedded = self.origin_embedded;
         let support_permission = self.cfg.borrow().features.support_permission;
         let telemetry_enabled = self.product_analytics_enabled();
         let origin_client = self.origin_client_info_from_meta(init.meta.as_ref());
@@ -4363,13 +4449,13 @@ impl MvpAgent {
         );
         let skills = self.cfg.borrow().skills.clone();
         let compat = self.cfg.borrow().compat_resolved;
-        let acp_agent_profile = (!self.origin_embedded)
+        let acp_agent_profile = (!self.origin_restricted())
             .then(|| parse_agent_profile_from_meta(session_meta))
             .flatten();
         let session_default_agent_profile = acp_agent_profile
             .as_ref()
             .map(|d| d.name.clone());
-        let mut agent_definition = if self.origin_embedded {
+        let mut agent_definition = if self.origin_restricted() {
             // The embedding host selects one generic native harness. Ambient
             // env, project agent files, and transport metadata must not swap
             // prompts or toolsets underneath Forge's fixed policy.
@@ -4398,7 +4484,7 @@ impl MvpAgent {
                 );
             }
         }
-        if self.origin_embedded {
+        if self.origin_restricted() {
             agent_definition.agents_md = false;
             agent_definition.discover_skills = false;
         }
@@ -4461,7 +4547,7 @@ impl MvpAgent {
                 agent_definition.override_file_tools(file_tools);
             }
         }
-        let lsp_tools_enabled = !self.origin_embedded
+        let lsp_tools_enabled = !self.origin_restricted()
             && self.cfg.borrow().resolve_lsp_tools().value;
         if lsp_tools_enabled && tool_ctx.lsp.is_none() {
             let snapshot = self.plugin_registry_handle.snapshot();
@@ -4557,7 +4643,7 @@ impl MvpAgent {
             .borrow()
             .workflow_max_concurrent_agents;
         let session_cwd = std::path::Path::new(&session_info.cwd);
-        let session_plugin_registry = if self.origin_embedded {
+        let session_plugin_registry = if self.origin_restricted() {
             // Today's generic Forge baseline has no Product Plugin activation.
             // Keep an explicit immutable snapshot so descendants inherit the
             // same authority without falling back to the ambient shared handle.
@@ -4578,7 +4664,7 @@ impl MvpAgent {
                 session_meta,
             )
             .unwrap_or_else(|| self.cfg.borrow().resolve_ask_user_question().value);
-        let client_hooks = if self.origin_embedded {
+        let client_hooks = if self.origin_restricted() {
             crate::extensions::hooks::ClientHooks::default()
         } else {
             crate::extensions::hooks::parse_client_hooks(session_meta)
@@ -4740,6 +4826,7 @@ impl MvpAgent {
                 code_nav: client_code_nav_enabled,
                 git_head_changed,
             });
+            let transcribe_user_images = self.cfg.borrow().transcribe_user_images;
             spawn_session_on_thread(
                     session_info.clone(),
                     self.gateway.clone(),
@@ -4830,18 +4917,17 @@ impl MvpAgent {
                     path_not_found_hints,
                     tool_params_json,
                     session_plugin_registry,
-                    (!self.origin_embedded).then(|| self.plugin_registry_handle.clone()),
+                    (!self.origin_restricted()).then(|| self.plugin_registry_handle.clone()),
                     self.models_manager.clone(),
                     None,
                     None,
-                    Some(
-                        Arc::new(
-                            crate::auth::manager::SharedAuthKeyProvider(
-                                self.auth_manager.clone(),
-                            ),
-                        ),
-                    ),
+                    (!self.origin_embedded).then(|| {
+                        Arc::new(crate::auth::manager::SharedAuthKeyProvider(
+                            self.auth_manager.clone(),
+                        )) as xai_grok_tools::types::SharedApiKeyProvider
+                    }),
                     self.resolve_image_description_model(),
+                    transcribe_user_images,
                     agent_hook_registry_override,
                     workspace_ops.clone(),
                     {

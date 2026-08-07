@@ -264,6 +264,38 @@ fn parse_otlp_header_list(raw: &str) -> Vec<(String, String)> {
         .collect()
 }
 impl EndpointsConfig {
+    /// Deterministic endpoint defaults for in-process embeddings. Unlike
+    /// [`Default`], this never reads process environment variables.
+    fn origin_embedded() -> Self {
+        Self {
+            cli_chat_proxy_base_url: None,
+            xai_api_base_url: XAI_API_BASE_URL_DEFAULT.to_owned(),
+            alpha_test_key: None,
+            models_base_url: None,
+            models_list_url: None,
+            feedback_base_url: None,
+            trace_upload_url: None,
+            trace_upload_bucket: None,
+            trace_upload_region: None,
+            trace_upload_credentials_file: None,
+            trace_upload_credentials: None,
+            trace_upload_endpoint_url: None,
+            deployment_key: None,
+            managed_config_url: None,
+            otel_exporter_otlp_endpoint: None,
+            otel_exporter_otlp_traces_endpoint: None,
+            otel_exporter_otlp_headers: None,
+            grok_internal_otlp_traces_endpoint: None,
+            grok_internal_otlp_headers: None,
+            external_otel_master_switch: false,
+            otel_traces_exporter: None,
+            otel_traces_export_interval: None,
+            otel_exporter_otlp_timeout: None,
+            management_api_key: None,
+            gcs_service_account_key: None,
+        }
+    }
+
     pub fn has_custom_endpoint(&self) -> bool {
         self.models_base_url.is_some() || self.models_list_url.is_some()
     }
@@ -1325,12 +1357,60 @@ pub struct ShellEnvironmentPolicyKnownKeys {
     pub set: Option<toml::Value>,
     pub include_only: Option<toml::Value>,
 }
+
+/// Explicit media-service configuration supplied by an in-process host.
+/// This is runtime state rather than user configuration, so it never consults
+/// environment variables or config files and is never serialized.
+#[derive(Clone, Default)]
+pub struct OriginMediaConfig {
+    pub api_key: String,
+    pub base_url: String,
+    pub extra_headers: IndexMap<String, String>,
+    pub query_params: IndexMap<String, String>,
+    pub image_gen_enabled: bool,
+    pub image_edit_enabled: bool,
+    pub video_gen_enabled: bool,
+    pub image_gen_model: Option<String>,
+    pub image_edit_model: Option<String>,
+    pub image_to_video_model: Option<String>,
+    pub reference_to_video_model: Option<String>,
+}
+
+impl std::fmt::Debug for OriginMediaConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OriginMediaConfig")
+            .field("api_key", &"[redacted]")
+            .field("base_url", &self.base_url)
+            .field(
+                "extra_headers",
+                &self.extra_headers.keys().collect::<Vec<_>>(),
+            )
+            .field(
+                "query_params",
+                &self.query_params.keys().collect::<Vec<_>>(),
+            )
+            .field("image_gen_enabled", &self.image_gen_enabled)
+            .field("image_edit_enabled", &self.image_edit_enabled)
+            .field("video_gen_enabled", &self.video_gen_enabled)
+            .field("image_gen_model", &self.image_gen_model)
+            .field("image_edit_model", &self.image_edit_model)
+            .field("image_to_video_model", &self.image_to_video_model)
+            .field("reference_to_video_model", &self.reference_to_video_model)
+            .finish()
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Config {
     /// True only for the in-process Origin boundary. This is runtime state,
     /// never user configuration, and is propagated to native subagents.
     #[serde(skip)]
     pub origin_embedded: bool,
+    /// Explicit media provider selected by an Origin desktop host. When set,
+    /// this is authoritative and bypasses ambient media feature/provider
+    /// resolution.
+    #[serde(skip)]
+    pub origin_media: Option<OriginMediaConfig>,
     pub features: Features,
     /// `[goal]` section: canonical `/goal` configuration. See [`GoalConfig`].
     #[serde(default)]
@@ -1630,11 +1710,26 @@ pub struct Config {
     /// Image describe model (`grok-build` default via `ModelOverrideConfig::resolve`).
     #[serde(skip)]
     pub image_description_model: Option<String>,
+    /// Route user image blocks through `image_description_model` before the
+    /// main turn. Kept separate from the model override so integrations can
+    /// opt in without changing the stock shell's image-file behavior.
+    #[serde(skip)]
+    pub transcribe_user_images: bool,
     /// Next-prompt suggestion model pin (`env > [models] prompt_suggestion >
     /// remote`), consumed catalog-guarded by `handle_suggest_prompt`; see
     /// `ModelOverrideConfig::resolve`.
     #[serde(skip)]
     pub prompt_suggest_model_pin: crate::config::PromptSuggestModelPin,
+}
+
+/// Feature policy for an Origin-hosted agent. Both profiles retain the
+/// embedded process and persistence boundary; Desktop restores the normal
+/// Grok feature surface inside that boundary.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum OriginEmbeddedProfile {
+    #[default]
+    Restricted,
+    Desktop,
 }
 #[derive(Debug, Clone, Default)]
 pub struct CliAgentOverrides {
@@ -1800,6 +1895,7 @@ impl Config {
         let endpoints = EndpointsConfig::default();
         Self {
             origin_embedded: false,
+            origin_media: None,
             features: Features::default(),
             goal: GoalConfig::default(),
             workflows: WorkflowsConfig::default(),
@@ -1892,6 +1988,7 @@ impl Config {
             web_search_model: crate::models::default_web_search_model().to_owned(),
             session_summary_model: None,
             image_description_model: None,
+            transcribe_user_images: false,
             prompt_suggest_model_pin: crate::config::PromptSuggestModelPin::Unpinned,
         }
     }
@@ -1901,6 +1998,7 @@ impl Config {
     pub fn origin_embedded() -> Self {
         let mut cfg = Self::defaults_without_env();
         cfg.origin_embedded = true;
+        cfg.endpoints = EndpointsConfig::origin_embedded();
         cfg.features.telemetry = Some(TelemetryMode::Disabled);
         cfg.features.feedback = Some(false);
         cfg.features.managed_config = Some(false);
@@ -1924,11 +2022,43 @@ impl Config {
         cfg.agent.name = Some("grok-build".into());
         cfg
     }
+
+    /// Origin desktop boundary: deterministic, environment-independent
+    /// defaults and isolated persistence, without the restricted feature
+    /// policy used by [`Self::origin_embedded`].
+    pub fn origin_desktop() -> Self {
+        let mut cfg = Self::defaults_without_env();
+        // This flag describes the process/persistence boundary. Feature
+        // restrictions are carried separately by `OriginEmbeddedProfile`.
+        cfg.origin_embedded = true;
+        cfg.endpoints = EndpointsConfig::origin_embedded();
+        cfg.features.telemetry = Some(TelemetryMode::Disabled);
+        cfg.features.feedback = Some(false);
+        cfg.features.managed_config = Some(false);
+        cfg.telemetry.trace_upload = Some(false);
+        cfg.cli.auto_update = Some(false);
+        cfg.remote_settings = None;
+        cfg.announcements.clear();
+        cfg
+    }
 }
 
 #[cfg(test)]
 mod origin_embedded_tests {
     use super::*;
+
+    fn assert_no_ambient_endpoint_credentials(cfg: &Config) {
+        let endpoints = &cfg.endpoints;
+        assert!(endpoints.alpha_test_key.is_none());
+        assert!(endpoints.deployment_key.is_none());
+        assert!(endpoints.management_api_key.is_none());
+        assert!(endpoints.gcs_service_account_key.is_none());
+        assert!(endpoints.trace_upload_credentials.is_none());
+        assert!(endpoints.trace_upload_credentials_file.is_none());
+        assert!(endpoints.otel_exporter_otlp_headers.is_none());
+        assert!(endpoints.grok_internal_otlp_headers.is_none());
+        assert!(!endpoints.external_otel_master_switch);
+    }
 
     #[test]
     fn origin_embedded_disables_ambient_products() {
@@ -1948,6 +2078,7 @@ mod origin_embedded_tests {
         assert_eq!(cfg.workflows.enabled, Some(false));
         assert_eq!(cfg.agent.name.as_deref(), Some("grok-build"));
         assert!(cfg.cli_agent_overrides.tools.is_none());
+        assert_no_ambient_endpoint_credentials(&cfg);
     }
 
     #[test]
@@ -1956,6 +2087,27 @@ mod origin_embedded_tests {
         assert!(cfg.managed_mcps_enabled);
         assert!(cfg.auto_wake_enabled);
         assert!(!cfg.disable_web_search);
+    }
+
+    #[test]
+    fn origin_desktop_keeps_features_inside_isolated_boundary() {
+        let default_marketplace_source_count =
+            Config::defaults_without_env().marketplace.sources.len();
+        let cfg = Config::origin_desktop();
+        assert!(cfg.origin_embedded);
+        assert_ne!(cfg.features.web_fetch, Some(false));
+        assert!(!cfg.disable_web_search);
+        assert!(!cfg.cli_no_memory);
+        assert_ne!(cfg.workflows.enabled, Some(false));
+        assert!(cfg.managed_mcps_enabled);
+        assert!(cfg.auto_wake_enabled);
+        assert_eq!(
+            cfg.marketplace.sources.len(),
+            default_marketplace_source_count
+        );
+        assert_eq!(cfg.features.telemetry, Some(TelemetryMode::Disabled));
+        assert_eq!(cfg.cli.auto_update, Some(false));
+        assert_no_ambient_endpoint_credentials(&cfg);
     }
 }
 /// Config paths read by raw-layer resolvers, not [`Config`] serde fields, so
@@ -3931,6 +4083,7 @@ fn default_models(endpoints: &EndpointsConfig) -> IndexMap<String, ModelEntryCon
                 api_key: None,
                 env_key: None,
                 extra_headers: IndexMap::new(),
+                query_params: IndexMap::new(),
                 use_concise: false,
                 hidden: m.hidden,
                 supported_in_api: m.supported_in_api,
@@ -3997,6 +4150,9 @@ pub struct ModelEntryConfig {
     /// Example: { "x-anthropic-api-key" = "sk-ant-..." }
     #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
     pub extra_headers: IndexMap<String, String>,
+    /// Query parameters appended to every request for this model.
+    #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
+    pub query_params: IndexMap<String, String>,
     /// The total context window size in tokens for this model.
     /// Used for auto-compact threshold calculations.
     /// Required — BYOK users must explicitly set this in config.toml.
@@ -4375,7 +4531,7 @@ impl ModelInfo {
             api_backend: entry.api_backend.clone(),
             auth_scheme: entry.auth_scheme.unwrap_or_default(),
             extra_headers: entry.extra_headers.clone(),
-            query_params: IndexMap::new(),
+            query_params: entry.query_params.clone(),
             env_http_headers: IndexMap::new(),
             context_window: entry.context_window,
             auto_compact_threshold_percent: entry.auto_compact_threshold_percent,
@@ -7587,6 +7743,7 @@ reasoning_effort = "low"
             api_backend: ApiBackend::default(),
             auth_scheme: None,
             extra_headers: IndexMap::new(),
+            query_params: IndexMap::new(),
             context_window: NonZeroU64::new(200_000).unwrap(),
             auto_compact_threshold_percent: None,
             system_prompt_label: None,
@@ -7746,6 +7903,7 @@ reasoning_effort = "low"
             api_backend: ApiBackend::default(),
             auth_scheme: None,
             extra_headers: IndexMap::new(),
+            query_params: IndexMap::new(),
             context_window: NonZeroU64::new(200_000).unwrap(),
             auto_compact_threshold_percent: None,
             system_prompt_label: None,
@@ -8197,6 +8355,7 @@ reasoning_effort = "low"
             api_backend: ApiBackend::default(),
             auth_scheme: None,
             extra_headers: IndexMap::new(),
+            query_params: IndexMap::new(),
             context_window: NonZeroU64::new(200_000).unwrap(),
             auto_compact_threshold_percent: None,
             system_prompt_label: None,

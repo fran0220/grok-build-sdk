@@ -104,6 +104,7 @@ async fn web_search_uses_model_override_from_config_end_to_end() {
             base_url: web_search_sampling.base_url.clone(),
             model: web_search_sampling.model.clone(),
             extra_headers: web_search_sampling.extra_headers.clone(),
+            query_params: Box::new(web_search_sampling.query_params.clone()),
             // The optional extra access key is no longer carried on
             // `SamplerConfig`. The shell-level value flows in via
             // `Credentials` at session-spawn time; in this self-contained

@@ -2252,6 +2252,7 @@ mod tests {
             base_url: "https://api.x.ai/v1".into(),
             model: "test-web-search-model".into(),
             extra_headers: Default::default(),
+            query_params: Default::default(),
             alpha_test_key: None,
         })
         .with_web_fetch_config(WebFetchConfig::Enabled {
@@ -2379,6 +2380,7 @@ mod tests {
                 base_url: "https://api.x.ai/v1".into(),
                 model: "test-web-search-model".into(),
                 extra_headers: Default::default(),
+                query_params: Default::default(),
                 alpha_test_key: None,
             }
         } else {

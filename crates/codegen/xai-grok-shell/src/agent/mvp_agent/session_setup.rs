@@ -239,7 +239,7 @@ impl MvpAgent {
         let cwd = AbsPathBuf::new(cwd.to_path_buf())
             .map_err(|e| acp::Error::invalid_params().data(e.to_string()))?;
         let remote_settings = self.cfg.borrow().remote_settings.clone();
-        if !self.origin_embedded {
+        if !self.origin_restricted() {
             folder_trust::resolve_and_record(cwd.as_path(), remote_settings.as_ref(), false);
         }
         let (initial_client_mcp_servers, mcp_servers, managed_mcp_expires_at) = self
@@ -290,7 +290,12 @@ impl MvpAgent {
         arguments: acp::NewSessionRequest,
     ) -> Result<acp::NewSessionResponse, acp::Error> {
         reject_chat_kind_without_feature(arguments.meta.as_ref())?;
-        tracing::debug!(config = ?self.sampling_config, "Received new session request {arguments:?}");
+        tracing::debug!(
+            cwd = ?arguments.cwd,
+            mcp_server_count = arguments.mcp_servers.len(),
+            has_meta = arguments.meta.is_some(),
+            "Received new session request"
+        );
         let init = self.initialize_request.get().ok_or_else(|| {
             acp::Error::invalid_params().data("initialize must be called before new_session")
         })?;
@@ -342,7 +347,7 @@ impl MvpAgent {
         let session_computer_sessions = resolve_session_computer_sessions(arguments.meta.as_ref())?;
         let is_chat_kind =
             ChatKindClaim::from_meta(arguments.meta.as_ref()).declared() == SessionKind::Chat;
-        let session_yolo_mode = self.origin_embedded
+        let session_yolo_mode = self.origin_restricted()
             || arguments
                 .meta
                 .as_ref()
@@ -527,7 +532,7 @@ impl MvpAgent {
                 Some(self.gateway.clone()),
                 summary_model,
                 registry_title_sync,
-                !self.origin_embedded,
+                !self.origin_restricted(),
                 self.storage_root.clone(),
             )
             .await
@@ -597,7 +602,7 @@ impl MvpAgent {
         if local_workspace_intent_present(arguments.meta.as_ref()) {
             self.mark_local_workspace_bound(session_id.clone());
         }
-        if !self.origin_embedded {
+        if !self.origin_restricted() {
             self.maybe_spawn_interactive_trust_prompt(
                 &session_id,
                 cwd.as_path(),
@@ -770,7 +775,13 @@ impl MvpAgent {
             return Err(acp::Error::internal_error()
                 .data("previous native session actor did not terminate; refusing replacement"));
         }
-        tracing::debug!("Received load session request {arguments:?}");
+        tracing::debug!(
+            session_id = %arguments.session_id.0,
+            cwd = ?arguments.cwd,
+            mcp_server_count = arguments.mcp_servers.len(),
+            has_meta = arguments.meta.is_some(),
+            "Received load session request"
+        );
         let init = self.initialize_request.get().ok_or_else(|| {
             acp::Error::invalid_params().data("initialize must be called before load_session")
         })?;
@@ -892,7 +903,7 @@ impl MvpAgent {
             Some(self.gateway.clone()),
             summary_model,
             registry_title_sync,
-            !self.origin_embedded,
+            !self.origin_restricted(),
             self.storage_root.clone(),
         )
         .await
@@ -923,7 +934,7 @@ impl MvpAgent {
             .and_then(|m| m.get("cursor"))
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
-        let session_yolo_mode = self.origin_embedded
+        let session_yolo_mode = self.origin_restricted()
             || request_meta
                 .as_ref()
                 .and_then(|m| m.get("yoloMode"))
@@ -939,7 +950,7 @@ impl MvpAgent {
         let code_restore_info = self
             .restore_session_code(&session_id, &cwd, &summary, policy.restore_code)
             .await;
-        let load_envrc = if self.origin_embedded {
+        let load_envrc = if self.origin_restricted() {
             false
         } else {
             let skip_envrc = request_meta
@@ -966,7 +977,7 @@ impl MvpAgent {
                 no_replay,
             )
             .await?;
-        let preloaded_envrc = if self.origin_embedded {
+        let preloaded_envrc = if self.origin_restricted() {
             Default::default()
         } else {
             xai_grok_workspace::envrc::load_envrc_or_empty_when_trusted(
@@ -1077,7 +1088,7 @@ impl MvpAgent {
                 );
             }
         }
-        if !self.origin_embedded
+        if !self.origin_restricted()
             && let Some(hooks) =
                 crate::extensions::hooks::reconnect_client_hooks(request_meta.as_ref())
             && let Some(handle) = self.resident_handle(&session_id)
@@ -1096,7 +1107,7 @@ impl MvpAgent {
             session_yolo_mode,
             session_auto_mode,
         );
-        if !self.origin_embedded {
+        if !self.origin_restricted() {
             self.maybe_spawn_interactive_trust_prompt(
                 &session_id,
                 cwd.as_path(),

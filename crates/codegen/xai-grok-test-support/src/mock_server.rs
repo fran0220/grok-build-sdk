@@ -17,6 +17,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
 
 use anyhow::Context as _;
+use axum::extract::OriginalUri;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
@@ -670,148 +671,167 @@ impl MockInferenceServer {
         Router::new()
             .route(
                 "/v1/chat/completions",
-                post(move |headers: HeaderMap, Json(body): Json<Value>| {
-                    let log = log_cc.clone();
-                    let mode = mode_cc.clone();
-                    let overrides = overrides_cc.clone();
-                    let agent_turns = agent_turns_cc.clone();
-                    let delay = delay_cc.clone();
-                    async move {
-                        let auth = Self::extract_auth(&headers);
-                        log.record(
-                            "POST",
-                            "/v1/chat/completions",
-                            Some(&body),
-                            auth.as_deref(),
-                            Self::headers_vec(&headers),
-                        );
+                post(
+                    move |OriginalUri(uri): OriginalUri,
+                          headers: HeaderMap,
+                          Json(body): Json<Value>| {
+                        let log = log_cc.clone();
+                        let mode = mode_cc.clone();
+                        let overrides = overrides_cc.clone();
+                        let agent_turns = agent_turns_cc.clone();
+                        let delay = delay_cc.clone();
+                        async move {
+                            let auth = Self::extract_auth(&headers);
+                            let path = uri
+                                .path_and_query()
+                                .map_or(uri.path(), |value| value.as_str());
+                            log.record(
+                                "POST",
+                                path,
+                                Some(&body),
+                                auth.as_deref(),
+                                Self::headers_vec(&headers),
+                            );
 
-                        let request =
-                            overrides.classify(InferenceEndpoint::ChatCompletions, &headers, &body);
-                        let chunk_delay = *delay.read().unwrap();
-                        if let Some(response) = overrides
-                            .response_override(&request, &headers, chunk_delay)
-                            .await
-                        {
-                            return response;
+                            let request = overrides.classify(
+                                InferenceEndpoint::ChatCompletions,
+                                &headers,
+                                &body,
+                            );
+                            let chunk_delay = *delay.read().unwrap();
+                            if let Some(response) = overrides
+                                .response_override(&request, &headers, chunk_delay)
+                                .await
+                            {
+                                return response;
+                            }
+
+                            let user_msg = body
+                                .get("messages")
+                                .and_then(|m| m.as_array())
+                                .and_then(|msgs| {
+                                    msgs.iter().rev().find(|m| {
+                                        m.get("role").and_then(Value::as_str) == Some("user")
+                                    })
+                                })
+                                .and_then(|m| m.get("content"))
+                                .and_then(Value::as_str)
+                                .unwrap_or("hello");
+
+                            let model = body
+                                .get("model")
+                                .and_then(Value::as_str)
+                                .unwrap_or("test-model");
+
+                            let events = match Self::pop_agent_turn(&agent_turns, &request) {
+                                Some(text) => sse::chat_completion_events_exact(&text, model),
+                                None => match &*mode.read().unwrap() {
+                                    ResponseMode::Echo => sse::chat_completion_events(
+                                        &format!("Echo: {user_msg}"),
+                                        model,
+                                    ),
+                                    ResponseMode::Fixed(text) => {
+                                        sse::chat_completion_events_exact(text, model)
+                                    }
+                                },
+                            };
+                            let gate = overrides.fallback_terminal_wait(&request);
+                            let stream = paced_events(events, *delay.read().unwrap(), gate);
+                            Sse::new(stream)
+                                .keep_alive(KeepAlive::default())
+                                .into_response()
                         }
-
-                        let user_msg = body
-                            .get("messages")
-                            .and_then(|m| m.as_array())
-                            .and_then(|msgs| {
-                                msgs.iter()
-                                    .rev()
-                                    .find(|m| m.get("role").and_then(Value::as_str) == Some("user"))
-                            })
-                            .and_then(|m| m.get("content"))
-                            .and_then(Value::as_str)
-                            .unwrap_or("hello");
-
-                        let model = body
-                            .get("model")
-                            .and_then(Value::as_str)
-                            .unwrap_or("test-model");
-
-                        let events = match Self::pop_agent_turn(&agent_turns, &request) {
-                            Some(text) => sse::chat_completion_events_exact(&text, model),
-                            None => match &*mode.read().unwrap() {
-                                ResponseMode::Echo => {
-                                    sse::chat_completion_events(&format!("Echo: {user_msg}"), model)
-                                }
-                                ResponseMode::Fixed(text) => {
-                                    sse::chat_completion_events_exact(text, model)
-                                }
-                            },
-                        };
-                        let gate = overrides.fallback_terminal_wait(&request);
-                        let stream = paced_events(events, *delay.read().unwrap(), gate);
-                        Sse::new(stream)
-                            .keep_alive(KeepAlive::default())
-                            .into_response()
-                    }
-                }),
+                    },
+                ),
             )
             .route(
                 "/v1/responses",
-                post(move |headers: HeaderMap, Json(body): Json<Value>| {
-                    let log = log_rs.clone();
-                    let mode = mode_rs.clone();
-                    let overrides = overrides_rs.clone();
-                    let agent_turns = agent_turns_rs.clone();
-                    let delay = delay_rs.clone();
-                    async move {
-                        let auth = Self::extract_auth(&headers);
-                        log.record(
-                            "POST",
-                            "/v1/responses",
-                            Some(&body),
-                            auth.as_deref(),
-                            Self::headers_vec(&headers),
-                        );
+                post(
+                    move |OriginalUri(uri): OriginalUri,
+                          headers: HeaderMap,
+                          Json(body): Json<Value>| {
+                        let log = log_rs.clone();
+                        let mode = mode_rs.clone();
+                        let overrides = overrides_rs.clone();
+                        let agent_turns = agent_turns_rs.clone();
+                        let delay = delay_rs.clone();
+                        async move {
+                            let auth = Self::extract_auth(&headers);
+                            let path = uri
+                                .path_and_query()
+                                .map_or(uri.path(), |value| value.as_str());
+                            log.record(
+                                "POST",
+                                path,
+                                Some(&body),
+                                auth.as_deref(),
+                                Self::headers_vec(&headers),
+                            );
 
-                        let request =
-                            overrides.classify(InferenceEndpoint::Responses, &headers, &body);
-                        let chunk_delay = *delay.read().unwrap();
-                        if let Some(response) = overrides
-                            .response_override(&request, &headers, chunk_delay)
-                            .await
-                        {
-                            return response;
-                        }
+                            let request =
+                                overrides.classify(InferenceEndpoint::Responses, &headers, &body);
+                            let chunk_delay = *delay.read().unwrap();
+                            if let Some(response) = overrides
+                                .response_override(&request, &headers, chunk_delay)
+                                .await
+                            {
+                                return response;
+                            }
 
-                        let user_msg = body
-                            .get("input")
-                            .and_then(|i| i.as_array())
-                            .and_then(|items| {
-                                items.iter().rev().find(|item| {
-                                    item.get("role").and_then(Value::as_str) == Some("user")
+                            let user_msg = body
+                                .get("input")
+                                .and_then(|i| i.as_array())
+                                .and_then(|items| {
+                                    items.iter().rev().find(|item| {
+                                        item.get("role").and_then(Value::as_str) == Some("user")
+                                    })
                                 })
-                            })
-                            .and_then(|item| {
-                                item.get("content").and_then(|c| {
-                                    c.as_str().map(String::from).or_else(|| {
-                                        c.as_array().and_then(|parts| {
-                                            parts.iter().find_map(|p| {
-                                                if p.get("type").and_then(Value::as_str)
-                                                    == Some("input_text")
-                                                {
-                                                    p.get("text")
-                                                        .and_then(Value::as_str)
-                                                        .map(String::from)
-                                                } else {
-                                                    None
-                                                }
+                                .and_then(|item| {
+                                    item.get("content").and_then(|c| {
+                                        c.as_str().map(String::from).or_else(|| {
+                                            c.as_array().and_then(|parts| {
+                                                parts.iter().find_map(|p| {
+                                                    if p.get("type").and_then(Value::as_str)
+                                                        == Some("input_text")
+                                                    {
+                                                        p.get("text")
+                                                            .and_then(Value::as_str)
+                                                            .map(String::from)
+                                                    } else {
+                                                        None
+                                                    }
+                                                })
                                             })
                                         })
                                     })
                                 })
-                            })
-                            .unwrap_or_else(|| "hello".to_string());
+                                .unwrap_or_else(|| "hello".to_string());
 
-                        let model = body
-                            .get("model")
-                            .and_then(Value::as_str)
-                            .unwrap_or("test-model");
+                            let model = body
+                                .get("model")
+                                .and_then(Value::as_str)
+                                .unwrap_or("test-model");
 
-                        let events = match Self::pop_agent_turn(&agent_turns, &request) {
-                            Some(text) => sse::responses_api_events_exact(&text, model),
-                            None => match &*mode.read().unwrap() {
-                                ResponseMode::Echo => {
-                                    sse::responses_api_events(&format!("Echo: {user_msg}"), model)
-                                }
-                                ResponseMode::Fixed(text) => {
-                                    sse::responses_api_events_exact(text, model)
-                                }
-                            },
-                        };
-                        let gate = overrides.fallback_terminal_wait(&request);
-                        let stream = paced_events(events, *delay.read().unwrap(), gate);
-                        Sse::new(stream)
-                            .keep_alive(KeepAlive::default())
-                            .into_response()
-                    }
-                }),
+                            let events = match Self::pop_agent_turn(&agent_turns, &request) {
+                                Some(text) => sse::responses_api_events_exact(&text, model),
+                                None => match &*mode.read().unwrap() {
+                                    ResponseMode::Echo => sse::responses_api_events(
+                                        &format!("Echo: {user_msg}"),
+                                        model,
+                                    ),
+                                    ResponseMode::Fixed(text) => {
+                                        sse::responses_api_events_exact(text, model)
+                                    }
+                                },
+                            };
+                            let gate = overrides.fallback_terminal_wait(&request);
+                            let stream = paced_events(events, *delay.read().unwrap(), gate);
+                            Sse::new(stream)
+                                .keep_alive(KeepAlive::default())
+                                .into_response()
+                        }
+                    },
+                ),
             )
             .route(
                 "/v1/messages",

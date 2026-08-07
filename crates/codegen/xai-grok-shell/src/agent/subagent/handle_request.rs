@@ -104,11 +104,13 @@ pub(crate) async fn run_shell_child(
     } = run;
     let start = std::time::Instant::now();
     let mut completion_data = ShellCompletionData::from_context(&ctx);
+    // Storage/root correlation remains embedded for both Origin profiles.
     let origin_embedded = ctx
         .agent_config
         .as_ref()
         .is_some_and(|config| config.origin_embedded);
-    if origin_embedded
+    let origin_restricted = ctx.origin_restricted;
+    if origin_restricted
         && (request
             .cwd
             .as_deref()
@@ -168,7 +170,7 @@ pub(crate) async fn run_shell_child(
     }
     resolve_subagent_toolset(
         &request.subagent_type,
-        if origin_embedded {
+        if origin_restricted {
             None
         } else {
             request.runtime_overrides.harness_agent_type.as_deref()
@@ -188,7 +190,7 @@ pub(crate) async fn run_shell_child(
         cwd,
         &definition,
     );
-    if origin_embedded {
+    if origin_restricted {
         effective_runtime.model = Some(ctx.model_id.0.to_string());
         effective_runtime.reasoning_effort = None;
         effective_runtime.capability_mode = None;
@@ -513,7 +515,7 @@ pub(crate) async fn run_shell_child(
             effective_model_id = parent_mid;
         }
     }
-    if !origin_embedded
+    if !origin_restricted
         && let Some(ref source) = resume_source
         && let Some(ref source_model) = source.model_id
         && effective_model_id.0.as_ref() != source_model.as_str()
@@ -803,8 +805,9 @@ pub(crate) async fn run_shell_child(
     tool_ctx.sampler_retry_only_before_output = task_output_budget.is_some();
     tool_ctx.monitor_event_buffer = Some(MonitorEventBuffer::default());
     tool_ctx.subagent_depth = child_depth;
-    tool_ctx.origin_embedded = origin_embedded;
-    tool_ctx.lsp = if origin_embedded {
+    tool_ctx.origin_embedded = origin_restricted;
+    tool_ctx.origin_runtime_embedded = origin_embedded;
+    tool_ctx.lsp = if origin_restricted {
         None
     } else {
         ctx.lsp.clone()
@@ -835,12 +838,12 @@ pub(crate) async fn run_shell_child(
             "effective_model": effective_model_id.0.as_ref(),
             "effective_model_raw": &effective_sampling_config.model,
             "base_url": &effective_sampling_config.base_url,
-            "key_prefix": key_prefix(&effective_sampling_config.api_key),
+            "has_key": effective_sampling_config.api_key.is_some(),
             "auth_type": format!("{:?}", inherited_auth_type),
             "model_has_own_creds": model_has_own_creds,
             "auth_method_id": ctx.auth_method_id.0.as_ref(),
             "parent_model": ctx.model_id.0.as_ref(),
-            "parent_key_prefix": key_prefix(&ctx.sampling_config.api_key),
+            "parent_has_key": ctx.sampling_config.api_key.is_some(),
             "context_window": effective_sampling_config.context_window,
         })),
     );
@@ -849,7 +852,7 @@ pub(crate) async fn run_shell_child(
     let agent_memory_scope = definition.memory;
     let agent_name_for_memory = definition.name.clone();
     let is_plugin_agent = definition.plugin_name.is_some();
-    let agent_permission_mode = if origin_embedded {
+    let agent_permission_mode = if origin_restricted {
         xai_grok_agent::config::PermissionMode::BypassPermissions
     } else {
         resolve_subagent_permission_mode(
@@ -858,7 +861,7 @@ pub(crate) async fn run_shell_child(
             xai_grok_workspace::permission::resolution::yolo_disabled_by_policy(),
         )
     };
-    if !origin_embedded && agent_permission_mode != definition.permission_mode {
+    if !origin_restricted && agent_permission_mode != definition.permission_mode {
         if is_plugin_agent {
             tracing::warn!(
                 agent = %definition.name,
@@ -959,7 +962,7 @@ pub(crate) async fn run_shell_child(
     }
     let agent_mcp_servers: Vec<_> = if !agent_owned_mcp_servers_allowed(
         is_plugin_agent,
-        origin_embedded,
+        origin_restricted,
     ) {
         if !definition.mcp_servers.is_empty() {
             tracing::warn!(
@@ -1218,6 +1221,7 @@ pub(crate) async fn run_shell_child(
         ctx.permission_handle.clone(),
         ctx.api_key_provider.clone(),
         ctx.image_description_model.clone(),
+        ctx.transcribe_user_images,
         ctx.hook_registry.clone(),
         ctx.workspace_ops.clone(),
         vec![],

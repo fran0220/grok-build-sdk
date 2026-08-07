@@ -110,6 +110,14 @@ pub(crate) async fn parse_prompt_with_skills(
         match block {
             acp::ContentBlock::Text(text) => message_parts.push(text.text.clone()),
             acp::ContentBlock::Image(image_content) => image_parts.push(image_content.clone()),
+            // The sampling layer currently has native image parts but no audio
+            // part. Preserve ACP audio losslessly as an explicit data-URI
+            // attachment in the user message rather than rejecting or dropping
+            // it; model backends can inspect/transcribe it, and future native
+            // audio plumbing can replace this compatibility representation.
+            acp::ContentBlock::Audio(audio) => {
+                message_parts.push(render_audio_attachment(audio));
+            }
             acp::ContentBlock::ResourceLink(link) => {
                 resource_links.push(link.clone());
                 if link.meta.is_none() {
@@ -161,6 +169,15 @@ pub(crate) async fn parse_prompt_with_skills(
         is_cursor,
     })
 }
+
+fn render_audio_attachment(audio: &acp::AudioContent) -> String {
+    let payload = serde_json::json!({
+        "mimeType": audio.mime_type,
+        "dataUri": format!("data:{};base64,{}", audio.mime_type, audio.data),
+    });
+    format!("<audio_attachment>{payload}</audio_attachment>")
+}
+
 /// Returns `(context, query)` — the two halves of the prompt kept separate
 /// so the caller can truncate context without searching for the query boundary.
 fn render_message(
@@ -478,6 +495,13 @@ mod tests {
     fn test_grok_render_plain_message() {
         let result = render_grok("hello", vec![], vec![], &[], false);
         assert_eq!(result, "<user_query>\nhello\n</user_query>");
+    }
+    #[test]
+    fn audio_attachment_is_lossless_and_self_describing() {
+        let rendered = render_audio_attachment(&acp::AudioContent::new("AQ==", "audio/wav"));
+        assert!(rendered.starts_with("<audio_attachment>"));
+        assert!(rendered.contains(r#""mimeType":"audio/wav""#));
+        assert!(rendered.contains("data:audio/wav;base64,AQ=="));
     }
     #[test]
     fn test_grok_render_with_attachments_uses_system_reminder_wrapper() {

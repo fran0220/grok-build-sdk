@@ -707,7 +707,7 @@ mod tests {
         // TEST-NET-1 (RFC 5737) is not RFC1918, so SSRF validation lets it
         // through, but no connection succeeds: reqwest returns a connection
         // error whose default Display would include the URL.
-        let secret = "ghp_VERY_REAL_SECRET_TOKEN_42";
+        let secret = "secret-token-example-42";
         let mut extra_env = std::collections::HashMap::new();
         extra_env.insert("RUNTIME_HOST".to_string(), "192.0.2.1".to_string());
         extra_env.insert("MY_TOKEN".to_string(), secret.to_string());
@@ -783,7 +783,7 @@ mod tests {
         let info = info.expect("HttpInfo should be present for connection failures too");
         assert_eq!(
             info.url,
-            "https://192.0.2.1/check?token=ghp_VERY_REAL_SECRET_TOKEN_42"
+            "https://192.0.2.1/check?token=secret-token-example-42"
         );
         assert_eq!(info.raw_url.as_deref(), Some(raw));
     }

@@ -100,6 +100,10 @@ impl AutoCompactThresholdTiers {
 /// Avoids passing `&MvpAgent` (which would require the coordinator to know
 /// about the full agent struct). Built by `MvpAgent::build_subagent_spawn_context()`.
 pub(crate) struct SubagentSpawnContext {
+    /// Whether Origin's restricted feature policy applies. This is separate
+    /// from `Config::origin_embedded`, which keeps storage/root correlation
+    /// enabled for both restricted and full desktop embeddings.
+    pub origin_restricted: bool,
     /// Parent's LSP runtime — inherited via ToolContext, same as fs/terminal.
     pub lsp: Option<std::sync::Arc<dyn xai_grok_tools::implementations::lsp::LspBackend>>,
     /// Root session's process scope, inherited so the subagent's own child
@@ -260,6 +264,7 @@ pub(crate) struct SubagentSpawnContext {
     pub worktree_type: crate::util::config::WorktreeType,
     pub api_key_provider: Option<xai_grok_tools::types::SharedApiKeyProvider>,
     pub image_description_model: String,
+    pub transcribe_user_images: bool,
     /// Dual-mode workspace operations handle.
     pub workspace_ops: xai_grok_workspace::WorkspaceOps,
     pub auth_manager: std::sync::Arc<crate::auth::AuthManager>,
@@ -684,15 +689,6 @@ async fn resolve_effective_model_config(
     }
     resolve_subagent_sampling_config(subagent_type, definition_model, ctx).await
 }
-/// Truncate an API key to a safe prefix for logging. Counts characters, not
-/// bytes: a configured key with a multi-byte character would panic a byte
-/// slice, and this only ever runs to build a log line.
-fn key_prefix(key: &Option<String>) -> String {
-    match key {
-        Some(k) => k.chars().take(8).collect(),
-        None => "<none>".to_string(),
-    }
-}
 /// Emit a unified log entry recording which model and credentials a subagent
 /// resolved to, and how they compare to the parent's.
 fn log_subagent_model_resolution(
@@ -702,8 +698,6 @@ fn log_subagent_model_resolution(
     resolved_id: &acp::ModelId,
     parent: &xai_grok_sampler::SamplerConfig,
 ) {
-    let child_key = key_prefix(&resolved.api_key);
-    let parent_key = key_prefix(&parent.api_key);
     let keys_match = resolved.api_key == parent.api_key;
     xai_grok_telemetry::unified_log::debug(
         "subagent model resolved",
@@ -713,10 +707,10 @@ fn log_subagent_model_resolution(
             "priority": priority,
             "child_model": resolved_id.0.as_ref(),
             "child_base_url": &resolved.base_url,
-            "child_key_prefix": child_key,
+            "child_has_key": resolved.api_key.is_some(),
             "parent_model": &parent.model,
             "parent_base_url": &parent.base_url,
-            "parent_key_prefix": parent_key,
+            "parent_has_key": parent.api_key.is_some(),
             "keys_match": keys_match,
         })),
     );
@@ -826,7 +820,7 @@ async fn read_parent_sampling_config(
                 Some(serde_json::json!({
                     "parent_model": &inherited.model,
                     "parent_base_url": &inherited.base_url,
-                    "parent_key_prefix": key_prefix(&inherited.api_key),
+                    "parent_has_key": inherited.api_key.is_some(),
                     "session_model_id": model_id.0.as_ref(),
                     "global_model_id": global_model_id.0.as_ref(),
                     "source": "chat_state",
@@ -845,7 +839,7 @@ async fn read_parent_sampling_config(
         Some(serde_json::json!({
             "parent_model": &ctx.sampling_config.model,
             "parent_base_url": &ctx.sampling_config.base_url,
-            "parent_key_prefix": key_prefix(&ctx.sampling_config.api_key),
+            "parent_has_key": ctx.sampling_config.api_key.is_some(),
             "source": "spawn_context_baseline",
             "has_chat_state": ctx.parent_chat_state.is_some(),
         })),
@@ -930,7 +924,7 @@ fn resolve_model_override_to_config(
             "canonical_model": canonical_model_id.0.as_ref(),
             "resolved_model_raw": &config.model,
             "base_url": &config.base_url,
-            "key_prefix": key_prefix(&config.api_key),
+            "has_key": config.api_key.is_some(),
             "has_own_credentials": entry.has_own_credentials(),
             "has_session_key": has_session_key,
             "auth_type": format!("{:?}", resolved_auth_type),
@@ -1491,10 +1485,7 @@ fn resolve_agent_definition(
     subagent_type: &str,
     ctx: &SubagentSpawnContext,
 ) -> Option<xai_grok_agent::config::AgentDefinition> {
-    let origin_embedded = ctx
-        .agent_config
-        .as_ref()
-        .is_some_and(|config| config.origin_embedded);
+    let origin_embedded = ctx.origin_restricted;
     let cli_agents = ctx
         .agent_config
         .as_ref()
@@ -1519,11 +1510,7 @@ fn resolve_agent_definition(
     Some(def)
 }
 fn available_agent_names(ctx: &SubagentSpawnContext) -> Vec<String> {
-    if ctx
-        .agent_config
-        .as_ref()
-        .is_some_and(|config| config.origin_embedded)
-    {
+    if ctx.origin_restricted {
         return origin_available_agent_names(ctx.plugin_registry.as_deref());
     }
     let cli_agents = ctx
