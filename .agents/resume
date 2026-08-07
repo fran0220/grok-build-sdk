@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$repo_root"
+
+command -v cargo >/dev/null
+command -v dotslash >/dev/null
+echo "Rust and DotSlash are ready; this repository has no services to resume."
