@@ -12,6 +12,7 @@ account login or ambient credentials.
 This repository retains the upstream CLI/TUI source and provenance so SDK
 consumers can audit the implementation. It is an independent redistribution;
 it is not an official xAI SDK. See [`SOURCE_REV`](SOURCE_REV),
+[`UPSTREAM_GROK_BUILD_COMMIT`](UPSTREAM_GROK_BUILD_COMMIT),
 [`THIRD-PARTY-NOTICES`](THIRD-PARTY-NOTICES), and the SDK's
 [capability and trust-boundary documentation](crates/grok-build-sdk/README.md).
 
@@ -38,6 +39,8 @@ runtime. It is synced periodically from the SpaceXAI monorepo.
 
 A small `SOURCE_REV` file at the root records the full monorepo commit SHA
 for the version of the code present in this tree.
+`UPSTREAM_GROK_BUILD_COMMIT` records the corresponding public
+`xai-org/grok-build` snapshot used by the SDK's automated upstream sync.
 
 </div>
 
