@@ -32,6 +32,8 @@ if ! command -v rustup >/dev/null 2>&1; then
     curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
         | sh -s -- -y --no-modify-path --default-toolchain none
 fi
+# Keep $HOME literal so it is evaluated by each future login shell.
+# shellcheck disable=SC2016
 cargo_profile_line='. "$HOME/.cargo/env"'
 if ! grep -Fqx "$cargo_profile_line" "$HOME/.bash_profile" 2>/dev/null; then
     printf '\n%s\n' "$cargo_profile_line" >> "$HOME/.bash_profile"
@@ -68,6 +70,23 @@ cargo fetch --locked
 
 step "Priming the hermetic protoc download"
 bin/protoc --version
+
+step "Checking the optional OriginGame test credential"
+if [[ -n "${OG_API_KEY:-}" ]]; then
+    og_host="${OG_HOST:-https://origingame.dev}"
+    curl_config="$(mktemp)"
+    trap 'rm -f "$curl_config"' EXIT
+    chmod 600 "$curl_config"
+    printf 'header = "Authorization: Bearer %s"\n' "$OG_API_KEY" > "$curl_config"
+    curl --config "$curl_config" --fail --silent --show-error \
+        --connect-timeout 10 --max-time 30 \
+        --output /dev/null "${og_host%/}/gw/v1/models"
+    rm -f "$curl_config"
+    trap - EXIT
+    echo "OriginGame Gateway credential is valid."
+else
+    echo "OG_API_KEY is not set; skipping the live OriginGame Gateway check."
+fi
 
 step "Orb setup complete"
 rustc --version
