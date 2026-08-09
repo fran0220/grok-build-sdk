@@ -42,7 +42,7 @@ executable.
 | One Runtime, one Session per Host Thread | `Runtime`, `create_session`, `load_session`, `resume_session`, `unload_session` | Complete; no registry or external executable is required. The Host owns the Thread↔Session mapping. |
 | Session cwd/model/reasoning | `SessionConfig::{cwd, model, reasoning}`, `Runtime::set_route` | Complete for M1. Explicit reasoning wins; omission resolves to the validated fixed-catalog default on create/load/resume and route changes. |
 | Restart, recovery, receipt, cursor | `PromptReceipt`, `SessionLedger`, rewind receipts, `events_after`, Run reconciliation/attach APIs | Complete for M1. A cursor gap is typed and fails closed. |
-| Host-owned native Session state | `SessionStateStore`, `SessionStateSnapshot`, `LocalSessionStateStore`, reusable conformance suites | The neutral authority contract is complete. Native shell replay/rewind still requires the backend-neutral adapter wiring described below before a Host store can replace JSONL without creating a second mutable authority. |
+| Host-owned native Session state | `SessionStateStore`, chunked `SessionObject`s, CAS `SessionManifest`, `LocalSessionStateStore` | The preparatory neutral contract is current-only. Native shell replay/rewind still requires the backend-neutral adapter wiring described below before a Host store becomes required or can replace JSONL without creating a second mutable authority. |
 | Immutable harness materialization | `HarnessSnapshot`, `HarnessContent`, `MaterializedHarness` | First-batch contract on this branch. A snapshot requires the complete system prompt; rules are deterministically folded into that authoritative override for native create/load/resume. There is no mutable SDK harness store. |
 | Turn binding | `TurnBindingReceipt`, `CompleteEventCursor`, `SdkProvenance`, harness-aware Session/prompt methods | First-batch contract on this branch. Provider-wire tests cover exact prompt replacement, rules update/removal, effective routes, load/resume and Runtime restart before a receipt is issued. |
 | Optimistic refinement | `HarnessRefinementPatch`, `HarnessRefinement` | First-batch contract on this branch. Patch application rejects stale content identity and duplicate typed targets. The Host commits revisions, evidence, activation, history and rollback. |
@@ -125,18 +125,28 @@ The default `LocalRunStore` is a standalone/reference SQLite authority with tran
 
 `SessionEvidenceStore` is the separate, host-agnostic single authority for SDK-origin `SessionLedger`, rewind intent/receipt, and immutable harness Turn-binding documents. Payload schemas, bounded parsing, identity, settlement digests and transition decisions remain SDK-owned; the Host implementation owns connections/paths, transactions, migrations, encryption, backup and lifecycle. The current marker/version is `grok-build-sdk.session-evidence`/1. CAS compares revision and digest: absence advances to revision 1, otherwise checked `current + 1`; the digest is `sha256:` plus lowercase SHA-256 of the exact payload bytes. Implementations must return the exact value produced by `SessionEvidenceVersion::successor`. `Conflict`, a malformed successor, or `CommitUnknown` always fails closed. Pending is acknowledged before native prompt dispatch, rewind intent before native rewind, intent-to-receipt is one CAS replacement, and binding evidence is acknowledged before ledger settlement. `RuntimeBuilder::session_evidence_store` replaces the local reference store without mirroring. `Runtime::start_with_stores` avoids startup API combinations when both production authorities are injected. Current-only schemas require an explicit offline migration or deliberate discard before startup.
 
-`SessionStateStore` defines the next native persistence boundary without exposing
-shell protocol types. The SDK prepares a current-only
-`grok-build-sdk.session-state`/1 snapshot containing the canonical transcript,
-rewind points, and bounded compaction checkpoints. Prepared commit/delete values
-validate identity, schema, section/count/path bounds, exact encoded bytes, and
-the revision/digest successor before Host code can open a transaction. Stores
-atomically compare revision and digest, distinguish conflict from
-acknowledgement uncertainty, and bound the row before fetching its payload.
-`LocalSessionStateStore` is the SQLite reference authority. The public black-box
-and fault-capable conformance runners cover absence, competing writers, stale
-revision and digest, deletion, reopen, schema and row corruption, oversized
-reads, and after-commit/before-ack reconciliation.
+`SessionStateStore` is a preparatory chunked native persistence boundary without
+shell protocol types. Its current-only `grok-build-sdk.session-log`/1 contract
+stores immutable SHA-256-addressed Session objects scoped by validated
+`SessionKey` + `SessionGeneration`: chain transcript segments and publication
+records, and separately referenced checkpoint/rewind payloads. Publication records
+preserve exact marker bytes. A 64 KiB CAS manifest/head is prepared from the full
+expected live document and a validated suffix. Objects are bounded at 64 MiB
+(transcript target about 4 MiB),
+while checked `u64` counters permit unbounded total history. Publication verifies
+reference kind, name where applicable, identity, and generation. Slot inspection
+fully verifies the chain and distinguishes
+Vacant, Live, and permanent Tombstoned state, preventing identity ABA. Delete
+atomically tombstones/removes only the manifest. This release exposes no GC API;
+backends may eventually collect unreachable objects only under an operator-defined
+retention policy. For every `CommitUnknown`, use the exported reconciliation helpers
+with the exact scoped object, manifest successor, or tombstone receipt and never
+blindly repeat a native action.
+`LocalSessionStateStore` is the current-only SQLite reference implementation.
+Production backends can run `run_session_state_conformance` and
+`run_session_state_fault_conformance`; together they exercise competing CAS,
+restart/tombstone behavior, compound publication, missing/corrupt/oversized
+objects, bounded payload reads, and exact acknowledgement-loss reconciliation.
 
 This revision deliberately does not connect that contract to native shell
 storage yet. The native replay and rewind paths still expose filesystem paths
@@ -144,7 +154,8 @@ outside `StorageAdapter`; merely copying Host snapshots into those files would
 retain a second mutable authority. Completion requires one backend-neutral
 shell adapter, atomic checkpoint/rewind mutations, and fail-closed poisoning on
 unresolved conflict or commit uncertainty. Until that lands, do not advertise
-`SessionStateStore` as a production Runtime injection point.
+`SessionStateStore` as a required Host trait, production authority, or Runtime
+injection point.
 
 Startup still creates `grok_home` and `session_storage`. Even with both stores injected, native Grok necessarily keeps its session transcript/history, rewind implementation state, shell storage, native tool/process/terminal state and other bundled-agent files there; those are not SDK-origin evidence and are not copied into either store. Hosts must place, protect and back up that native filesystem as appropriate. The `Event` receiver and `events_after` journal are bounded in-memory delivery only and are not durable evidence.
 

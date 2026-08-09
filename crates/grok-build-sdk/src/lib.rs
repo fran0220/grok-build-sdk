@@ -28,14 +28,15 @@ pub use harness::{
 };
 pub use prime::*;
 pub use session_state::{
-    ConformanceOpen, LocalSessionStateStore, MAX_CHECKPOINT_NAME_BYTES, MAX_CHECKPOINTS,
-    MAX_SESSION_STATE_BYTES, MAX_SESSION_STATE_KEY_BYTES, MAX_SESSION_STATE_REVISION,
-    PreparedSessionStateCommit, PreparedSessionStateDelete, SESSION_STATE_SCHEMA_MARKER,
-    SESSION_STATE_SCHEMA_VERSION, SessionStateCommit, SessionStateConformanceError,
-    SessionStateDelete, SessionStateDocument, SessionStateFault, SessionStateFaultHarness,
-    SessionStateFaultMetrics, SessionStateKey, SessionStateSnapshot, SessionStateStore,
-    SessionStateStoreError, SessionStateVersion, run_session_state_conformance,
-    run_session_state_fault_conformance,
+    ConformanceOpen, DeleteReceipt, LiveSessionDocument, LocalSessionStateStore,
+    MAX_SESSION_GENERATION_BYTES, MAX_SESSION_IDENTITY_BYTES, MAX_SESSION_MANIFEST_BYTES,
+    MAX_SESSION_OBJECT_BYTES, ManifestCas, ManifestVersion, ObjectPut, PreparedManifestCas,
+    PreparedSessionDelete, RewindKind, SESSION_LOG_SCHEMA_MARKER, SESSION_LOG_SCHEMA_VERSION,
+    SessionDelete, SessionGeneration, SessionKey, SessionManifest, SessionObject, SessionObjectId,
+    SessionObjectKind, SessionSlot, SessionStateFault, SessionStateFaultHarness,
+    SessionStateFaultMetrics, SessionStateStore, SessionStateStoreError,
+    TARGET_TRANSCRIPT_SEGMENT_BYTES, delete_reconciled, manifest_cas_reconciled,
+    object_put_reconciled, run_session_state_conformance, run_session_state_fault_conformance,
 };
 
 use std::{collections::BTreeMap, path::PathBuf, sync::Arc};

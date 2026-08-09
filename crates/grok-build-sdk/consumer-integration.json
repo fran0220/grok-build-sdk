@@ -21,13 +21,16 @@
       "policy": "compare revision+digest atomically; returned Committed version must equal SDK-computed successor"
     },
     "session_state": {
-      "marker": "grok-build-sdk.session-state",
+      "marker": "grok-build-sdk.session-log",
       "version": 1,
-      "max_document_bytes": 67108864,
-      "contents": ["canonical_transcript", "rewind_points", "compaction_checkpoints"],
-      "commit_preparation": "PreparedSessionStateCommit::new",
-      "delete_preparation": "PreparedSessionStateDelete::new",
-      "policy": "current-only bounded decode; compare revision+digest atomically; corruption and acknowledgement uncertainty fail closed"
+      "max_object_bytes": 67108864,
+      "max_manifest_bytes": 65536,
+      "target_transcript_segment_bytes": 4194304,
+      "contents": ["transcript_segment_chain_record", "checkpoint_payload", "rewind_operation_payload", "checkpoint_publication_chain_record", "rewind_publication_chain_record", "cas_manifest", "tombstone"],
+      "commit_preparation": "PreparedManifestCas::new",
+      "delete_preparation": "PreparedSessionDelete::new",
+      "status": "preparatory contract only; not a required_host_trait, production authority, or Runtime injection until native wiring lands",
+      "policy": "current-only key+generation-scoped bounded objects and manifest; no GC API; immutable sha256 objects; full expected live document plus validated suffix; compare manifest revision+digest atomically; tombstones prevent ABA; reconcile CommitUnknown by exact authoritative load"
     }
   },
   "migration_policy": "current-only fail-closed; breaking durable schemas require explicit offline migration or deliberate discard before Runtime startup",
@@ -47,7 +50,7 @@
     "RunStore": "load(&RunId)->Result<Option<RunEnvelope>,RunError>; list()->Result<Vec<RunEnvelope>,RunError>; commit(StoreCommit)->Result<StoreCommitResult,RunError>",
     "RunCommitPreparation": "StoreCommit::validate_and_encode(&self)->Result<PreparedStoreCommit,RunError>",
     "SessionEvidenceStore": "load(&SessionEvidenceKey)->Result<Option<SessionEvidenceDocument>,SessionEvidenceStoreError>; compare_and_swap(&SessionEvidenceKey,Option<&SessionEvidenceVersion>,&[u8])->Result<SessionEvidenceCommit,SessionEvidenceStoreError>",
-    "SessionStateStore": "load(&SessionStateKey)->Result<Option<SessionStateDocument>,SessionStateStoreError>; compare_and_swap(PreparedSessionStateCommit)->Result<SessionStateCommit,SessionStateStoreError>; compare_and_delete(PreparedSessionStateDelete)->Result<SessionStateDelete,SessionStateStoreError>",
+    "SessionStateStore": "inspect_slot(&SessionKey)->SessionSlot; load_object(&SessionKey,&SessionGeneration,&SessionObjectId)->Option<SessionObject>; put_object(SessionObject)->ObjectPut; compare_and_swap_manifest(PreparedManifestCas)->ManifestCas; compare_and_delete(PreparedSessionDelete)->SessionDelete",
     "SessionStateConformance": "run_session_state_conformance; run_session_state_fault_conformance",
     "StoreInjection": "RuntimeBuilder::run_store(Arc<dyn RunStore>); RuntimeBuilder::session_evidence_store(Arc<dyn SessionEvidenceStore>); Runtime::start_with_stores(RuntimeConfig,Arc<dyn RunStore>,Arc<dyn SessionEvidenceStore>)",
     "Residency": "inspect_run_residency; request_run_wake; claim_run_activation; renew_run_activation; release_run_activation; AutonomousTurnLoop::activate_claimed",
