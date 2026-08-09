@@ -6,9 +6,15 @@
 //! private implementation details.
 
 mod autonomous;
+mod harness;
 mod private;
 
 pub use autonomous::{AutonomousActivation, AutonomousActivationResult, AutonomousTurnLoop};
+pub use harness::{
+    HARNESS_SNAPSHOT_SCHEMA_VERSION, HarnessContent, HarnessDigest, HarnessError,
+    HarnessRefinement, HarnessRefinementPatch, HarnessSnapshot, MAX_HARNESS_SNAPSHOT_BYTES,
+    MaterializedHarness,
+};
 
 use std::{collections::BTreeMap, path::PathBuf, sync::Arc};
 use tokio::sync::mpsc;
