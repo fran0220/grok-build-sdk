@@ -1006,18 +1006,18 @@ async fn next_compaction_segment_index(compaction_dir: &std::path::Path) -> u64 
     next
 }
 
+type CanonicalState = (
+    Vec<super::SessionUpdate>,
+    Vec<RewindPoint>,
+    std::collections::HashMap<String, Vec<u8>>,
+);
+
 impl JsonlStorageAdapter {
     fn authority_error(error: impl ToString) -> io::Error {
         io::Error::other(error.to_string())
     }
 
-    fn canonical_state(
-        &self,
-    ) -> io::Result<(
-        Vec<super::SessionUpdate>,
-        Vec<RewindPoint>,
-        std::collections::HashMap<String, Vec<u8>>,
-    )> {
+    fn canonical_state(&self) -> io::Result<CanonicalState> {
         use crate::session::state_authority::{ReplayRecord, RewindOperation};
         let session = self
             .native_session
