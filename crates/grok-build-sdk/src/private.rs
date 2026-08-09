@@ -79,6 +79,7 @@ enum CapturedTurnUsage {
 type TurnUsageMap = Rc<RefCell<HashMap<(String, String), CapturedTurnUsage>>>;
 enum Command {
     Create(SessionConfig, Option<HarnessDigest>, Reply<SessionId>),
+    Ensure(SessionId, SessionConfig, Reply<SessionId>),
     Load(SessionId, SessionConfig, Option<HarnessDigest>, Reply<()>),
     Resume(SessionId, SessionConfig, Option<HarnessDigest>, Reply<()>),
     Prompt(SessionId, String, String, Reply<PromptReceipt>),
@@ -658,6 +659,13 @@ impl Runtime {
     }
     pub async fn create_session(&self, c: SessionConfig) -> Result<SessionId, Error> {
         self.call(|r| Command::Create(c, None, r)).await
+    }
+    pub async fn create_session_with_id(
+        &self,
+        id: SessionId,
+        c: SessionConfig,
+    ) -> Result<SessionId, Error> {
+        self.call(|r| Command::Ensure(id, c, r)).await
     }
     pub async fn create_session_with_harness(
         &self,
@@ -2089,6 +2097,7 @@ struct PreparedHarnessTurn {
 
 struct Core {
     agent: Rc<MvpAgent>,
+    session_state_authority: Option<Arc<ShellAuthority>>,
     events: mpsc::UnboundedSender<Event>,
     catalog: HashMap<String, crate::ModelSpec>,
     sequences: Rc<RefCell<HashMap<String, u64>>>,
@@ -2917,7 +2926,7 @@ impl Core {
                 models,
                 input.session_storage.clone(),
                 profile,
-                session_state_authority,
+                session_state_authority.clone(),
             ),
         );
         static NEXT_RUNTIME_INSTANCE: std::sync::atomic::AtomicU64 =
@@ -3018,6 +3027,7 @@ impl Core {
         Ok((
             Self {
                 agent,
+                session_state_authority,
                 events,
                 catalog: input
                     .models
@@ -3046,6 +3056,9 @@ impl Core {
             match c {
                 Command::Create(x, harness_digest, r) => {
                     let _ = r.send(self.create(x, harness_digest).await);
+                }
+                Command::Ensure(id, config, r) => {
+                    let _ = r.send(self.ensure(id, config).await);
                 }
                 Command::Load(i, x, harness_digest, r) => {
                     let _ = r.send(self.load(i, x, harness_digest).await);
@@ -3526,11 +3539,66 @@ impl Core {
         config: SessionConfig,
         harness_digest: Option<HarnessDigest>,
     ) -> Result<SessionId, Error> {
+        self.create_inner(config, harness_digest, None).await
+    }
+
+    async fn ensure(&self, id: SessionId, config: SessionConfig) -> Result<SessionId, Error> {
+        use sha2::{Digest as _, Sha256};
+        self.check(&config)?;
+        uuid::Uuid::try_parse(id.as_str()).map_err(|error| {
+            Error::InvalidConfig(format!(
+                "caller-selected session id must be a UUID: {error}"
+            ))
+        })?;
+        let authority = self.session_state_authority.as_ref().ok_or_else(|| {
+            Error::InvalidConfig(
+                "create_session_with_id requires a Host session state authority".into(),
+            )
+        })?;
+        let exact = serde_json::to_vec(&config).map_err(op)?;
+        let generation = format!("config-sha256:{:x}", Sha256::digest(exact));
+        match authority.inspect(id.as_str()).map_err(op)? {
+            xai_grok_shell::session::state_authority::SessionInspection::Vacant => {
+                self.create_inner(config, None, Some((id, generation)))
+                    .await
+            }
+            xai_grok_shell::session::state_authority::SessionInspection::Live {
+                generation: current,
+            } if current == generation => {
+                if !self.resident.borrow().contains(id.as_str()) {
+                    self.load(id.clone(), config, None).await?;
+                }
+                Ok(id)
+            }
+            xai_grok_shell::session::state_authority::SessionInspection::Live { .. } => {
+                Err(Error::InvalidConfig(
+                    "session identity already exists with different config".into(),
+                ))
+            }
+            xai_grok_shell::session::state_authority::SessionInspection::Tombstoned { .. } => Err(
+                Error::InvalidConfig("session identity is permanently tombstoned".into()),
+            ),
+        }
+    }
+
+    async fn create_inner(
+        &self,
+        config: SessionConfig,
+        harness_digest: Option<HarnessDigest>,
+        requested: Option<(SessionId, String)>,
+    ) -> Result<SessionId, Error> {
         self.check(&config)?;
         let effective_reasoning =
             self.effective_reasoning(&config.model, config.reasoning.as_deref())?;
         let binding = SessionBinding::new(&config, effective_reasoning.clone(), harness_digest);
-        let meta = self.session_meta(&config, effective_reasoning.as_deref())?;
+        let mut meta = self.session_meta(&config, effective_reasoning.as_deref())?;
+        if let Some((id, generation)) = &requested {
+            meta.insert("sessionId".into(), serde_json::Value::String(id.0.clone()));
+            meta.insert(
+                "sessionStateGeneration".into(),
+                serde_json::Value::String(generation.clone()),
+            );
+        }
         let x = self
             .agent
             .new_session(

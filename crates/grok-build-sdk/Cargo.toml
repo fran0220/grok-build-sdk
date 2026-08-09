@@ -23,6 +23,7 @@ sha2 = { workspace = true }
 rusqlite = { version = "0.37", features = ["bundled"] }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["rt", "sync", "time"] }
+uuid = { workspace = true }
 xai-acp-lib = { workspace = true }
 xai-agent-lifecycle = { workspace = true }
 xai-file-utils = { path = "../codegen/xai-file-utils" }

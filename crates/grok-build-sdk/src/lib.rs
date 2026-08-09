@@ -3136,6 +3136,17 @@ impl Runtime {
     pub async fn create_session(&self, config: SessionConfig) -> Result<SessionId, Error> {
         self.inner.create_session(config).await
     }
+    /// Creates the exact caller-selected Session identity, or idempotently
+    /// reopens it when the complete configuration matches. This current-only
+    /// contract requires a Host [`SessionStateStore`]; a different config or a
+    /// tombstoned identity fails closed.
+    pub async fn create_session_with_id(
+        &self,
+        id: SessionId,
+        config: SessionConfig,
+    ) -> Result<SessionId, Error> {
+        self.inner.create_session_with_id(id, config).await
+    }
     /// Creates a native Session whose complete harness inputs are materialized
     /// from one immutable snapshot. The Runtime retains only the digest needed
     /// to issue Turn binding receipts; revision and activation remain Host state.
@@ -7805,6 +7816,30 @@ done
             .create_session(session_config(workspace.clone()))
             .await
             .expect("session starts");
+        let requested = SessionId::from_stored(uuid::Uuid::new_v4().to_string());
+        let requested_config = session_config(workspace.clone());
+        assert_eq!(
+            runtime
+                .create_session_with_id(requested.clone(), requested_config.clone())
+                .await
+                .expect("caller-selected identity is created"),
+            requested
+        );
+        assert_eq!(
+            runtime
+                .create_session_with_id(requested.clone(), requested_config.clone())
+                .await
+                .expect("same exact create retries idempotently"),
+            requested
+        );
+        let mut conflicting_config = requested_config.clone();
+        conflicting_config.rules = Some("different exact config".into());
+        assert!(matches!(
+            runtime
+                .create_session_with_id(requested.clone(), conflicting_config)
+                .await,
+            Err(Error::InvalidConfig(_))
+        ));
         runtime
             .prompt(&session, "host-session-state-turn", "state")
             .await
@@ -7821,6 +7856,13 @@ done
             .load_session(session.clone(), session_config(workspace))
             .await
             .expect("session reloads from Host authority without JSONL fallback");
+        assert_eq!(
+            runtime
+                .create_session_with_id(requested.clone(), requested_config.clone())
+                .await
+                .expect("exact caller-selected identity reopens after restart"),
+            requested
+        );
         runtime
             .shutdown()
             .await

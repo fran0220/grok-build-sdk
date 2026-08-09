@@ -518,14 +518,23 @@ impl MvpAgent {
             crate::session::persistence::PersistenceHandle::noop()
         } else {
             let native_session = match &self.session_state_authority {
-                Some(authority) => Some(
-                    authority
+                Some(authority) => {
+                    let generation = arguments
+                        .meta
+                        .as_ref()
+                        .and_then(|meta| meta.get("sessionStateGeneration"))
+                        .and_then(|value| value.as_str())
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| uuid::Uuid::now_v7().to_string());
+                    Some(
+                        authority
                         .create(crate::session::state_authority::SessionIdentity {
                             identity: session_id.0.to_string(),
-                            generation: uuid::Uuid::now_v7().to_string(),
+                            generation,
                         })
                         .map_err(|error| acp::Error::internal_error().data(error.to_string()))?,
-                ),
+                    )
+                }
                 None => None,
             };
             let _timer = crate::instrumentation_timer!("session.persistence_init");
