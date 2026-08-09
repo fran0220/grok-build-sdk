@@ -167,6 +167,84 @@ pub fn replay_to_prompt(
     })
 }
 
+/// Replay already-decoded canonical updates using checkpoint payloads supplied
+/// by the active persistence authority. No filesystem projection is involved.
+pub(crate) fn replay_updates_to_prompt(
+    updates: &[SessionUpdate],
+    checkpoints: &std::collections::HashMap<String, Vec<u8>>,
+    target_prompt_index: usize,
+) -> io::Result<ReplayResult> {
+    let mut state = ReplayState::new(target_prompt_index);
+    for update in updates {
+        let action = match update {
+            SessionUpdate::Xai(notification)
+                if matches!(
+                    notification.update,
+                    XaiSessionUpdate::CompactionCheckpoint(_)
+                ) =>
+            {
+                let XaiSessionUpdate::CompactionCheckpoint(info) = &notification.update else {
+                    unreachable!()
+                };
+                let payload = checkpoints.get(&info.checkpoint_file).ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::NotFound,
+                        format!("authority checkpoint missing: {}", info.checkpoint_file),
+                    )
+                })?;
+                state.handle_checkpoint_bytes(info, payload)?
+            }
+            _ => state.process_update(update, Path::new(""))?,
+        };
+        if action == ReplayAction::Stop {
+            break;
+        }
+    }
+    finish_replay(state, target_prompt_index)
+}
+
+fn finish_replay(mut state: ReplayState, target_prompt_index: usize) -> io::Result<ReplayResult> {
+    state.flush_pending_user();
+    state.flush_pending_agent();
+    if state.prompt_counter > target_prompt_index {
+        if state.checkpoint_active && target_prompt_index >= state.checkpoint_prompt_index {
+            let turns_to_keep = target_prompt_index - state.checkpoint_prompt_index;
+            let mut seen_marker = false;
+            let mut user_count = 0;
+            let mut cut_pos = state.conversation.len();
+            for (i, item) in state.conversation[state.checkpoint_base_len..]
+                .iter()
+                .enumerate()
+            {
+                if counts_as_replay_turn_progressive(item, &mut seen_marker) {
+                    user_count += 1;
+                    if user_count > turns_to_keep {
+                        cut_pos = state.checkpoint_base_len + i;
+                        break;
+                    }
+                }
+            }
+            state.conversation.truncate(cut_pos);
+        } else if target_prompt_index == 0 {
+            state.conversation.clear();
+        } else {
+            let truncate_at = state.truncate_target(target_prompt_index);
+            let keep =
+                crate::sampling::conversation_truncate_for_prompt(&state.conversation, truncate_at);
+            state.conversation.truncate(keep);
+        }
+        state.prompt_counter = target_prompt_index;
+    }
+    Ok(ReplayResult {
+        conversation: state.conversation,
+        prompt_index_reached: state.prompt_counter,
+        original_user_info: state.original_user_info,
+        last_compaction_prompt_index: state
+            .checkpoint_active
+            .then_some(state.checkpoint_prompt_index),
+    })
+}
+
 #[derive(Debug, PartialEq)]
 enum ReplayAction {
     Continue,
@@ -284,6 +362,24 @@ impl ReplayState {
         info: &CompactionCheckpointInfo,
         session_dir: &Path,
     ) -> io::Result<ReplayAction> {
+        let checkpoint_path = session_dir.join(&info.checkpoint_file);
+        let bytes = std::fs::read(&checkpoint_path).map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!(
+                    "Compaction checkpoint unavailable: {}. Cannot safely rewind past the compaction point.",
+                    checkpoint_path.display()
+                ),
+            )
+        })?;
+        self.handle_checkpoint_bytes(info, &bytes)
+    }
+
+    fn handle_checkpoint_bytes(
+        &mut self,
+        info: &CompactionCheckpointInfo,
+        bytes: &[u8],
+    ) -> io::Result<ReplayAction> {
         if self.target < info.prompt_index_at_compaction {
             // Target is before this compaction — don't load the compacted
             // history (we'll reconstruct from raw updates). But the
@@ -291,26 +387,7 @@ impl ReplayState {
             // historical User(user_info) that the model saw for these
             // pre-compaction turns. Without it we'd use the post-compaction
             // rebuilt user_info, which is wrong data.
-            let checkpoint_path = session_dir.join(&info.checkpoint_file);
-            let bytes = match std::fs::read(&checkpoint_path) {
-                Ok(b) => b,
-                Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                    tracing::error!(
-                        path = %checkpoint_path.display(),
-                        "Compaction checkpoint file missing, cannot restore original user_info"
-                    );
-                    return Err(io::Error::new(
-                        io::ErrorKind::NotFound,
-                        format!(
-                            "Compaction checkpoint file missing: {}. \
-                             Cannot safely rewind past the compaction point.",
-                            checkpoint_path.display()
-                        ),
-                    ));
-                }
-                Err(e) => return Err(e),
-            };
-            match serde_json::from_slice::<CompactionCheckpointFile>(&bytes) {
+            match serde_json::from_slice::<CompactionCheckpointFile>(bytes) {
                 Ok(file) => {
                     if self.original_user_info.is_none() {
                         self.original_user_info = file.original_user_info;
@@ -319,15 +396,12 @@ impl ReplayState {
                 Err(e) => {
                     tracing::error!(
                         ?e,
-                        path = %checkpoint_path.display(),
                         "Compaction checkpoint file corrupt, cannot restore original user_info"
                     );
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
                         format!(
-                            "Compaction checkpoint file corrupt: {}. \
-                             Cannot safely rewind past the compaction point.",
-                            checkpoint_path.display()
+                            "Compaction checkpoint is corrupt. Cannot safely rewind past the compaction point."
                         ),
                     ));
                 }
@@ -339,39 +413,17 @@ impl ReplayState {
             );
             Ok(ReplayAction::Continue)
         } else {
-            let checkpoint_path = session_dir.join(&info.checkpoint_file);
-            let bytes = match std::fs::read(&checkpoint_path) {
-                Ok(b) => b,
-                Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                    tracing::error!(
-                        path = %checkpoint_path.display(),
-                        "Compaction checkpoint file missing, cannot reconstruct conversation"
-                    );
-                    return Err(io::Error::new(
-                        io::ErrorKind::NotFound,
-                        format!(
-                            "Compaction checkpoint file missing: {}. \
-                             Cannot safely rewind past the compaction point.",
-                            checkpoint_path.display()
-                        ),
-                    ));
-                }
-                Err(e) => return Err(e),
-            };
-            let file: CompactionCheckpointFile = match serde_json::from_slice(&bytes) {
+            let file: CompactionCheckpointFile = match serde_json::from_slice(bytes) {
                 Ok(f) => f,
                 Err(e) => {
                     tracing::error!(
                         ?e,
-                        path = %checkpoint_path.display(),
                         "Compaction checkpoint file corrupt, cannot reconstruct conversation"
                     );
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
                         format!(
-                            "Compaction checkpoint file corrupt: {}. \
-                             Cannot safely rewind past the compaction point.",
-                            checkpoint_path.display()
+                            "Compaction checkpoint is corrupt. Cannot safely rewind past the compaction point."
                         ),
                     ));
                 }
@@ -380,7 +432,6 @@ impl ReplayState {
             if file.schema_version > 1 {
                 tracing::error!(
                     schema_version = file.schema_version,
-                    path = %checkpoint_path.display(),
                     "Unsupported checkpoint schema version, cannot reconstruct conversation"
                 );
                 return Err(io::Error::new(
@@ -822,6 +873,53 @@ mod tests {
         }
         std::fs::write(&updates_path, content).unwrap();
         replay_to_prompt(&updates_path, session_dir, target).unwrap()
+    }
+
+    #[test]
+    fn authority_replay_across_checkpoint_never_projects_covered_files() {
+        let root = TempDir::new().unwrap();
+        let checkpoint_name = "compaction_checkpoints/authority.json";
+        let checkpoint = CompactionCheckpointFile {
+            checkpoint_id: "authority".into(),
+            prompt_index_at_compaction: 1,
+            compacted_history: vec![
+                ConversationItem::system("system"),
+                ConversationItem::user("compacted first prompt"),
+                ConversationItem::assistant("compacted answer"),
+            ],
+            schema_version: 1,
+            created_at: "2024-01-01T00:00:00Z".into(),
+            original_user_info: Some("original user info".into()),
+            reread_file_paths: vec![],
+        };
+        let updates = vec![
+            make_user_update_pi("s1", "discarded raw prompt", 0),
+            make_checkpoint("authority", 1, None),
+            make_user_update_pi("s1", "second prompt", 1),
+            make_agent_update("s1", "second answer"),
+        ];
+        let checkpoints = std::collections::HashMap::from([(
+            checkpoint_name.to_string(),
+            serde_json::to_vec(&checkpoint).unwrap(),
+        )]);
+
+        let replayed = replay_updates_to_prompt(&updates, &checkpoints, 2).unwrap();
+        assert_eq!(replayed.prompt_index_reached, 2);
+        assert_eq!(replayed.last_compaction_prompt_index, Some(1));
+        assert!(
+            replayed
+                .conversation
+                .iter()
+                .any(|item| item.text_content() == "second prompt")
+        );
+        for covered in [
+            "updates.jsonl",
+            "chat_history.jsonl",
+            "rewind_points.jsonl",
+            "compaction_checkpoints",
+        ] {
+            assert!(!root.path().join(covered).exists(), "created {covered}");
+        }
     }
 
     #[test]

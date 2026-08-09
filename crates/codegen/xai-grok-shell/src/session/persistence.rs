@@ -333,6 +333,11 @@ pub enum PersistenceMsg {
     MergeRewindPointsFrom {
         target_index: usize,
     },
+    ReplayAuthorityToPrompt {
+        target_index: usize,
+        respond_to:
+            tokio::sync::oneshot::Sender<io::Result<crate::session::helpers::replay::ReplayResult>>,
+    },
     /// Collection ID for telemetry tracing
     CollectionId(String),
     /// Monotonic telemetry turn counter and optional request_id for trace metadata/filenames.
@@ -1619,6 +1624,22 @@ impl PersistenceHandle {
         self.projects_chat_history
     }
 
+    pub(crate) async fn replay_authority_to_prompt(
+        &self,
+        target_index: usize,
+    ) -> io::Result<crate::session::helpers::replay::ReplayResult> {
+        let (respond_to, response) = tokio::sync::oneshot::channel();
+        self.tx
+            .send(PersistenceMsg::ReplayAuthorityToPrompt {
+                target_index,
+                respond_to,
+            })
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "persistence stopped"))?;
+        response
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "persistence stopped"))?
+    }
+
     #[cfg(test)]
     pub(crate) fn is_disk_full(&self) -> bool {
         *self.disk_full_rx.borrow()
@@ -2308,6 +2329,13 @@ impl SessionPersistence {
                     {
                         tracing::warn!(?e, target_index, "failed to merge rewind points");
                     }
+                }
+                PersistenceMsg::ReplayAuthorityToPrompt {
+                    target_index,
+                    respond_to,
+                } => {
+                    let result = self.storage.replay_authority_to_prompt(target_index).await;
+                    let _ = respond_to.send(result);
                 }
                 PersistenceMsg::CollectionId(collection_id) => {
                     if let Err(e) = self

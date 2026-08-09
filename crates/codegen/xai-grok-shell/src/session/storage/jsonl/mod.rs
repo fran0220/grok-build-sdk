@@ -1954,6 +1954,23 @@ impl StorageAdapter for JsonlStorageAdapter {
         let bytes = tokio::fs::read(&path).await?;
         serde_json::from_slice(&bytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
     }
+    async fn replay_authority_to_prompt(
+        &self,
+        target_prompt_index: usize,
+    ) -> io::Result<crate::session::helpers::replay::ReplayResult> {
+        if self.native_session.is_none() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "canonical authority replay is not configured",
+            ));
+        }
+        let (updates, _, checkpoints) = self.canonical_state()?;
+        crate::session::helpers::replay::replay_updates_to_prompt(
+            &updates,
+            &checkpoints,
+            target_prompt_index,
+        )
+    }
 }
 /// Max decoded size for a data-URI image loaded from persisted history.
 /// Generous (20 MB) — fresh images use 5 MB, but loaded ones just need sanity-checking.

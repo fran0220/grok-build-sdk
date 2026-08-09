@@ -392,6 +392,238 @@ async fn sync_forked_session_to_backend(
 mod tests {
     use super::*;
 
+    struct StaticSession {
+        id: crate::session::state_authority::SessionIdentity,
+        records: Vec<crate::session::state_authority::ReplayRecord>,
+    }
+
+    impl crate::session::state_authority::NativeSession for StaticSession {
+        fn identity(&self) -> &crate::session::state_authority::SessionIdentity {
+            &self.id
+        }
+        fn stage_update(
+            &self,
+            _: Vec<u8>,
+        ) -> Result<(), crate::session::state_authority::AuthorityError> {
+            unreachable!()
+        }
+        fn flush(
+            &self,
+        ) -> Result<
+            crate::session::state_authority::ReplayCursor,
+            crate::session::state_authority::AuthorityError,
+        > {
+            unreachable!()
+        }
+        fn replay_page(
+            &self,
+            cursor: Option<crate::session::state_authority::ReplayCursor>,
+            _: usize,
+        ) -> Result<
+            crate::session::state_authority::ReplayPage,
+            crate::session::state_authority::AuthorityError,
+        > {
+            if cursor.is_some() {
+                return Err(crate::session::state_authority::AuthorityError(
+                    "unexpected cursor".into(),
+                ));
+            }
+            Ok(crate::session::state_authority::ReplayPage {
+                records: self.records.clone(),
+                next: None,
+            })
+        }
+        fn publish_checkpoint(
+            &self,
+            _: String,
+            _: Vec<u8>,
+            _: Vec<u8>,
+        ) -> Result<
+            crate::session::state_authority::ReplayCursor,
+            crate::session::state_authority::AuthorityError,
+        > {
+            unreachable!()
+        }
+        fn publish_rewind(
+            &self,
+            _: crate::session::state_authority::RewindOperation,
+            _: Vec<u8>,
+        ) -> Result<
+            crate::session::state_authority::ReplayCursor,
+            crate::session::state_authority::AuthorityError,
+        > {
+            unreachable!()
+        }
+    }
+
+    struct ForkAuthority {
+        source: std::sync::Arc<StaticSession>,
+        published: std::sync::Mutex<
+            Vec<(
+                crate::session::state_authority::SessionIdentity,
+                Vec<crate::session::state_authority::ReplayRecord>,
+            )>,
+        >,
+    }
+
+    impl crate::session::state_authority::NativeSessionStateAuthority for ForkAuthority {
+        fn inspect(
+            &self,
+            _: &str,
+        ) -> Result<
+            crate::session::state_authority::SessionInspection,
+            crate::session::state_authority::AuthorityError,
+        > {
+            Ok(crate::session::state_authority::SessionInspection::Live {
+                generation: self.source.id.generation.clone(),
+            })
+        }
+        fn create(
+            &self,
+            _: crate::session::state_authority::SessionIdentity,
+        ) -> Result<
+            std::sync::Arc<dyn crate::session::state_authority::NativeSession>,
+            crate::session::state_authority::AuthorityError,
+        > {
+            unreachable!()
+        }
+        fn open(
+            &self,
+            _: crate::session::state_authority::SessionIdentity,
+        ) -> Result<
+            std::sync::Arc<dyn crate::session::state_authority::NativeSession>,
+            crate::session::state_authority::AuthorityError,
+        > {
+            Ok(self.source.clone())
+        }
+        fn publish_fork(
+            &self,
+            id: crate::session::state_authority::SessionIdentity,
+            records: Vec<crate::session::state_authority::ReplayRecord>,
+        ) -> Result<
+            std::sync::Arc<dyn crate::session::state_authority::NativeSession>,
+            crate::session::state_authority::AuthorityError,
+        > {
+            self.published
+                .lock()
+                .unwrap()
+                .push((id.clone(), records.clone()));
+            Ok(std::sync::Arc::new(StaticSession { id, records }))
+        }
+        fn tombstone(
+            &self,
+            _: crate::session::state_authority::SessionIdentity,
+        ) -> Result<(), crate::session::state_authority::AuthorityError> {
+            unreachable!()
+        }
+    }
+
+    fn fork_update(
+        id: &str,
+        text: &str,
+        prompt_index: usize,
+    ) -> crate::session::state_authority::ReplayRecord {
+        let update =
+            crate::session::storage::SessionUpdate::Acp(Box::new(acp::SessionNotification::new(
+                acp::SessionId::new(id),
+                acp::SessionUpdate::UserMessageChunk(
+                    acp::ContentChunk::new(acp::ContentBlock::Text(acp::TextContent::new(text)))
+                        .meta(
+                            serde_json::json!({"promptIndex": prompt_index})
+                                .as_object()
+                                .cloned(),
+                        ),
+                ),
+            )));
+        crate::session::state_authority::ReplayRecord::Update(serde_json::to_vec(&update).unwrap())
+    }
+
+    #[tokio::test]
+    async fn authority_full_and_partial_forks_publish_fresh_generations_without_covered_files() {
+        use crate::session::storage::StorageAdapter as _;
+        let root = tempfile::TempDir::new().unwrap();
+        let storage = JsonlStorageAdapter::with_root(root.path().to_path_buf());
+        let source_info = Info {
+            id: acp::SessionId::new("source"),
+            cwd: "/source".into(),
+        };
+        storage
+            .init_session(
+                &source_info,
+                crate::session::persistence::default_model_id(),
+            )
+            .await
+            .unwrap();
+        let source_dir = storage.session_dir(&source_info);
+        for covered in ["updates.jsonl", "chat_history.jsonl", "rewind_points.jsonl"] {
+            let _ = std::fs::remove_file(source_dir.join(covered));
+        }
+        let authority = ForkAuthority {
+            source: std::sync::Arc::new(StaticSession {
+                id: crate::session::state_authority::SessionIdentity {
+                    identity: "source".into(),
+                    generation: "source-generation".into(),
+                },
+                records: vec![
+                    fork_update("source", "zero", 0),
+                    fork_update("source", "one", 1),
+                ],
+            }),
+            published: std::sync::Mutex::new(Vec::new()),
+        };
+        for (target, cut, expected) in [("full", None, 2usize), ("partial", Some(0), 1usize)] {
+            let target_info = Info {
+                id: acp::SessionId::new(target),
+                cwd: "/target".into(),
+            };
+            copy_authority_fork(
+                &authority,
+                &storage,
+                &source_info,
+                &target_info,
+                CopySessionOptions {
+                    target_prompt_index: cut,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let published = authority.published.lock().unwrap();
+            let (identity, records) = published.last().unwrap();
+            assert_eq!(identity.identity, target);
+            assert_ne!(identity.generation, "source-generation");
+            assert_eq!(
+                records
+                    .iter()
+                    .filter(|r| matches!(
+                        r,
+                        crate::session::state_authority::ReplayRecord::Update(_)
+                    ))
+                    .count(),
+                expected
+            );
+        }
+        fn assert_absent(path: &std::path::Path) {
+            if let Ok(entries) = std::fs::read_dir(path) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    assert!(!matches!(
+                        path.file_name().and_then(|x| x.to_str()),
+                        Some(
+                            "updates.jsonl"
+                                | "chat_history.jsonl"
+                                | "rewind_points.jsonl"
+                                | "compaction_checkpoints"
+                        )
+                    ));
+                    if path.is_dir() {
+                        assert_absent(&path);
+                    }
+                }
+            }
+        }
+        assert_absent(root.path());
+    }
+
     #[test]
     fn test_generate_fork_session_id_format() {
         let fork_id = generate_fork_session_id("abc123");

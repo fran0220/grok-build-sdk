@@ -1287,6 +1287,18 @@ pub trait StorageAdapter: Send + Sync {
         info: &Info,
         checkpoint_file: &str,
     ) -> io::Result<crate::extensions::notification::CompactionCheckpointFile>;
+
+    /// Rebuild a Host-authority conversation across a compaction boundary.
+    /// Legacy callers continue to use the streaming JSONL replay path.
+    async fn replay_authority_to_prompt(
+        &self,
+        _target_prompt_index: usize,
+    ) -> io::Result<crate::session::helpers::replay::ReplayResult> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "canonical authority replay is not configured",
+        ))
+    }
 }
 
 pub use jsonl::JsonlStorageAdapter;

@@ -5291,6 +5291,18 @@ mod tests {
                 )
                 .is_err()
         );
+        assert!(
+            session
+                .replay_page(
+                    Some(ReplayCursor {
+                        generation: "generation-1".into(),
+                        next_sequence: 99,
+                    }),
+                    1,
+                )
+                .is_err(),
+            "logical replay cursor gaps must fail closed"
+        );
         session
             .publish_checkpoint("cp".into(), b"state".to_vec(), b"cp-marker".to_vec())
             .unwrap();
