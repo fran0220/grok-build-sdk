@@ -127,63 +127,109 @@ impl XaiProtoBuilder {
 
         // Can only process one input file when using --dependency_out=FILE.
         for proto in protos {
-            let mut command = Command::new(protoc.unwrap_or(Path::new("protoc")));
-            command
-                .arg("--dependency_out=/dev/stdout")
-                .arg("--descriptor_set_out=/dev/null");
-
-            // Add protoc's well-known types include directory first (if found).
-            // This is needed for Bazel sandboxed builds where protoc and its
-            // include files are in different locations.
-            if let Some(include_dir) = protoc_include_dir {
-                command.arg(format!(
-                    "-I{}",
-                    include_dir.to_str().context("include path not UTF-8")?
-                ));
-            }
-
-            for include in &includes {
-                command.arg(format!("-I{}", include.to_str().context("path not UTF-8")?));
-            }
-
-            command.arg(proto);
-
-            command.stdin(Stdio::null());
-            command.stderr(Stdio::inherit());
-
-            let output = command.output().context("protoc command failed")?;
-            if !output.status.success() {
-                return Err(anyhow::anyhow!("protoc command failed"));
-            }
-
-            let output =
-                String::from_utf8(output.stdout).context("protoc command output not UTF-8")?;
-
-            let mut lines = output.lines();
-            let first_line = lines.next().context("protoc command output is empty")?;
-            let prefix = "/dev/null:";
-            let rem = first_line.strip_prefix(prefix).with_context(|| {
-                format!("protoc command output must start with /dev/null: {output:?}")
-            })?;
-            for line in iter::once(rem).chain(lines) {
-                let line = line.trim();
-                let line = line.strip_suffix("\\").unwrap_or(line);
-                // Depending on absolute paths like
-                // /Users/user/homebrew/Cellar/protobuf/29.1/include/google/protobuf/timestamp.proto
-                // is valid, but we want to have output more deterministic.
-                if line.contains("/include/google/protobuf/") {
-                    continue;
-                }
-
-                if !fs::exists(line)? {
-                    return Err(anyhow::anyhow!("dependency file not found: {line}"));
-                }
-
-                println!("cargo:rerun-if-changed={line}");
-            }
+            let (dependencies, _output_dir) =
+                Self::scan_dependencies(protoc, protoc_include_dir, proto, &includes)?;
+            Self::emit_dependencies(dependencies, |directive| println!("{directive}"));
         }
 
         Ok(())
+    }
+
+    fn emit_dependencies(
+        dependencies: impl IntoIterator<Item = String>,
+        mut emit: impl FnMut(String),
+    ) {
+        for dependency in dependencies {
+            emit(format!("cargo:rerun-if-changed={dependency}"));
+        }
+    }
+
+    fn scan_dependencies(
+        protoc: Option<&Path>,
+        protoc_include_dir: Option<&Path>,
+        proto: &Path,
+        includes: &[&Path],
+    ) -> anyhow::Result<(Vec<String>, tempfile::TempDir)> {
+        let output_dir = tempfile::tempdir().context("failed to create protoc output dir")?;
+        let dependency_out = output_dir.path().join("dependencies.d");
+        let descriptor_set_out = output_dir.path().join("descriptor.pb");
+        let mut command = Command::new(protoc.unwrap_or(Path::new("protoc")));
+        command
+            .arg(format!(
+                "--dependency_out={}",
+                dependency_out
+                    .to_str()
+                    .context("dependency output path not UTF-8")?
+            ))
+            .arg(format!(
+                "--descriptor_set_out={}",
+                descriptor_set_out
+                    .to_str()
+                    .context("descriptor output path not UTF-8")?
+            ));
+
+        // Add protoc's well-known types include directory first (if found).
+        // This is needed for Bazel sandboxed builds where protoc and its
+        // include files are in different locations.
+        if let Some(include_dir) = protoc_include_dir {
+            command.arg(format!(
+                "-I{}",
+                include_dir.to_str().context("include path not UTF-8")?
+            ));
+        }
+
+        for include in includes {
+            command.arg(format!("-I{}", include.to_str().context("path not UTF-8")?));
+        }
+
+        command.arg(proto);
+
+        command.stdin(Stdio::null());
+        command.stderr(Stdio::inherit());
+
+        let status = command.status().context("protoc command failed")?;
+        if !status.success() {
+            return Err(anyhow::anyhow!("protoc command failed"));
+        }
+
+        let dependencies = Self::read_dependencies(&dependency_out, &descriptor_set_out)?;
+        Ok((dependencies, output_dir))
+    }
+
+    fn read_dependencies(
+        dependency_out: &Path,
+        descriptor_set_out: &Path,
+    ) -> anyhow::Result<Vec<String>> {
+        let output = fs::read_to_string(dependency_out)
+            .context("failed to read protoc dependency output")?;
+        Self::parse_dependencies(&output, descriptor_set_out)
+    }
+
+    fn parse_dependencies(output: &str, descriptor_set_out: &Path) -> anyhow::Result<Vec<String>> {
+        let mut lines = output.lines();
+        let first_line = lines.next().context("protoc command output is empty")?;
+        let prefix = format!(
+            "{}:",
+            descriptor_set_out
+                .to_str()
+                .context("descriptor output path not UTF-8")?
+        );
+        let rem = first_line.strip_prefix(&prefix).with_context(|| {
+            format!("protoc command output must start with {prefix}: {output:?}")
+        })?;
+        let mut dependencies = Vec::new();
+        for line in iter::once(rem).chain(lines) {
+            let line = line.trim();
+            let line = line.strip_suffix("\\").unwrap_or(line);
+
+            if !fs::exists(line)? {
+                return Err(anyhow::anyhow!("dependency file not found: {line}"));
+            }
+
+            dependencies.push(line.to_owned());
+        }
+
+        Ok(dependencies)
     }
 
     pub fn compile_protos(
@@ -324,5 +370,241 @@ pub fn configure() -> XaiProtoBuilder {
         pbjson_preserve_proto_field_names: false,
         file_descriptor_set_path: None,
         honor_debug_redact: false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::process::Command;
+
+    fn protoc_on_path() -> PathBuf {
+        let executable = if cfg!(windows) {
+            "protoc.exe"
+        } else {
+            "protoc"
+        };
+        std::env::split_paths(&std::env::var_os("PATH").unwrap())
+            .map(|directory| directory.join(executable))
+            .find(|candidate| candidate.is_file())
+            .expect("these tests require protoc on PATH")
+    }
+
+    #[test]
+    fn dependency_parser_keeps_owned_and_well_known_paths_with_spaces_and_crlf() {
+        let directory = tempfile::tempdir().unwrap();
+        let descriptor = directory.path().join("descriptor with spaces.pb");
+        let owned = directory
+            .path()
+            .join("project")
+            .join("include")
+            .join("google")
+            .join("protobuf")
+            .join("owned.proto");
+        let well_known = directory
+            .path()
+            .join("protoc")
+            .join("include")
+            .join("google")
+            .join("protobuf")
+            .join("timestamp.proto");
+        let spaced = directory.path().join("project sources").join("input.proto");
+        for dependency in [&owned, &well_known, &spaced] {
+            fs::create_dir_all(dependency.parent().unwrap()).unwrap();
+            fs::write(dependency, "syntax = \"proto3\";").unwrap();
+        }
+
+        let output = format!(
+            "{}: {}\\\r\n {}\\\r\n {}\r\n",
+            descriptor.display(),
+            owned.display(),
+            well_known.display(),
+            spaced.display()
+        );
+        let dependencies = XaiProtoBuilder::parse_dependencies(&output, &descriptor).unwrap();
+        let mut directives = Vec::new();
+        XaiProtoBuilder::emit_dependencies(dependencies.clone(), |directive| {
+            directives.push(directive)
+        });
+
+        assert_eq!(
+            dependencies,
+            vec![
+                owned.to_string_lossy(),
+                well_known.to_string_lossy(),
+                spaced.to_string_lossy()
+            ]
+        );
+        assert!(
+            dependencies
+                .iter()
+                .any(|dependency| dependency.ends_with("owned.proto"))
+        );
+        assert!(
+            dependencies
+                .iter()
+                .any(|dependency| dependency.ends_with("timestamp.proto"))
+        );
+        assert!(directives.contains(&format!("cargo:rerun-if-changed={}", owned.display())));
+        assert!(directives.contains(&format!("cargo:rerun-if-changed={}", well_known.display())));
+        #[cfg(windows)]
+        assert!(dependencies[0].contains("\\project\\include\\google\\protobuf\\owned.proto"));
+    }
+
+    #[test]
+    fn dependency_scan_keeps_actual_well_known_proto() {
+        let protoc = protoc_on_path();
+        let include = find_protoc_include_dir(Some(&protoc))
+            .expect("protoc must have its include directory beside bin");
+        let timestamp = include.join("google/protobuf/timestamp.proto");
+        assert!(timestamp.is_file());
+
+        let directory = tempfile::tempdir().unwrap();
+        let project = directory.path().join("project with spaces");
+        fs::create_dir(&project).unwrap();
+        let input = project.join("input.proto");
+        fs::write(
+            &input,
+            "syntax = \"proto3\";\nimport \"google/protobuf/timestamp.proto\";\n\
+             message M { google.protobuf.Timestamp timestamp = 1; }\n",
+        )
+        .unwrap();
+
+        let (dependencies, _output_dir) = XaiProtoBuilder::scan_dependencies(
+            Some(&protoc),
+            Some(&include),
+            &input,
+            &[project.as_path()],
+        )
+        .unwrap();
+        let mut directives = Vec::new();
+        XaiProtoBuilder::emit_dependencies(dependencies.clone(), |directive| {
+            directives.push(directive)
+        });
+        let timestamp_dependency = dependencies
+            .iter()
+            .find(|dependency| Path::new(dependency) == timestamp)
+            .unwrap();
+        assert!(directives.contains(&format!("cargo:rerun-if-changed={timestamp_dependency}")));
+    }
+
+    #[test]
+    fn dependency_parser_rejects_bad_target_and_missing_or_non_utf8_dependencies() {
+        let directory = tempfile::tempdir().unwrap();
+        let descriptor = directory.path().join("descriptor.pb");
+        let dependency_out = directory.path().join("dependencies.d");
+        let missing = directory.path().join("missing.proto");
+
+        let wrong_target = format!("wrong-target: {}\n", missing.display());
+        let error = XaiProtoBuilder::parse_dependencies(&wrong_target, &descriptor).unwrap_err();
+        assert!(error.to_string().contains("must start with"));
+
+        let missing_output = format!("{}: {}\n", descriptor.display(), missing.display());
+        let error = XaiProtoBuilder::parse_dependencies(&missing_output, &descriptor).unwrap_err();
+        assert!(error.to_string().contains("dependency file not found"));
+
+        fs::write(&dependency_out, [0xff, 0xfe]).unwrap();
+        let error = XaiProtoBuilder::read_dependencies(&dependency_out, &descriptor).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("failed to read protoc dependency output")
+        );
+    }
+
+    #[test]
+    fn parallel_dependency_scans_use_distinct_dirs_and_clean_them_up() {
+        let protoc = find_protoc::find_protoc().unwrap();
+        let protoc_include_dir = find_protoc_include_dir(protoc.as_deref());
+        let test_data = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("test_data");
+        let proto = test_data.join("debug_redact_plain.proto");
+
+        let scans = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..8)
+                .map(|_| {
+                    scope.spawn(|| {
+                        XaiProtoBuilder::scan_dependencies(
+                            protoc.as_deref(),
+                            protoc_include_dir.as_deref(),
+                            &proto,
+                            &[test_data.as_path()],
+                        )
+                        .unwrap()
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+
+        let mut paths = Vec::new();
+        for (dependencies, output_dir) in scans {
+            assert!(
+                dependencies
+                    .iter()
+                    .any(|dependency| dependency.ends_with("debug_redact_plain.proto"))
+            );
+            assert!(output_dir.path().join("dependencies.d").is_file());
+            assert!(output_dir.path().join("descriptor.pb").is_file());
+            paths.push(output_dir.path().to_owned());
+            drop(output_dir);
+        }
+        paths.sort();
+        paths.dedup();
+        assert_eq!(paths.len(), 8);
+        assert!(paths.iter().all(|path| !path.exists()));
+    }
+
+    #[test]
+    fn path_fallback_uses_path_after_bad_bundled_protoc() {
+        assert!(
+            Command::new("protoc")
+                .arg("--version")
+                .status()
+                .unwrap()
+                .success(),
+            "this test requires protoc on PATH"
+        );
+        let directory = tempfile::tempdir().unwrap();
+        let bin = directory.path().join("bin");
+        fs::create_dir(&bin).unwrap();
+        let bundled = bin.join("protoc");
+        fs::write(&bundled, "not an executable").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&bundled, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "tests::path_fallback_child", "--nocapture"])
+            .current_dir(directory.path())
+            .env_remove("PROTOC")
+            .env("XAI_PROTO_PATH_FALLBACK_CHILD", "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "child failed; stdout: {}; stderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("XAI_PROTO_PATH_FALLBACK_CHILD_RAN")
+        );
+    }
+
+    #[test]
+    fn path_fallback_child() {
+        if std::env::var_os("XAI_PROTO_PATH_FALLBACK_CHILD").is_none() {
+            return;
+        }
+        assert_eq!(
+            find_protoc::find_protoc().unwrap(),
+            Some(PathBuf::from("protoc"))
+        );
+        println!("XAI_PROTO_PATH_FALLBACK_CHILD_RAN");
     }
 }
