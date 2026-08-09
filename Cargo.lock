@@ -4815,6 +4815,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "uuid",
  "xai-acp-lib",
  "xai-agent-lifecycle",
  "xai-file-utils",
