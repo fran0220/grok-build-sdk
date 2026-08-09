@@ -730,10 +730,10 @@ pub struct MvpAgent {
     pub(crate) origin_profile: crate::agent::config::OriginEmbeddedProfile,
     /// Origin embedded boundary: explicit persistence root, independent of GROK_HOME.
     storage_root: Option<PathBuf>,
-    /// Host-injected canonical native-session authority. When present, the
+    /// Host-injected semantic native-session authority. When present, the
     /// same runtime-wide instance is shared by every embedded session.
     pub(crate) session_state_authority:
-        Option<Arc<dyn crate::session::state_authority::CanonicalSessionStateAuthority>>,
+        Option<Arc<dyn crate::session::state_authority::NativeSessionStateAuthority>>,
     /// LEADER-SAFE(shared): `Send + Sync` mirror of per-session activity for the
     /// leader's auto-update checker, which cannot read the `!Send` maps. Expires
     /// when the actor exits. See [`crate::agent::activity::AgentActivity`].

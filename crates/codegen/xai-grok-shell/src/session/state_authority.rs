@@ -1,119 +1,98 @@
-//! Canonical native-session persistence boundary for embedded hosts.
+//! Semantic native-session persistence port for embedded hosts.
 //!
-//! This module intentionally contains no SDK dependency. The SDK adapts its
-//! public content-addressed object/manifest ABI to these shell-owned traits.
+//! The shell owns these concepts, but deliberately knows nothing about the
+//! SDK's object, digest, manifest, CAS, or storage ABI.
 
 use std::sync::Arc;
 
-/// Opaque error returned by a Host-owned canonical session authority.
 #[doc(hidden)]
-#[derive(Clone, Debug, thiserror::Error)]
-#[error("canonical session state authority failed: {0}")]
+#[derive(Clone, Debug, thiserror::Error, PartialEq, Eq)]
+#[error("native session state authority failed: {0}")]
 pub struct AuthorityError(pub String);
 
-/// A stored immutable object, encoded by the canonical ABI.
 #[doc(hidden)]
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct CanonicalObject {
-    pub id: String,
-    pub declared_size: u64,
-    pub bytes: Vec<u8>,
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct SessionIdentity {
+    pub identity: String,
+    pub generation: String,
 }
 
-/// A versioned canonical manifest document.
 #[doc(hidden)]
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct CanonicalManifest {
-    pub revision: u64,
-    pub digest: String,
-    pub bytes: Vec<u8>,
-}
-
-/// Current durable state of a session identity.
-#[doc(hidden)]
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum CanonicalSlot {
+pub enum SessionInspection {
     Vacant,
-    Live(CanonicalManifest),
-    Tombstoned {
-        generation: String,
-        revision: u64,
-        prior_digest: String,
+    Live { generation: String },
+    Tombstoned { generation: String },
+}
+
+/// Stable position between published records. Cursors are scoped to one
+/// identity/generation and are invalid after rewind or recreation.
+#[doc(hidden)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReplayCursor {
+    pub generation: String,
+    pub next_sequence: u64,
+}
+
+#[doc(hidden)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RewindOperation {
+    AppendPoint { index: u64, payload: Vec<u8> },
+    Truncate { index: u64, payload: Vec<u8> },
+    Merge { index: u64, payload: Vec<u8> },
+}
+
+#[doc(hidden)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ReplayRecord {
+    Update(Vec<u8>),
+    Checkpoint {
+        name: String,
+        payload: Vec<u8>,
+        marker: Vec<u8>,
+    },
+    Rewind {
+        operation: RewindOperation,
+        marker: Vec<u8>,
     },
 }
 
-/// Outcome of staging an immutable object.
-#[doc(hidden)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum CanonicalObjectPut {
-    Stored,
-    AlreadyPresent,
-    CommitUnknown,
-}
-
-/// Outcome of publishing a manifest with compare-and-swap.
 #[doc(hidden)]
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum CanonicalManifestCas {
-    Committed(CanonicalManifest),
-    Conflict,
-    CommitUnknown,
+pub struct ReplayPage {
+    pub records: Vec<ReplayRecord>,
+    pub next: Option<ReplayCursor>,
 }
 
-/// Outcome of tombstoning a session generation.
+/// One opened native session. Staging is process-local until `flush`; all
+/// other publication methods atomically flush staged updates with their marker.
 #[doc(hidden)]
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum CanonicalDelete {
-    Deleted {
-        generation: String,
-        revision: u64,
-        prior_digest: String,
-    },
-    Conflict,
-    CommitUnknown,
-}
-
-/// Exact CAS input. `suffix` contains the immutable objects extending the
-/// expected head and is validated again by the Host authority.
-#[doc(hidden)]
-#[derive(Clone, Debug)]
-pub struct CanonicalManifestCasRequest {
-    pub expected: Option<CanonicalManifest>,
-    pub successor_bytes: Vec<u8>,
-    pub suffix: Vec<CanonicalObject>,
-}
-
-/// Bounded object reader used while reconstructing a canonical session.
-#[doc(hidden)]
-pub trait CanonicalSessionReplay: Send + Sync + 'static {
-    fn load_object(&self, id: &str) -> Result<Option<CanonicalObject>, AuthorityError>;
-}
-
-/// One session identity and generation opened from the shared authority.
-#[doc(hidden)]
-pub trait CanonicalSession: Send + Sync + 'static {
-    fn session_identity(&self) -> &str;
-    fn generation(&self) -> &str;
-    fn replay(&self) -> Arc<dyn CanonicalSessionReplay>;
-    fn put_object(&self, object: CanonicalObject) -> Result<CanonicalObjectPut, AuthorityError>;
-    fn compare_and_swap_manifest(
+pub trait NativeSession: Send + Sync + 'static {
+    fn identity(&self) -> &SessionIdentity;
+    fn stage_update(&self, bytes: Vec<u8>) -> Result<(), AuthorityError>;
+    fn flush(&self) -> Result<ReplayCursor, AuthorityError>;
+    fn replay_page(
         &self,
-        request: CanonicalManifestCasRequest,
-    ) -> Result<CanonicalManifestCas, AuthorityError>;
-    fn compare_and_delete(
+        cursor: Option<ReplayCursor>,
+        max_records: usize,
+    ) -> Result<ReplayPage, AuthorityError>;
+    fn publish_checkpoint(
         &self,
-        expected: CanonicalManifest,
-    ) -> Result<CanonicalDelete, AuthorityError>;
+        name: String,
+        payload: Vec<u8>,
+        marker: Vec<u8>,
+    ) -> Result<ReplayCursor, AuthorityError>;
+    fn publish_rewind(
+        &self,
+        operation: RewindOperation,
+        marker: Vec<u8>,
+    ) -> Result<ReplayCursor, AuthorityError>;
 }
 
-/// Runtime-wide canonical authority. One instance is shared by every native
-/// session; callers key all durable state by identity and generation.
 #[doc(hidden)]
-pub trait CanonicalSessionStateAuthority: Send + Sync + 'static {
-    fn inspect_slot(&self, session_identity: &str) -> Result<CanonicalSlot, AuthorityError>;
-    fn open_session(
-        &self,
-        session_identity: &str,
-        generation: &str,
-    ) -> Result<Arc<dyn CanonicalSession>, AuthorityError>;
+pub trait NativeSessionStateAuthority: Send + Sync + 'static {
+    fn inspect(&self, identity: &str) -> Result<SessionInspection, AuthorityError>;
+    fn create(&self, id: SessionIdentity) -> Result<Arc<dyn NativeSession>, AuthorityError>;
+    fn open(&self, id: SessionIdentity) -> Result<Arc<dyn NativeSession>, AuthorityError>;
+    fn tombstone(&self, id: SessionIdentity) -> Result<(), AuthorityError>;
 }

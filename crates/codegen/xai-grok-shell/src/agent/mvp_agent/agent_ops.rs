@@ -2477,7 +2477,7 @@ impl MvpAgent {
         storage_root: PathBuf,
         profile: crate::agent::config::OriginEmbeddedProfile,
         session_state_authority: Option<
-            Arc<dyn crate::session::state_authority::CanonicalSessionStateAuthority>,
+            Arc<dyn crate::session::state_authority::NativeSessionStateAuthority>,
         >,
     ) -> Self {
         Self::with_models_mode(
@@ -2499,7 +2499,7 @@ impl MvpAgent {
         storage_root: Option<PathBuf>,
         origin_profile: crate::agent::config::OriginEmbeddedProfile,
         session_state_authority: Option<
-            Arc<dyn crate::session::state_authority::CanonicalSessionStateAuthority>,
+            Arc<dyn crate::session::state_authority::NativeSessionStateAuthority>,
         >,
     ) -> Self {
         let origin_embedded = storage_root.is_some();
