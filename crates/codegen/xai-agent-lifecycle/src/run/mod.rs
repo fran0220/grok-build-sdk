@@ -15,7 +15,10 @@ pub use artifact::{ArtifactMetadata, ArtifactStore, LocalArtifactStore};
 pub use controller::RunController;
 pub use model::*;
 pub use providers::*;
-pub use store::{LocalRunStore, RunStore, StoreCommit, StoreCommitResult};
+pub use store::{
+    CURRENT_RUN_SCHEMA, LocalRunStore, PreparedIteration, PreparedStoreCommit, RUN_SCHEMA_MARKER,
+    RunSchemaMarker, RunStore, StoreCommit, StoreCommitResult,
+};
 
 #[cfg(test)]
 mod tests;

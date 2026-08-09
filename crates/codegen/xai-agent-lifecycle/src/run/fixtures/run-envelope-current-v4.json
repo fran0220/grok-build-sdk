@@ -1,5 +1,5 @@
 {
-  "schema_version": 2,
+  "schema_version": 4,
   "run": {
     "revision": 1,
     "controller_epoch": 1,
@@ -70,12 +70,30 @@
     "current_strategy_revision": 0,
     "workflow_revisions": [],
     "current_workflow_revision": null,
+    "harness": {
+      "active": {
+        "digest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "descriptor_digest": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "capability_revision": "provider-v1",
+        "negotiated_capabilities": [],
+        "revision": 1,
+        "evidence": [],
+        "provenance": "fixture"
+      },
+      "previous": null,
+      "proposals": {}
+    },
     "verdict": null,
     "pending_approval": false,
     "recovery_prior_status": null,
     "command_receipts": {},
     "terminal_report_claimed": false,
-    "event_cursor": 0
+    "event_cursor": 0,
+    "wake": {
+      "reasons": [],
+      "deadline_ms": null
+    },
+    "activation_lease": null
   },
   "events": []
 }

@@ -4807,6 +4807,7 @@ dependencies = [
  "axum",
  "base64 0.22.1",
  "indexmap",
+ "rusqlite",
  "rustls",
  "serde",
  "serde_json",

@@ -3,6 +3,16 @@ use super::store::{RunStore, StoreCommit, StoreCommitResult};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
+fn boundary(run: &RunRecord) -> Result<(), RunError> {
+    if run.active_iteration.is_some() || run.stage != RunStage::Idle {
+        Err(RunError::InvalidTransition(
+            "Harness governance is allowed only at iteration boundaries".into(),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
 pub struct RunController<S: RunStore> {
     store: S,
     runs: BTreeMap<RunId, RunEnvelope>,
@@ -60,6 +70,10 @@ impl<S: RunStore> RunController<S> {
         }
         request.goal.validate()?;
         request.capabilities.validate()?;
+        let harness = request.harness_snapshot.as_ref().ok_or_else(|| {
+            RunError::Validation("new Runs require an exact Harness snapshot pin".into())
+        })?;
+        harness.validate()?;
         if !matches!(&request.driver, RunDriverSpec::AutonomousTurnLoop { .. }) {
             return Err(RunError::Validation(
                 "only AutonomousTurnLoop is executable in Run schema v2".into(),
@@ -121,6 +135,8 @@ impl<S: RunStore> RunController<S> {
         let run = RunRecord {
             revision,
             controller_epoch: epoch,
+            wake: WakeIntent::default(),
+            activation_lease: None,
             created_at_ms: now_ms,
             updated_at_ms: now_ms,
             id: run_id.clone(),
@@ -149,6 +165,11 @@ impl<S: RunStore> RunController<S> {
             current_strategy_revision,
             workflow_revisions: Vec::new(),
             current_workflow_revision,
+            harness: HarnessGovernance {
+                active: request.harness_snapshot,
+                previous: None,
+                proposals: BTreeMap::new(),
+            },
             verdict: None,
             pending_approval: false,
             recovery_prior_status: None,
@@ -182,6 +203,197 @@ impl<S: RunStore> RunController<S> {
 
     pub fn list_runs(&self) -> Vec<RunEnvelope> {
         self.runs.values().cloned().collect()
+    }
+
+    /// Restart/re-arm view. This is inspection only; the claim command is the
+    /// authority that durably converts an overdue deadline into CatchUp.
+    pub fn inspect_residency(
+        &self,
+        run_id: &RunId,
+        now_ms: u64,
+    ) -> Result<ResidencyInspection, RunError> {
+        let run = &self.runs.get(run_id).ok_or(RunError::NotFound)?.run;
+        Ok(ResidencyInspection {
+            run_id: run.id.clone(),
+            revision: run.revision,
+            wake: run.wake.clone(),
+            lease: run.activation_lease.clone(),
+            overdue: run
+                .wake
+                .deadline_ms
+                .is_some_and(|deadline| deadline <= now_ms),
+        })
+    }
+
+    pub fn request_wake(
+        &mut self,
+        request: MutationRequest<WakeRequest>,
+        now_ms: u64,
+    ) -> Result<RunCommandResult, RunError> {
+        let input = request.input.clone();
+        self.apply_command(
+            request,
+            "request_wake",
+            "wake_requested",
+            now_ms,
+            false,
+            |run| {
+                if run.status != RunStatus::Active {
+                    return Err(RunError::InvalidTransition(
+                        "only an active Run can be woken".into(),
+                    ));
+                }
+                run.wake.reasons.insert(input.reason);
+                run.wake.deadline_ms = match (run.wake.deadline_ms, input.deadline_ms) {
+                    (Some(a), Some(b)) => Some(a.min(b)),
+                    (None, value) | (value, None) => value,
+                };
+                Ok(())
+            },
+        )
+    }
+
+    pub fn claim_activation(
+        &mut self,
+        request: MutationRequest<ClaimActivation>,
+        now_ms: u64,
+    ) -> Result<CommandOutput<ActivationLease>, RunError> {
+        let input = request.input.clone();
+        let claim_command_id = request.command_id.clone();
+        if input.lease_ms == 0 || input.lease_ms > 86_400_000 {
+            return Err(RunError::Validation(
+                "activation lease must be between 1ms and 24h".into(),
+            ));
+        }
+        let token = ActivationToken::random();
+        let mut output = None;
+        let command = self.apply_command(
+            request,
+            "claim_activation",
+            "activation_claimed",
+            now_ms,
+            false,
+            |run| {
+                if run.status != RunStatus::Active || run.pending_approval {
+                    return Err(RunError::InvalidTransition(
+                        "inactive Run cannot be claimed".into(),
+                    ));
+                }
+                if run
+                    .activation_lease
+                    .as_ref()
+                    .is_some_and(|lease| lease.expires_at_ms > now_ms)
+                {
+                    return Err(RunError::InvalidTransition(
+                        "Run already has an active worker".into(),
+                    ));
+                }
+                let expired = run
+                    .activation_lease
+                    .as_ref()
+                    .filter(|lease| lease.expires_at_ms <= now_ms)
+                    .cloned();
+                let due = run
+                    .wake
+                    .deadline_ms
+                    .is_some_and(|deadline| deadline <= now_ms);
+                if run.wake.reasons.is_empty() && !due && expired.is_none() {
+                    return Err(RunError::InvalidTransition(
+                        "Run has no due wake intent".into(),
+                    ));
+                }
+                run.controller_epoch = ControllerEpoch::new(
+                    run.controller_epoch
+                        .get()
+                        .checked_add(1)
+                        .ok_or_else(|| RunError::Integrity("controller epoch overflow".into()))?,
+                );
+                let mut reasons = std::mem::take(&mut run.wake.reasons);
+                if let Some(expired) = expired {
+                    reasons.extend(expired.reasons);
+                }
+                if due {
+                    reasons.insert(WakeReason::CatchUp);
+                }
+                run.wake.deadline_ms = None;
+                let lease = ActivationLease {
+                    worker_id: input.worker_id.clone(),
+                    claim_command_id: claim_command_id.clone(),
+                    epoch: run.controller_epoch,
+                    token: token.clone(),
+                    expires_at_ms: now_ms
+                        .checked_add(input.lease_ms)
+                        .ok_or_else(|| RunError::Validation("lease expiry overflow".into()))?,
+                    reasons,
+                };
+                run.activation_lease = Some(lease.clone());
+                output = Some(lease);
+                Ok(())
+            },
+        )?;
+        let output = output
+            .or_else(|| {
+                command
+                    .snapshot
+                    .run
+                    .activation_lease
+                    .as_ref()
+                    .filter(|lease| {
+                        lease.claim_command_id == claim_command_id && lease.expires_at_ms > now_ms
+                    })
+                    .cloned()
+            })
+            .ok_or_else(|| {
+                RunError::InvalidTransition("duplicate claim has already been settled".into())
+            })?;
+        Ok(CommandOutput { command, output })
+    }
+
+    pub fn renew_activation(
+        &mut self,
+        request: MutationRequest<(ActivationFence, u64)>,
+        now_ms: u64,
+    ) -> Result<RunCommandResult, RunError> {
+        let (fence, lease_ms) = request.input.clone();
+        if lease_ms == 0 || lease_ms > 86_400_000 {
+            return Err(RunError::Validation(
+                "activation lease must be between 1ms and 24h".into(),
+            ));
+        }
+        self.apply_command(
+            request,
+            "renew_activation",
+            "activation_renewed",
+            now_ms,
+            false,
+            |run| {
+                check_activation(run, &fence, now_ms)?;
+                run.activation_lease.as_mut().unwrap().expires_at_ms = now_ms
+                    .checked_add(lease_ms)
+                    .ok_or_else(|| RunError::Validation("lease expiry overflow".into()))?;
+                Ok(())
+            },
+        )
+    }
+
+    pub fn release_activation(
+        &mut self,
+        request: MutationRequest<ActivationFence>,
+        now_ms: u64,
+    ) -> Result<RunCommandResult, RunError> {
+        let fence = request.input.clone();
+        self.apply_command(
+            request,
+            "release_activation",
+            "activation_released",
+            now_ms,
+            false,
+            |run| {
+                check_activation(run, &fence, now_ms)?;
+                run.activation_lease = None;
+                Ok(())
+            },
+        )
     }
 
     pub fn list_recoverable_runs(&self) -> Vec<RunEnvelope> {
@@ -323,6 +535,9 @@ impl<S: RunStore> RunController<S> {
                         .checked_add(1)
                         .ok_or_else(|| RunError::Integrity("controller epoch overflow".into()))?,
                 );
+                // Acquiring process authority fences a pre-restart worker.
+                run.activation_lease = None;
+                run.wake = WakeIntent::default();
                 run.status = RunStatus::RecoveryRequired;
                 run.stage = RunStage::Recovering;
                 for operation in run.operations.values_mut() {
@@ -537,6 +752,8 @@ impl<S: RunStore> RunController<S> {
                     || request.input.context.strategy_revision != run.current_strategy_revision
                     || request.input.context.workflow_revision != run.current_workflow_revision
                     || request.input.context.policy_digest != run.verifier_policy_digest
+                    || run.harness.active.as_ref().map(|pin| pin.digest.as_str())
+                        != Some(request.input.context.harness_snapshot_digest.as_str())
                 {
                     return Err(RunError::Conflict {
                         expected: Some(request.expected_revision),
@@ -601,6 +818,142 @@ impl<S: RunStore> RunController<S> {
             },
             command,
         })
+    }
+
+    pub fn propose_harness(
+        &mut self,
+        request: MutationRequest<ProposeHarness>,
+        now_ms: u64,
+    ) -> Result<RunCommandResult, RunError> {
+        self.apply_command(
+            request.clone(),
+            "propose_harness",
+            "harness_proposed",
+            now_ms,
+            false,
+            |run| {
+                boundary(run)?;
+                request.input.pin.validate()?;
+                if run
+                    .harness
+                    .proposals
+                    .contains_key(&request.input.pin.digest)
+                {
+                    return Err(RunError::Conflict {
+                        expected: None,
+                        actual: None,
+                    });
+                }
+                run.harness.proposals.insert(
+                    request.input.pin.digest.clone(),
+                    HarnessProposal {
+                        pin: request.input.pin.clone(),
+                        state: HarnessProposalState::Proposed,
+                    },
+                );
+                Ok(())
+            },
+        )
+    }
+
+    pub fn validate_harness(
+        &mut self,
+        request: MutationRequest<ValidateHarness>,
+        now_ms: u64,
+    ) -> Result<RunCommandResult, RunError> {
+        self.apply_command(
+            request.clone(),
+            "validate_harness",
+            "harness_validated",
+            now_ms,
+            false,
+            |run| {
+                boundary(run)?;
+                let proposal = run
+                    .harness
+                    .proposals
+                    .get_mut(&request.input.digest)
+                    .ok_or(RunError::NotFound)?;
+                if proposal.state != HarnessProposalState::Proposed {
+                    return Err(RunError::InvalidTransition(
+                        "Harness proposal is not proposed".into(),
+                    ));
+                }
+                proposal.state = if request.input.accepted {
+                    HarnessProposalState::Validated
+                } else {
+                    HarnessProposalState::Rejected
+                };
+                Ok(())
+            },
+        )
+    }
+
+    pub fn activate_harness(
+        &mut self,
+        request: MutationRequest<ActivateHarness>,
+        now_ms: u64,
+    ) -> Result<RunCommandResult, RunError> {
+        self.apply_command(
+            request.clone(),
+            "activate_harness",
+            "harness_activated",
+            now_ms,
+            false,
+            |run| {
+                boundary(run)?;
+                let proposal = run
+                    .harness
+                    .proposals
+                    .get_mut(&request.input.digest)
+                    .ok_or(RunError::NotFound)?;
+                if proposal.state != HarnessProposalState::Validated {
+                    return Err(RunError::InvalidTransition(
+                        "Harness proposal is not validated".into(),
+                    ));
+                }
+                proposal.state = HarnessProposalState::Active;
+                run.harness.previous = run.harness.active.replace(proposal.pin.clone());
+                Ok(())
+            },
+        )
+    }
+
+    pub fn rollback_harness(
+        &mut self,
+        request: MutationRequest<RollbackHarness>,
+        now_ms: u64,
+    ) -> Result<RunCommandResult, RunError> {
+        self.apply_command(
+            request.clone(),
+            "rollback_harness",
+            "harness_rolled_back",
+            now_ms,
+            false,
+            |run| {
+                boundary(run)?;
+                if run.harness.active.as_ref().map(|p| &p.digest)
+                    != Some(&request.input.expected_active_digest)
+                {
+                    return Err(RunError::Conflict {
+                        expected: None,
+                        actual: None,
+                    });
+                }
+                let previous = run.harness.previous.take().ok_or_else(|| {
+                    RunError::InvalidTransition("no Harness snapshot to roll back to".into())
+                })?;
+                if let Some(proposal) = run
+                    .harness
+                    .proposals
+                    .get_mut(&request.input.expected_active_digest)
+                {
+                    proposal.state = HarnessProposalState::RolledBack;
+                }
+                run.harness.active = Some(previous);
+                Ok(())
+            },
+        )
     }
 
     pub fn finish_iteration(
@@ -810,7 +1163,9 @@ impl<S: RunStore> RunController<S> {
     ) -> Result<CommandOutput<CommittedEffect>, RunError> {
         let run_id = request.run_id.clone();
         let operation_id = request.input.operation_id.clone();
+        let claim_command_id = request.command_id.clone();
         let reservation = request.input.reservation.clone();
+        let activation = request.input.activation.clone();
         let command = self.apply_command(
             request,
             "claim_effect",
@@ -822,6 +1177,16 @@ impl<S: RunStore> RunController<S> {
                     return Err(RunError::InvalidTransition(
                         "only active Runs may claim effects".into(),
                     ));
+                }
+                match (&run.activation_lease, &activation) {
+                    (Some(_), Some(fence)) => check_activation(run, fence, now_ms)?,
+                    (Some(_), None) => {
+                        return Err(RunError::InvalidTransition(
+                            "leased Run effect claim requires its activation fence".into(),
+                        ));
+                    }
+                    (None, Some(_)) => return Err(RunError::StaleEpoch),
+                    (None, None) => {}
                 }
                 let operation = run
                     .operations
@@ -890,6 +1255,7 @@ impl<S: RunStore> RunController<S> {
                     .ok_or_else(|| RunError::Integrity("effect attempt overflow".into()))?;
                 operation.active_attempt = Some(OperationAttempt {
                     attempt,
+                    claim_command_id: claim_command_id.clone(),
                     token: DispatchToken::random(),
                     epoch: run.controller_epoch,
                 });
@@ -908,6 +1274,7 @@ impl<S: RunStore> RunController<S> {
         let attempt = operation
             .active_attempt
             .as_ref()
+            .filter(|attempt| attempt.claim_command_id == claim_command_id)
             .ok_or_else(|| RunError::Integrity("effect claim lost attempt token".into()))?;
         Ok(CommandOutput {
             output: CommittedEffect {
@@ -1038,7 +1405,7 @@ impl<S: RunStore> RunController<S> {
             }
         }
         if requires_recovery {
-            enter_recovery(&mut next.run);
+            enter_recovery(&mut next.run)?;
         }
         let snapshot = self.commit_callback(old, next, "effect_acknowledged", now_ms, None)?;
         Ok(CallbackResult {
@@ -1765,6 +2132,7 @@ fn apply_control(run: &mut RunRecord, action: &RunAction, _now_ms: u64) -> Resul
                 return Err(RunError::InvalidTransition("Run is not active".into()));
             }
             run.status = RunStatus::UserPaused;
+            fence_activation(run)?;
         }
         RunAction::PauseFor { reason } => {
             if run.status != RunStatus::Active || run.active_iteration.is_some() {
@@ -1785,6 +2153,7 @@ fn apply_control(run: &mut RunRecord, action: &RunAction, _now_ms: u64) -> Resul
                     ));
                 }
             };
+            fence_activation(run)?;
         }
         RunAction::Resume { budget } => {
             if !matches!(
@@ -1861,6 +2230,7 @@ fn apply_control(run: &mut RunRecord, action: &RunAction, _now_ms: u64) -> Resul
             }
             run.status = RunStatus::Cancelled;
             run.stage = RunStage::Idle;
+            fence_activation(run)?;
         }
         RunAction::Approve => {
             if !run.pending_approval || run.stage != RunStage::AwaitingApproval {
@@ -1880,11 +2250,13 @@ fn apply_control(run: &mut RunRecord, action: &RunAction, _now_ms: u64) -> Resul
             run.pending_approval = false;
             run.status = RunStatus::UserPaused;
             run.stage = RunStage::Idle;
+            fence_activation(run)?;
         }
         RunAction::TryComplete => {
             validate_completion(run)?;
             run.status = RunStatus::Complete;
             run.stage = RunStage::Idle;
+            fence_activation(run)?;
         }
         RunAction::ClaimTerminalReport => {
             if !run.status.is_terminal() || run.terminal_report_claimed || has_unsettled_work(run) {
@@ -1903,6 +2275,35 @@ fn apply_control(run: &mut RunRecord, action: &RunAction, _now_ms: u64) -> Resul
             run.status = RunStatus::Tombstoned;
             run.stage = RunStage::Idle;
         }
+    }
+    Ok(())
+}
+
+fn fence_activation(run: &mut RunRecord) -> Result<(), RunError> {
+    if run.activation_lease.is_some() {
+        run.controller_epoch = ControllerEpoch::new(
+            run.controller_epoch
+                .get()
+                .checked_add(1)
+                .ok_or_else(|| RunError::Integrity("controller epoch overflow".into()))?,
+        );
+    }
+    run.activation_lease = None;
+    run.wake = WakeIntent::default();
+    Ok(())
+}
+
+fn check_activation(run: &RunRecord, fence: &ActivationFence, now_ms: u64) -> Result<(), RunError> {
+    let lease = run
+        .activation_lease
+        .as_ref()
+        .ok_or_else(|| RunError::InvalidTransition("activation is no longer held".into()))?;
+    if lease.worker_id != fence.worker_id
+        || lease.epoch != fence.epoch
+        || lease.token != fence.token
+        || lease.expires_at_ms <= now_ms
+    {
+        return Err(RunError::InvalidTransition("stale activation fence".into()));
     }
     Ok(())
 }
@@ -1969,12 +2370,13 @@ fn has_unsettled_work(run: &RunRecord) -> bool {
             .any(|child| !child.state.is_terminal())
 }
 
-fn enter_recovery(run: &mut RunRecord) {
+fn enter_recovery(run: &mut RunRecord) -> Result<(), RunError> {
     if !matches!(run.status, RunStatus::Active | RunStatus::RecoveryRequired) {
         run.recovery_prior_status.get_or_insert(run.status);
     }
     run.status = RunStatus::RecoveryRequired;
     run.stage = RunStage::Recovering;
+    fence_activation(run)
 }
 
 fn has_unsettled_operations(run: &RunRecord) -> bool {
@@ -2036,6 +2438,7 @@ fn validate_effect_capability(run: &RunRecord, spec: &EffectSpec) -> Result<(), 
             payload.validate()?;
             format!("external.{provider}")
         }
+        EffectSpec::ProgramExecution { provider, .. } => format!("program.{provider}"),
         EffectSpec::Unknown => {
             return Err(RunError::Capability(
                 "unknown effect type is never executable".into(),

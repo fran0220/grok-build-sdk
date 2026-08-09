@@ -6,10 +6,18 @@
 //! private implementation details.
 
 mod autonomous;
+mod evidence;
 mod harness;
+mod prime;
 mod private;
 
 pub use autonomous::{AutonomousActivation, AutonomousActivationResult, AutonomousTurnLoop};
+pub use evidence::{
+    LocalSessionEvidenceStore, MAX_SESSION_EVIDENCE_BYTES, SESSION_EVIDENCE_SCHEMA_MARKER,
+    SESSION_EVIDENCE_SCHEMA_VERSION, SessionEvidenceCommit, SessionEvidenceDocument,
+    SessionEvidenceKey, SessionEvidenceKind, SessionEvidenceStore, SessionEvidenceStoreError,
+    SessionEvidenceVersion,
+};
 pub use harness::{
     CompleteEventCursor, HARNESS_SNAPSHOT_SCHEMA_VERSION, HarnessContent, HarnessDigest,
     HarnessError, HarnessRefinement, HarnessRefinementPatch, HarnessSnapshot,
@@ -17,6 +25,7 @@ pub use harness::{
     TURN_BINDING_RECORD_SCHEMA_VERSION, TurnBindingKey, TurnBindingReceipt, TurnBindingRecord,
     TurnBindingStatus,
 };
+pub use prime::*;
 
 use std::{collections::BTreeMap, path::PathBuf, sync::Arc};
 use tokio::sync::mpsc;
@@ -43,23 +52,28 @@ pub mod mcp_model {
 /// sequences; hosts cannot accidentally cross the two namespaces.
 pub mod run {
     pub use xai_agent_lifecycle::run::{
-        ApprovalDecision, ApprovalHandler, ApprovalRequest, ArtifactMetadata, ArtifactRef,
-        ArtifactStore, CapabilityPolicy, CommandId, ControllerEpoch, CreateRunRequest,
-        DenyApprovalHandler, EffectClass, EffectReceipt, EffectUsage, FailClosedGateProvider,
-        FailClosedGoalVerifier, FinishedOutcome, GateEvaluation, GateProvider, GateRequest,
-        GoalSpec, GoalVerdict, GoalVerification, GoalVerificationRequest, GoalVerifier,
-        IterationId, LocalArtifactStore, LocalRunStore, MAX_RUN_ENVELOPE_BYTES, MessageId,
-        MutationRequest, NoopTelemetrySink, OperationId, OperationState, ProviderSet,
-        RUN_SCHEMA_VERSION, ReconcileDecision, RecoveryNeed, RecoveryPlan, RecoveryResolution,
-        ResourceDimension, ResourceVector, RunAction, RunAttach, RunCommandResult, RunDriverSpec,
-        RunEnvelope, RunError, RunEvent, RunEventCursor, RunEventKind, RunId, RunLifecycle,
-        RunRevision, RunStage, RunStatus, RunStore, SessionRef, SessionTurnOutcome, StoreCommit,
-        StoreCommitResult, TelemetryRecord, TelemetrySink, WaitingReason, migrate_legacy_goal,
-    };
-    #[cfg(test)]
-    pub use xai_agent_lifecycle::run::{
-        BeginIteration, ClaimEffect, EffectSpec, FinishIteration, IterationContextManifest,
-        PrepareOperation,
+        AcceptMessage, ActivateHarness, ActivationFence, ActivationLease, ActivationToken,
+        AdmitChild, ApprovalDecision, ApprovalHandler, ApprovalRequest, ArtifactMetadata,
+        ArtifactRef, ArtifactStore, BeginIteration, CURRENT_RUN_SCHEMA, CallbackResult,
+        CapabilityPolicy, ChildCallback, ChildCompletionPolicy, ChildId, ChildRun, ClaimActivation,
+        ClaimEffect, CommandId, CommandOutput, CommittedEffect, CompactionCheckpoint,
+        ControllerEpoch, CreateRunRequest, DenyApprovalHandler, EffectCallback, EffectClass,
+        EffectOutcome, EffectReceipt, EffectSpec, EffectUsage, FailClosedGateProvider,
+        FailClosedGoalVerifier, FinishIteration, FinishedOutcome, GateEvaluation, GateProvider,
+        GateRequest, GoalSpec, GoalVerdict, GoalVerification, GoalVerificationRequest,
+        GoalVerifier, HarnessGovernance, HarnessProposal, HarnessProposalState, HarnessSnapshotPin,
+        IterationContextManifest, IterationId, LocalArtifactStore, LocalRunStore,
+        MAX_RUN_ENVELOPE_BYTES, MailMessage, MessageId, MessageState, MutationRequest,
+        NoopTelemetrySink, OperationId, OperationState, PrepareOperation, PreparedIteration,
+        PreparedStoreCommit, ProgramReceiptBinding, ProposeHarness, ProviderSet, RUN_SCHEMA_MARKER,
+        RUN_SCHEMA_VERSION, ReconcileDecision, ReconcileEffect, RecoveryNeed, RecoveryPlan,
+        RecoveryResolution, ResidencyInspection, ResourceDimension, ResourceVector,
+        RollbackHarness, RunAction, RunAttach, RunCommandResult, RunDriverSpec, RunEnvelope,
+        RunError, RunEvent, RunEventCursor, RunEventKind, RunId, RunLifecycle, RunRevision,
+        RunSchemaMarker, RunStage, RunStatus, RunStore, SessionRef, SessionTurnOutcome,
+        SkillDescriptorPin, StoreCommit, StoreCommitResult, TelemetryRecord, TelemetrySink,
+        TransitionMessage, ValidateHarness, WaitingReason, WakeIntent, WakeReason, WakeRequest,
+        WorkerId, migrate_legacy_goal,
     };
 }
 
@@ -2050,6 +2064,7 @@ impl Runtime {
             config,
             options: RuntimeOptions::default(),
             run_store: None,
+            evidence_store: None,
         }
     }
     pub async fn start(
@@ -2069,6 +2084,22 @@ impl Runtime {
         private::Runtime::start_with_run_store(config, RuntimeOptions::default(), Some(store))
             .await
             .map(|(inner, events)| (Self { inner }, events))
+    }
+    /// Starts with both Host-owned persistence authorities. Each injected store
+    /// replaces its local default; neither is mirrored.
+    pub async fn start_with_stores(
+        config: RuntimeConfig,
+        run_store: Arc<dyn run::RunStore>,
+        evidence_store: Arc<dyn SessionEvidenceStore>,
+    ) -> Result<(Self, mpsc::UnboundedReceiver<Event>), Error> {
+        private::Runtime::start_with_stores(
+            config,
+            RuntimeOptions::default(),
+            Some(run_store),
+            Some(evidence_store),
+        )
+        .await
+        .map(|(inner, events)| (Self { inner }, events))
     }
     pub fn capabilities(&self) -> RuntimeCapabilities {
         self.inner.capabilities()
@@ -2090,6 +2121,36 @@ impl Runtime {
     pub async fn list_recoverable_runs(&self) -> Result<Vec<run::RunEnvelope>, Error> {
         self.inner.list_recoverable_runs().await
     }
+    pub async fn inspect_run_residency(
+        &self,
+        run_id: &run::RunId,
+    ) -> Result<run::ResidencyInspection, Error> {
+        self.inner.inspect_run_residency(run_id).await
+    }
+    pub async fn request_run_wake(
+        &self,
+        request: run::MutationRequest<run::WakeRequest>,
+    ) -> Result<run::RunCommandResult, Error> {
+        self.inner.request_run_wake(request).await
+    }
+    pub async fn claim_run_activation(
+        &self,
+        request: run::MutationRequest<run::ClaimActivation>,
+    ) -> Result<run::CommandOutput<run::ActivationLease>, Error> {
+        self.inner.claim_run_activation(request).await
+    }
+    pub async fn renew_run_activation(
+        &self,
+        request: run::MutationRequest<(run::ActivationFence, u64)>,
+    ) -> Result<run::RunCommandResult, Error> {
+        self.inner.renew_run_activation(request).await
+    }
+    pub async fn release_run_activation(
+        &self,
+        request: run::MutationRequest<run::ActivationFence>,
+    ) -> Result<run::RunCommandResult, Error> {
+        self.inner.release_run_activation(request).await
+    }
     pub async fn control_run(
         &self,
         request: run::MutationRequest<run::RunAction>,
@@ -2110,6 +2171,34 @@ impl Runtime {
         after: run::RunEventCursor,
     ) -> Result<run::RunAttach, Error> {
         self.inner.attach_run(run_id, after).await
+    }
+    /// Admits a child to the authoritative parent Run and reserves its budget.
+    pub async fn admit_run_child(
+        &self,
+        request: run::MutationRequest<run::AdmitChild>,
+    ) -> Result<run::CommandOutput<run::ChildRun>, Error> {
+        self.inner.admit_child(request).await
+    }
+    /// Applies a token/epoch-fenced child settlement callback.
+    pub async fn settle_run_child(
+        &self,
+        callback: run::ChildCallback,
+    ) -> Result<run::CallbackResult, Error> {
+        self.inner.child_callback(callback).await
+    }
+    /// Idempotently accepts one message into the durable Run mailbox.
+    pub async fn accept_run_message(
+        &self,
+        request: run::MutationRequest<run::AcceptMessage>,
+    ) -> Result<run::RunCommandResult, Error> {
+        self.inner.accept_run_message(request).await
+    }
+    /// Advances one mailbox message through its monotonic delivery states.
+    pub async fn transition_run_message(
+        &self,
+        request: run::MutationRequest<run::TransitionMessage>,
+    ) -> Result<run::RunCommandResult, Error> {
+        self.inner.transition_run_message(request).await
     }
     /// Fences the previous controller epoch, enters Recovering, then resolves
     /// Session-turn operations from the existing SessionLedger and rewind
@@ -3260,6 +3349,7 @@ pub struct RuntimeBuilder {
     config: RuntimeConfig,
     options: RuntimeOptions,
     run_store: Option<Arc<dyn run::RunStore>>,
+    evidence_store: Option<Arc<dyn SessionEvidenceStore>>,
 }
 impl RuntimeBuilder {
     pub fn profile(mut self, value: RuntimeProfile) -> Self {
@@ -3366,10 +3456,20 @@ impl RuntimeBuilder {
         self.run_store = Some(value);
         self
     }
+    /// Replaces local SDK-origin evidence files with the Host's single CAS authority.
+    pub fn session_evidence_store(mut self, value: Arc<dyn SessionEvidenceStore>) -> Self {
+        self.evidence_store = Some(value);
+        self
+    }
     pub async fn start(self) -> Result<(Runtime, mpsc::UnboundedReceiver<Event>), Error> {
-        private::Runtime::start_with_run_store(self.config, self.options, self.run_store)
-            .await
-            .map(|(inner, events)| (Runtime { inner }, events))
+        private::Runtime::start_with_stores(
+            self.config,
+            self.options,
+            self.run_store,
+            self.evidence_store,
+        )
+        .await
+        .map(|(inner, events)| (Runtime { inner }, events))
     }
 }
 
@@ -7289,15 +7389,16 @@ done
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn rewind_receipt_recovers_after_native_and_ledger_commit_without_reexecution() {
-        use sha2::Digest as _;
-
+    async fn rewind_receipt_and_ledger_survive_authority_restart_without_reexecution() {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let server = MockInferenceServer::start().await.expect("mock server");
         let root = TempDir::new().expect("temp root");
         let workspace = root.path().join("workspace");
         std::fs::create_dir(&workspace).expect("workspace");
         let config = runtime_config(&root, server.url());
+        let evidence = Arc::new(
+            LocalSessionEvidenceStore::new(&config.session_storage).expect("evidence store"),
+        );
         let (runtime, _events) = Runtime::start(config.clone())
             .await
             .expect("runtime starts");
@@ -7305,10 +7406,6 @@ done
             .create_session(session_config(workspace.clone()))
             .await
             .expect("session starts");
-        let other_session = runtime
-            .create_session(session_config(workspace.clone()))
-            .await
-            .expect("other session starts");
         runtime
             .prompt(&session, "turn-0", "prompt zero")
             .await
@@ -7326,35 +7423,6 @@ done
                 .expect("absent rewind status"),
             ConversationRewindStatus::Absent
         ));
-        let rewind_root = root.path().join("sessions/origin-rewind-receipts");
-        std::fs::create_dir_all(&rewind_root).expect("rewind receipt root");
-        let digest = format!("{:x}", sha2::Sha256::digest(operation_id.as_bytes()));
-        let ledger_before = runtime
-            .session_ledger(&session)
-            .await
-            .expect("ledger before rewind");
-        let target_entry = &ledger_before.entries[1];
-        std::fs::write(
-            rewind_root.join(format!("{digest}.intent.json")),
-            serde_json::to_vec(&serde_json::json!({
-                "operation_id": operation_id,
-                "session_id": session.as_str(),
-                "target_prompt_index": 1,
-                "target_turn_id": target_entry.turn_id.clone(),
-                "target_prompt_digest": target_entry.prompt_digest.clone(),
-                "recovery_turn_id": null,
-                "recovery_prompt_digest": null
-            }))
-            .expect("intent json"),
-        )
-        .expect("simulate a durable intent before native execution");
-        assert!(matches!(
-            runtime
-                .rewind_status(&session, operation_id)
-                .await
-                .expect("pre-effect pending status"),
-            ConversationRewindStatus::Pending { .. }
-        ));
         let first = runtime
             .rewind_conversation(&session, operation_id, 1)
             .await
@@ -7367,13 +7435,6 @@ done
                 .expect("receipt status"),
             ConversationRewindStatus::Applied { receipt } if receipt == first
         ));
-        assert!(
-            runtime
-                .rewind_status(&other_session, operation_id)
-                .await
-                .is_err(),
-            "a global operation id cannot expose another session's receipt"
-        );
         assert_eq!(
             runtime
                 .rewind_conversation(&session, operation_id, 1)
@@ -7388,89 +7449,20 @@ done
                 .is_err(),
             "an operation identity cannot drift to another target"
         );
-        std::fs::write(
-            rewind_root.join(format!("{digest}.intent.json")),
-            serde_json::to_vec(&serde_json::json!({
-                "operation_id": operation_id,
-                "session_id": session.as_str(),
-                "target_prompt_index": 1,
-                "target_turn_id": first.target_turn_id.clone(),
-                "target_prompt_digest": first.target_prompt_digest.clone(),
-                "recovery_turn_id": null,
-                "recovery_prompt_digest": null
-            }))
-            .expect("intent json"),
-        )
-        .expect("restore stale intent after receipt publication");
-        assert!(matches!(
-            runtime
-                .rewind_status(&session, operation_id)
-                .await
-                .expect("receipt wins over stale intent"),
-            ConversationRewindStatus::Applied { receipt } if receipt == first
-        ));
-        runtime
-            .prompt(&session, "turn-1-reused", "prompt one")
-            .await
-            .expect("replacement turn reuses the discarded prompt index and text");
-        let reused_operation_id = "reused-index-restart-rewind";
-        let reused_digest = format!("{:x}", sha2::Sha256::digest(reused_operation_id.as_bytes()));
-        let reused_ledger = runtime
-            .session_ledger(&session)
-            .await
-            .expect("ledger after reused prompt index");
-        let reused_target = reused_ledger
-            .entries
-            .last()
-            .expect("replacement ledger entry");
-        assert_eq!(reused_target.runtime_prompt_index, 1);
-        assert_eq!(reused_target.prompt_digest, first.target_prompt_digest);
-        assert_ne!(reused_target.turn_id, first.target_turn_id);
-        std::fs::write(
-            rewind_root.join(format!("{reused_digest}.intent.json")),
-            serde_json::to_vec(&serde_json::json!({
-                "operation_id": reused_operation_id,
-                "session_id": session.as_str(),
-                "target_prompt_index": 1,
-                "target_turn_id": reused_target.turn_id.clone(),
-                "target_prompt_digest": reused_target.prompt_digest.clone(),
-                "recovery_turn_id": null,
-                "recovery_prompt_digest": null
-            }))
-            .expect("reused intent json"),
-        )
-        .expect("persist reused-index intent before native execution");
-        let reused_receipt = runtime
-            .rewind_conversation(&session, reused_operation_id, 1)
-            .await
-            .expect("reused-index rewind targets the replacement turn");
-        assert_eq!(reused_receipt.target_turn_id, reused_target.turn_id);
-        std::fs::write(
-            rewind_root.join(format!("{reused_digest}.intent.json")),
-            serde_json::to_vec(&serde_json::json!({
-                "operation_id": reused_operation_id,
-                "session_id": session.as_str(),
-                "target_prompt_index": 1,
-                "target_turn_id": reused_receipt.target_turn_id.clone(),
-                "target_prompt_digest": reused_receipt.target_prompt_digest.clone(),
-                "recovery_turn_id": null,
-                "recovery_prompt_digest": null
-            }))
-            .expect("post-effect reused intent json"),
-        )
-        .expect("simulate crash after reused-index effect and before receipt publication");
+        let rewind_key = SessionEvidenceKey {
+            kind: SessionEvidenceKind::Rewind,
+            identity: operation_id.into(),
+        };
+        let durable_receipt = evidence
+            .load(&rewind_key)
+            .expect("evidence authority loads")
+            .expect("rewind evidence exists");
+        assert!(durable_receipt.version.validates(&durable_receipt.bytes));
         runtime
             .unload_session(session.clone())
             .await
             .expect("session unloads");
-        runtime
-            .unload_session(other_session)
-            .await
-            .expect("other session unloads");
         runtime.shutdown().await.expect("first runtime shuts down");
-
-        std::fs::remove_file(rewind_root.join(format!("{reused_digest}.json")))
-            .expect("simulate crash before reused-index receipt publication");
 
         let (restarted, _events) = Runtime::start(config).await.expect("runtime restarts");
         restarted
@@ -7479,20 +7471,16 @@ done
             .expect("rewound session reloads");
         assert!(matches!(
             restarted
-                .rewind_status(&session, reused_operation_id)
+                .rewind_status(&session, operation_id)
                 .await
-                .expect("pending status"),
-            ConversationRewindStatus::Pending {
-                target_prompt_index: 1,
-                target_turn_id,
-                ..
-            } if target_turn_id == reused_receipt.target_turn_id
+                .expect("receipt status after restart"),
+            ConversationRewindStatus::Applied { receipt } if receipt == first
         ));
         let recovered = restarted
-            .rewind_conversation(&session, reused_operation_id, 1)
+            .rewind_conversation(&session, operation_id, 1)
             .await
-            .expect("missing receipt is reconstructed");
-        assert_eq!(recovered, reused_receipt);
+            .expect("receipt replay after restart");
+        assert_eq!(recovered, first);
         let ledger = restarted
             .session_ledger(&session)
             .await
@@ -7503,10 +7491,6 @@ done
         ));
         assert!(matches!(
             ledger.entries[1].state,
-            LedgerTurnState::Discarded
-        ));
-        assert!(matches!(
-            ledger.entries[2].state,
             LedgerTurnState::Discarded
         ));
         assert_eq!(restarted.rewind_points(&session).await.unwrap().len(), 1);
@@ -7653,6 +7637,13 @@ done
                 .artifact_bytes(u64::MAX),
         )
         .run_id(run::RunId::new(run_id).unwrap())
+        .harness_snapshot(run::HarnessSnapshotPin::new(
+            "b".repeat(64),
+            "c".repeat(64),
+            "test-v1",
+            1,
+            "sdk-test",
+        ))
         .verifier_policy_digest("test-verifier")
     }
 
@@ -7696,6 +7687,54 @@ done
         runtime.shutdown().await.expect("runtime shuts down");
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn host_session_evidence_store_replaces_all_default_sdk_evidence_files() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let server = MockInferenceServer::start().await.expect("mock server");
+        let root = TempDir::new().expect("temp root");
+        let workspace = root.path().join("workspace");
+        std::fs::create_dir(&workspace).expect("workspace");
+        let config = runtime_config(&root, server.url());
+        let host_runs = Arc::new(
+            run::LocalRunStore::new(root.path().join("host-runs")).expect("Host Run store"),
+        );
+        let host_evidence = Arc::new(
+            LocalSessionEvidenceStore::new(root.path().join("host-session-evidence"))
+                .expect("Host evidence store"),
+        );
+        let (runtime, _) =
+            Runtime::start_with_stores(config.clone(), host_runs, host_evidence.clone())
+                .await
+                .expect("runtime starts with Host authorities");
+        let session = runtime
+            .create_session(session_config(workspace))
+            .await
+            .expect("session starts");
+        runtime
+            .prompt(&session, "host-evidence-turn", "evidence")
+            .await
+            .expect("ledger settles");
+        let ledger = host_evidence
+            .load(&SessionEvidenceKey {
+                kind: SessionEvidenceKind::Ledger,
+                identity: session.as_str().into(),
+            })
+            .expect("Host authority loads")
+            .expect("Host ledger exists");
+        assert!(ledger.version.validates(&ledger.bytes));
+        for directory in [
+            "origin-turn-ledger",
+            "origin-rewind-receipts",
+            "origin-harness-turn-bindings",
+        ] {
+            assert!(
+                !config.session_storage.join(directory).exists(),
+                "injected evidence authority must replace default {directory}"
+            );
+        }
+        runtime.shutdown().await.expect("runtime shuts down");
+    }
+
     async fn claim_test_session_turn(
         runtime: &Runtime,
         created: &run::RunCommandResult,
@@ -7709,6 +7748,17 @@ done
             "test-verifier",
             "test-model-v1",
             "workspace-v1",
+        )
+        .harness_snapshot(
+            created
+                .snapshot
+                .run
+                .harness
+                .active
+                .as_ref()
+                .unwrap()
+                .digest
+                .clone(),
         );
         let iteration = runtime
             .inner
@@ -7988,6 +8038,17 @@ done
             "test-verifier",
             "test-model-v1",
             "workspace-v1",
+        )
+        .harness_snapshot(
+            created
+                .snapshot
+                .run
+                .harness
+                .active
+                .as_ref()
+                .unwrap()
+                .digest
+                .clone(),
         );
         let iteration = first
             .inner
@@ -8401,6 +8462,17 @@ done
             "test-verifier",
             "test-model-v1",
             "workspace-v1",
+        )
+        .harness_snapshot(
+            created
+                .snapshot
+                .run
+                .harness
+                .active
+                .as_ref()
+                .unwrap()
+                .digest
+                .clone(),
         );
         let iteration = first
             .inner

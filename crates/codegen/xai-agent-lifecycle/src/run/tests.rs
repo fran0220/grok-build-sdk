@@ -37,6 +37,18 @@ fn capabilities() -> CapabilityPolicy {
     CapabilityPolicy::new(values.clone(), values.clone(), values)
 }
 
+fn harness_pin() -> HarnessSnapshotPin {
+    HarnessSnapshotPin {
+        digest: "b".repeat(64),
+        descriptor_digest: "c".repeat(64),
+        capability_revision: "provider-v1".into(),
+        negotiated_capabilities: Default::default(),
+        revision: 1,
+        evidence: vec![],
+        provenance: "test".into(),
+    }
+}
+
 fn create_request() -> CreateRunRequest {
     CreateRunRequest::new(
         command("create"),
@@ -50,6 +62,7 @@ fn create_request() -> CreateRunRequest {
         budget(),
     )
     .run_id(run_id())
+    .harness_snapshot(harness_pin())
 }
 
 fn artifact(label: Option<&str>, workspace: Option<&str>) -> ArtifactRef {
@@ -74,6 +87,222 @@ fn create<S: RunStore>(controller: &mut RunController<S>) -> RunCommandResult {
     controller.create_run(create_request(), 1).unwrap()
 }
 
+#[test]
+fn public_store_commit_preparation_preserves_sdk_validation_and_schema_marker() {
+    let (_directory, mut controller) = controller();
+    let created = create(&mut controller);
+    let prepared = StoreCommit {
+        run_id: created.snapshot.run.id.clone(),
+        expected_revision: None,
+        next: created.snapshot.clone(),
+        finished_iteration: None,
+    }
+    .validate_and_encode()
+    .expect("valid creation commit prepares");
+    assert_eq!(prepared.schema, CURRENT_RUN_SCHEMA);
+    assert_eq!(prepared.schema.namespace, RUN_SCHEMA_MARKER);
+    assert_eq!(prepared.schema.version, RUN_SCHEMA_VERSION);
+    assert_eq!(prepared.next_revision, RunRevision::new(1));
+    assert_eq!(
+        RunEnvelope::from_json_slice(&prepared.envelope).unwrap(),
+        created.snapshot
+    );
+
+    let mut wrong_id = StoreCommit {
+        run_id: RunId::new("other_run").unwrap(),
+        expected_revision: None,
+        next: created.snapshot.clone(),
+        finished_iteration: None,
+    };
+    assert!(matches!(
+        wrong_id.validate_and_encode(),
+        Err(RunError::Integrity(message)) if message.contains("Run id")
+    ));
+    wrong_id.run_id = created.snapshot.run.id.clone();
+    wrong_id.expected_revision = Some(RunRevision::new(1));
+    assert!(matches!(
+        wrong_id.validate_and_encode(),
+        Err(RunError::Integrity(message)) if message.contains("successor")
+    ));
+}
+
+#[test]
+fn durable_residency_coalesces_fences_and_catches_up() {
+    let (directory, mut controller) = controller();
+    let created = create(&mut controller);
+    let wake = |reason, deadline| WakeRequest {
+        reason,
+        deadline_ms: deadline,
+    };
+    let first = controller
+        .request_wake(
+            MutationRequest::new(
+                run_id(),
+                created.snapshot.run.revision,
+                command("timer"),
+                wake(WakeReason::Timer, Some(10)),
+            ),
+            2,
+        )
+        .unwrap();
+    let duplicate = controller
+        .request_wake(
+            MutationRequest::new(
+                run_id(),
+                created.snapshot.run.revision,
+                command("timer"),
+                wake(WakeReason::Timer, Some(10)),
+            ),
+            3,
+        )
+        .unwrap();
+    assert!(duplicate.duplicate);
+    let merged = controller
+        .request_wake(
+            MutationRequest::new(
+                run_id(),
+                first.snapshot.run.revision,
+                command("dependency"),
+                wake(WakeReason::Dependency, Some(20)),
+            ),
+            4,
+        )
+        .unwrap();
+    assert_eq!(merged.snapshot.run.wake.deadline_ms, Some(10));
+    assert_eq!(merged.snapshot.run.wake.reasons.len(), 2);
+    let worker = WorkerId::new("worker_a").unwrap();
+    let claim = controller
+        .claim_activation(
+            MutationRequest::new(
+                run_id(),
+                merged.snapshot.run.revision,
+                command("claim_a"),
+                ClaimActivation {
+                    worker_id: worker.clone(),
+                    lease_ms: 5,
+                },
+            ),
+            11,
+        )
+        .unwrap();
+    assert!(claim.output.reasons.contains(&WakeReason::CatchUp));
+    let fence = ActivationFence {
+        worker_id: worker,
+        epoch: claim.output.epoch,
+        token: claim.output.token.clone(),
+    };
+    let queued = controller
+        .request_wake(
+            MutationRequest::new(
+                run_id(),
+                claim.command.snapshot.run.revision,
+                command("retry"),
+                wake(WakeReason::Retry, None),
+            ),
+            12,
+        )
+        .unwrap();
+    let takeover = controller
+        .claim_activation(
+            MutationRequest::new(
+                run_id(),
+                queued.snapshot.run.revision,
+                command("claim_b"),
+                ClaimActivation {
+                    worker_id: WorkerId::new("worker_b").unwrap(),
+                    lease_ms: 10,
+                },
+            ),
+            17,
+        )
+        .unwrap();
+    assert!(takeover.output.epoch > fence.epoch);
+    let lease_wire = serde_json::to_value(&takeover.command.snapshot).unwrap();
+    assert_eq!(
+        lease_wire["run"]["activation_lease"]["claim_command_id"],
+        serde_json::json!("claim_b")
+    );
+    let mut lease_without_claim_identity = lease_wire;
+    lease_without_claim_identity["run"]["activation_lease"]
+        .as_object_mut()
+        .unwrap()
+        .remove("claim_command_id");
+    assert!(serde_json::from_value::<RunEnvelope>(lease_without_claim_identity).is_err());
+    assert!(
+        controller
+            .claim_activation(
+                MutationRequest::new(
+                    run_id(),
+                    merged.snapshot.run.revision,
+                    command("claim_a"),
+                    ClaimActivation {
+                        worker_id: WorkerId::new("worker_a").unwrap(),
+                        lease_ms: 5,
+                    },
+                ),
+                18,
+            )
+            .is_err(),
+        "replaying the first claim must not disclose the takeover lease"
+    );
+    assert!(
+        controller
+            .renew_activation(
+                MutationRequest::new(
+                    run_id(),
+                    takeover.command.snapshot.run.revision,
+                    command("stale"),
+                    (fence.clone(), 10)
+                ),
+                18
+            )
+            .is_err()
+    );
+    drop(controller);
+    let store = LocalRunStore::new(directory.path()).unwrap();
+    let mut restarted = RunController::open(store).unwrap();
+    let inspected = restarted.inspect_residency(&run_id(), 18).unwrap();
+    assert_eq!(inspected.lease.unwrap().token, takeover.output.token);
+    restarted
+        .begin_recovery(
+            MutationRequest::new(
+                run_id(),
+                takeover.command.snapshot.run.revision,
+                command("recover"),
+                (),
+            ),
+            19,
+        )
+        .unwrap();
+    let current = restarted.get_run(&run_id()).unwrap();
+    let cancelled = restarted
+        .control_run(
+            MutationRequest::new(
+                run_id(),
+                current.run.revision,
+                command("cancel"),
+                RunAction::Cancel,
+            ),
+            20,
+        )
+        .unwrap();
+    assert!(cancelled.snapshot.run.activation_lease.is_none());
+    assert!(cancelled.snapshot.run.wake.reasons.is_empty());
+    assert!(
+        restarted
+            .release_activation(
+                MutationRequest::new(
+                    run_id(),
+                    cancelled.snapshot.run.revision,
+                    command("late"),
+                    fence
+                ),
+                21
+            )
+            .is_err()
+    );
+}
+
 fn begin_iteration<S: RunStore>(
     controller: &mut RunController<S>,
     run: &RunEnvelope,
@@ -84,7 +313,8 @@ fn begin_iteration<S: RunStore>(
         run.run.verifier_policy_digest.clone(),
         "model-v1",
         "workspace-v1",
-    );
+    )
+    .harness_snapshot(run.run.harness.active.as_ref().unwrap().digest.clone());
     controller
         .begin_iteration(
             MutationRequest::new(
@@ -99,11 +329,103 @@ fn begin_iteration<S: RunStore>(
 }
 
 #[test]
-fn current_v2_fixture_round_trips_and_future_values_fail_closed() {
-    // This fixture documents the current v2 wire shape; it is not historical
+fn harness_activation_is_boundary_pinned_rollback_and_reload_stable() {
+    let (directory, mut controller) = controller();
+    let created = create(&mut controller);
+    let mut next = harness_pin();
+    next.digest = "d".repeat(64);
+    next.revision = 2;
+    let proposed = controller
+        .propose_harness(
+            MutationRequest::new(
+                run_id(),
+                created.snapshot.run.revision,
+                command("harness_propose"),
+                ProposeHarness { pin: next.clone() },
+            ),
+            2,
+        )
+        .unwrap();
+    let validated = controller
+        .validate_harness(
+            MutationRequest::new(
+                run_id(),
+                proposed.snapshot.run.revision,
+                command("harness_validate"),
+                ValidateHarness {
+                    digest: next.digest.clone(),
+                    accepted: true,
+                },
+            ),
+            3,
+        )
+        .unwrap();
+    let activated = controller
+        .activate_harness(
+            MutationRequest::new(
+                run_id(),
+                validated.snapshot.run.revision,
+                command("harness_activate"),
+                ActivateHarness {
+                    digest: next.digest.clone(),
+                },
+            ),
+            4,
+        )
+        .unwrap();
+    assert_eq!(
+        activated.snapshot.run.harness.active.as_ref().unwrap(),
+        &next
+    );
+    let stale = IterationContextManifest::new(
+        activated.snapshot.run.revision,
+        0,
+        "default",
+        "model",
+        "workspace",
+    )
+    .harness_snapshot(harness_pin().digest);
+    assert!(
+        controller
+            .begin_iteration(
+                MutationRequest::new(
+                    run_id(),
+                    activated.snapshot.run.revision,
+                    command("stale_harness_iteration"),
+                    BeginIteration::new(stale)
+                ),
+                5
+            )
+            .is_err()
+    );
+    let rolled = controller
+        .rollback_harness(
+            MutationRequest::new(
+                run_id(),
+                activated.snapshot.run.revision,
+                command("harness_rollback"),
+                RollbackHarness {
+                    expected_active_digest: next.digest,
+                },
+            ),
+            6,
+        )
+        .unwrap();
+    let identity = rolled.snapshot.run.harness.active.unwrap();
+    drop(controller);
+    let reloaded = RunController::open(LocalRunStore::new(directory.path()).unwrap())
+        .unwrap()
+        .get_run(&run_id())
+        .unwrap();
+    assert_eq!(reloaded.run.harness.active.unwrap(), identity);
+}
+
+#[test]
+fn current_v4_fixture_round_trips_and_future_values_fail_closed() {
+    // This fixture documents the current v4 wire shape; it is not historical
     // compatibility evidence. Release fixtures become immutable only after
     // their originating release has shipped.
-    let fixture = include_str!("fixtures/run-envelope-current-v2.json");
+    let fixture = include_str!("fixtures/run-envelope-current-v4.json");
     let expected: serde_json::Value = serde_json::from_str(fixture).unwrap();
     let envelope: RunEnvelope = serde_json::from_str(fixture).unwrap();
     envelope.validate().unwrap();
@@ -344,6 +666,7 @@ fn durable_session_receipts_are_bound_to_exact_turn_intent() {
     operation.receipt = Some(valid.clone());
     operation.active_attempt = Some(OperationAttempt {
         attempt: 1,
+        claim_command_id: command("receipt_validation_claim"),
         token: DispatchToken::new("receipt_validation_token").unwrap(),
         epoch,
     });
@@ -672,7 +995,8 @@ fn unknown_usage_is_allowed_only_by_an_explicitly_unbounded_dimension() {
         created.snapshot.run.verifier_policy_digest.clone(),
         "model-v1",
         "workspace-v1",
-    );
+    )
+    .harness_snapshot(harness_pin().digest);
     let iteration = controller
         .begin_iteration(
             MutationRequest::new(
@@ -1230,6 +1554,82 @@ fn restart_never_replays_a_duplicate_claim_handle() {
 }
 
 #[test]
+fn duplicate_effect_claim_never_discloses_a_successor_attempt_token() {
+    let (_directory, mut controller) = controller();
+    let created = create(&mut controller);
+    let iteration = begin_iteration(&mut controller, &created.snapshot);
+    let operation_id = OperationId::new("effect_claim_takeover").unwrap();
+    let prepared = controller
+        .prepare_operation(
+            MutationRequest::new(
+                run_id(),
+                iteration.command.snapshot.run.revision,
+                command("prepare_effect_claim_takeover"),
+                PrepareOperation::new(
+                    operation_id.clone(),
+                    iteration.output.iteration_id,
+                    EffectClass::Idempotent,
+                    EffectSpec::External {
+                        provider: "test".into(),
+                        version: "1".into(),
+                        payload: artifact(None, None),
+                    },
+                ),
+            ),
+            3,
+        )
+        .unwrap();
+    let first_request = MutationRequest::new(
+        run_id(),
+        prepared.snapshot.run.revision,
+        command("first_effect_claim"),
+        ClaimEffect::new(operation_id.clone())
+            .reservation(ResourceVector::default().agent_calls(1)),
+    );
+    let first = controller.claim_effect(first_request.clone(), 4).unwrap();
+    let failed = controller
+        .acknowledge_effect(
+            EffectCallback::new(
+                &first.output,
+                EffectOutcome::FailedRetryable {
+                    message: "retry".into(),
+                },
+            ),
+            5,
+        )
+        .unwrap();
+    let second = controller
+        .claim_effect(
+            MutationRequest::new(
+                run_id(),
+                failed.snapshot.run.revision,
+                command("second_effect_claim"),
+                ClaimEffect::new(operation_id)
+                    .reservation(ResourceVector::default().agent_calls(1)),
+            ),
+            6,
+        )
+        .unwrap();
+
+    assert_ne!(first.output.token, second.output.token);
+    let attempt_wire = serde_json::to_value(&second.command.snapshot).unwrap();
+    assert_eq!(
+        attempt_wire["run"]["operations"]["effect_claim_takeover"]["active_attempt"]["claim_command_id"],
+        serde_json::json!("second_effect_claim")
+    );
+    let mut attempt_without_claim_identity = attempt_wire;
+    attempt_without_claim_identity["run"]["operations"]["effect_claim_takeover"]["active_attempt"]
+        .as_object_mut()
+        .unwrap()
+        .remove("claim_command_id");
+    assert!(serde_json::from_value::<RunEnvelope>(attempt_without_claim_identity).is_err());
+    assert!(
+        controller.claim_effect(first_request, 7).is_err(),
+        "replaying the first claim must not disclose the successor attempt token"
+    );
+}
+
+#[test]
 fn recovery_abandons_prepared_effect_and_it_can_never_be_claimed_later() {
     let directory = tempfile::tempdir().unwrap();
     let store = LocalRunStore::new(directory.path()).unwrap();
@@ -1292,7 +1692,8 @@ fn recovery_abandons_prepared_effect_and_it_can_never_be_claimed_later() {
         finished.snapshot.run.verifier_policy_digest.clone(),
         "model-v1",
         "workspace-v1",
-    );
+    )
+    .harness_snapshot(harness_pin().digest);
     let next_iteration = restarted
         .begin_iteration(
             MutationRequest::new(
@@ -2221,6 +2622,7 @@ fn completion_is_atomic_at_verified_iteration_boundary() {
         budget(),
     )
     .run_id(run_id())
+    .harness_snapshot(harness_pin())
     .required_gates(["tests".to_owned()]);
     let created = controller.create_run(request, 1).unwrap();
     let iteration = begin_iteration(&mut controller, &created.snapshot);

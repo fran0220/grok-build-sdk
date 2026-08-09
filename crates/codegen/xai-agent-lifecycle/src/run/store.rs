@@ -2,9 +2,29 @@ use super::model::{
     IterationManifest, MAX_RUN_ENVELOPE_BYTES, RUN_SCHEMA_VERSION, RunEnvelope, RunError, RunId,
     RunRevision, RunStatus,
 };
+use rusqlite::OptionalExtension as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+
+/// Stable namespace for the current-only durable Run schema. Host stores must
+/// persist this marker together with [`RUN_SCHEMA_VERSION`] and reject any
+/// mismatch before loading or committing Run data.
+pub const RUN_SCHEMA_MARKER: &str = "xai-agent-lifecycle.run-envelope";
+
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RunSchemaMarker {
+    pub namespace: &'static str,
+    pub version: u32,
+    pub max_envelope_bytes: usize,
+}
+
+pub const CURRENT_RUN_SCHEMA: RunSchemaMarker = RunSchemaMarker {
+    namespace: RUN_SCHEMA_MARKER,
+    version: RUN_SCHEMA_VERSION,
+    max_envelope_bytes: MAX_RUN_ENVELOPE_BYTES,
+};
 
 #[non_exhaustive]
 #[derive(Clone, Debug)]
@@ -13,6 +33,105 @@ pub struct StoreCommit {
     pub expected_revision: Option<RunRevision>,
     pub next: RunEnvelope,
     pub finished_iteration: Option<IterationManifest>,
+}
+
+/// SDK-validated and bounded representation of one atomic store commit.
+///
+/// Host implementations should call [`StoreCommit::validate_and_encode`] as
+/// the first step of `RunStore::commit`, then use only this value when binding
+/// transaction parameters. This preserves the exact validation/error ordering
+/// used by [`LocalRunStore`] without a lossy JSON validation round-trip.
+#[non_exhaustive]
+#[derive(Clone, Debug)]
+pub struct PreparedStoreCommit {
+    pub schema: RunSchemaMarker,
+    pub run_id: RunId,
+    pub expected_revision: Option<RunRevision>,
+    pub next_revision: RunRevision,
+    pub tombstoned: bool,
+    pub envelope: Vec<u8>,
+    pub finished_iteration: Option<PreparedIteration>,
+}
+
+#[non_exhaustive]
+#[derive(Clone, Debug)]
+pub struct PreparedIteration {
+    pub iteration_id: u64,
+    pub manifest: Vec<u8>,
+}
+
+impl StoreCommit {
+    /// Applies the SDK-owned validator and produces bounded canonical storage
+    /// payloads. Validation order is part of the public RunStore contract.
+    pub fn validate_and_encode(&self) -> Result<PreparedStoreCommit, RunError> {
+        if self.next.run.id != self.run_id {
+            return Err(RunError::Integrity(
+                "commit Run id differs from envelope Run id".into(),
+            ));
+        }
+        self.next.validate()?;
+        let expected_next = self
+            .expected_revision
+            .map(|revision| {
+                revision
+                    .get()
+                    .checked_add(1)
+                    .ok_or_else(|| RunError::Integrity("Run revision overflow".into()))
+            })
+            .transpose()?
+            .unwrap_or(1);
+        if self.next.run.revision.get() != expected_next {
+            return Err(RunError::Integrity(
+                "commit revision is not the expected successor".into(),
+            ));
+        }
+        let envelope =
+            serde_json::to_vec(&self.next).map_err(|error| RunError::Storage(error.to_string()))?;
+        if envelope.len() > MAX_RUN_ENVELOPE_BYTES {
+            return Err(RunError::Validation(
+                "serialized Run envelope exceeds 16 MiB".into(),
+            ));
+        }
+        let finished_iteration = self
+            .finished_iteration
+            .as_ref()
+            .map(|iteration| {
+                iteration.validate()?;
+                if iteration.finished_at_ms.is_none()
+                    || !self
+                        .next
+                        .run
+                        .iterations
+                        .iter()
+                        .any(|stored| stored == iteration)
+                {
+                    return Err(RunError::Integrity(
+                        "finished iteration is not the exact committed Run iteration".into(),
+                    ));
+                }
+                let manifest = serde_json::to_vec(iteration)
+                    .map_err(|error| RunError::Storage(error.to_string()))?;
+                if manifest.len() > MAX_RUN_ENVELOPE_BYTES {
+                    return Err(RunError::Validation(
+                        "serialized iteration manifest exceeds 16 MiB".into(),
+                    ));
+                }
+                Ok(PreparedIteration {
+                    iteration_id: iteration.iteration_id.get(),
+                    manifest,
+                })
+            })
+            .transpose()?;
+        Ok(PreparedStoreCommit {
+            schema: CURRENT_RUN_SCHEMA,
+            run_id: self.run_id.clone(),
+            expected_revision: self.expected_revision,
+            next_revision: self.next.run.revision,
+            tombstoned: self.next.run.status == RunStatus::Tombstoned,
+            envelope,
+            finished_iteration,
+        })
+    }
 }
 
 #[non_exhaustive]
@@ -29,7 +148,9 @@ pub enum StoreCommitResult {
 /// A successful `commit` atomically advances the snapshot, event journal,
 /// command receipt table and operation outbox. `CommitUnknown` is deliberately
 /// not reported as a retryable error: callers must reload and reconcile before
-/// attempting another mutation.
+/// attempting another mutation. Implementations must persist and verify
+/// [`CURRENT_RUN_SCHEMA`] and must begin `commit` with
+/// [`StoreCommit::validate_and_encode`].
 pub trait RunStore: Send + Sync + 'static {
     fn load(&self, run_id: &RunId) -> Result<Option<RunEnvelope>, RunError>;
     fn list(&self) -> Result<Vec<RunEnvelope>, RunError>;
@@ -65,6 +186,7 @@ impl LocalRunStore {
         fs::create_dir_all(&root).map_err(io_error)?;
         set_private_dir(&root)?;
         let path = root.join("runs.sqlite3");
+        let existed = path.exists();
         let connection = rusqlite::Connection::open(&path).map_err(sql_error)?;
         connection
             .busy_timeout(std::time::Duration::from_secs(5))
@@ -93,21 +215,62 @@ impl LocalRunStore {
                  );",
             )
             .map_err(sql_error)?;
-        connection
-            .execute(
-                "INSERT OR IGNORE INTO metadata(key,value) VALUES('schema_version',?1)",
-                [RUN_SCHEMA_VERSION],
-            )
+        let metadata_count: u64 = connection
+            .query_row("SELECT COUNT(*) FROM metadata", [], |row| row.get(0))
             .map_err(sql_error)?;
-        let version: u32 = connection
-            .query_row(
-                "SELECT value FROM metadata WHERE key='schema_version'",
-                [],
-                |row| row.get(0),
-            )
-            .map_err(sql_error)?;
-        if version != RUN_SCHEMA_VERSION {
-            return Err(RunError::UnsupportedSchema(version));
+        if metadata_count == 0 {
+            if existed {
+                return Err(RunError::Integrity(
+                    "existing Run store has no schema metadata".into(),
+                ));
+            }
+            let transaction = connection.unchecked_transaction().map_err(sql_error)?;
+            transaction
+                .execute(
+                    "INSERT INTO metadata(key,value) VALUES('schema_version',?1)",
+                    [RUN_SCHEMA_VERSION],
+                )
+                .map_err(sql_error)?;
+            transaction
+                .execute(
+                    "INSERT INTO metadata(key,value) VALUES('schema_marker',?1)",
+                    [RUN_SCHEMA_MARKER],
+                )
+                .map_err(sql_error)?;
+            transaction.commit().map_err(sql_error)?;
+        } else {
+            let version: Option<u32> = connection
+                .query_row(
+                    "SELECT value FROM metadata WHERE key='schema_version'",
+                    [],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(sql_error)?;
+            let marker: Option<String> = connection
+                .query_row(
+                    "SELECT value FROM metadata WHERE key='schema_marker'",
+                    [],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(sql_error)?;
+            if version.is_some_and(|version| version != RUN_SCHEMA_VERSION) {
+                return Err(RunError::UnsupportedSchema(version.unwrap()));
+            }
+            if version != Some(RUN_SCHEMA_VERSION)
+                || marker.as_deref() != Some(RUN_SCHEMA_MARKER)
+                || metadata_count != 2
+            {
+                return Err(RunError::Integrity(
+                    "Run store schema marker/version metadata is incomplete".into(),
+                ));
+            }
+        }
+        if metadata_count > 0 && metadata_count != 2 {
+            return Err(RunError::Integrity(
+                "Run store schema marker/version metadata is incomplete".into(),
+            ));
         }
         set_private_file(&path)?;
         Ok(Self {
@@ -160,33 +323,7 @@ impl RunStore for LocalRunStore {
     }
 
     fn commit(&self, commit: StoreCommit) -> Result<StoreCommitResult, RunError> {
-        if commit.next.run.id != commit.run_id {
-            return Err(RunError::Integrity(
-                "commit Run id differs from envelope Run id".into(),
-            ));
-        }
-        commit.next.validate()?;
-        let expected_next = commit
-            .expected_revision
-            .map_or(1, |revision| revision.get().saturating_add(1));
-        if commit.next.run.revision.get() != expected_next {
-            return Err(RunError::Integrity(
-                "commit revision is not the expected successor".into(),
-            ));
-        }
-        let bytes = serde_json::to_vec(&commit.next)
-            .map_err(|error| RunError::Storage(error.to_string()))?;
-        if bytes.len() > MAX_RUN_ENVELOPE_BYTES {
-            return Err(RunError::Validation(
-                "serialized Run envelope exceeds 16 MiB".into(),
-            ));
-        }
-        let iteration_bytes = commit
-            .finished_iteration
-            .as_ref()
-            .map(serde_json::to_vec)
-            .transpose()
-            .map_err(|error| RunError::Storage(error.to_string()))?;
+        let prepared = commit.validate_and_encode()?;
 
         let mut connection = self.lock()?;
         let transaction = connection
@@ -246,21 +383,24 @@ impl RunStore for LocalRunStore {
                    tombstoned=excluded.tombstoned,
                    envelope=excluded.envelope",
                 rusqlite::params![
-                    commit.run_id.as_str(),
-                    commit.next.run.revision.get(),
-                    commit.next.run.status == RunStatus::Tombstoned,
-                    bytes,
+                    prepared.run_id.as_str(),
+                    prepared.next_revision.get(),
+                    prepared.tombstoned,
+                    prepared.envelope,
                 ],
             )
             .map_err(sql_error)?;
-        if let (Some(manifest), Some(bytes)) = (commit.finished_iteration.as_ref(), iteration_bytes)
-        {
+        if let Some(iteration) = prepared.finished_iteration {
             transaction
                 .execute(
                     "INSERT INTO iterations(run_id,iteration_id,manifest)
                      VALUES(?1,?2,?3)
                      ON CONFLICT(run_id,iteration_id) DO UPDATE SET manifest=excluded.manifest",
-                    rusqlite::params![commit.run_id.as_str(), manifest.iteration_id.get(), bytes],
+                    rusqlite::params![
+                        commit.run_id.as_str(),
+                        iteration.iteration_id,
+                        iteration.manifest
+                    ],
                 )
                 .map_err(sql_error)?;
         }

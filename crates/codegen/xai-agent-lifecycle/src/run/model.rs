@@ -3,7 +3,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
 
-pub const RUN_SCHEMA_VERSION: u32 = 2;
+pub const RUN_SCHEMA_VERSION: u32 = 4;
 pub const MAX_RUN_ENVELOPE_BYTES: usize = 16 * 1024 * 1024;
 pub(crate) const MAX_OBJECTIVE_BYTES: usize = 16 * 1024;
 pub(crate) const MAX_LIST_ITEMS: usize = 128;
@@ -123,6 +123,8 @@ string_id!(DispatchToken, "dispatch token");
 string_id!(IterationToken, "iteration token");
 string_id!(ChildId, "child id");
 string_id!(MessageId, "message id");
+string_id!(WorkerId, "worker id");
+string_id!(ActivationToken, "activation token");
 numeric_id!(RunRevision);
 numeric_id!(ControllerEpoch);
 numeric_id!(RunEventCursor);
@@ -144,6 +146,75 @@ impl IterationToken {
     pub(crate) fn random() -> Self {
         Self(format!("iteration_{}", uuid::Uuid::new_v4().simple()))
     }
+}
+
+impl ActivationToken {
+    pub(crate) fn random() -> Self {
+        Self(format!("activation_{}", uuid::Uuid::new_v4().simple()))
+    }
+}
+
+/// Host-independent causes which make a Run eligible for bounded execution.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WakeReason {
+    Requested,
+    Timer,
+    Retry,
+    Dependency,
+    /// Synthesized durably when a Host claims an overdue deadline.
+    CatchUp,
+}
+
+#[non_exhaustive]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct WakeIntent {
+    pub reasons: BTreeSet<WakeReason>,
+    pub deadline_ms: Option<u64>,
+}
+
+#[non_exhaustive]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActivationLease {
+    pub worker_id: WorkerId,
+    pub claim_command_id: CommandId,
+    pub epoch: ControllerEpoch,
+    pub token: ActivationToken,
+    pub expires_at_ms: u64,
+    pub reasons: BTreeSet<WakeReason>,
+}
+
+#[non_exhaustive]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WakeRequest {
+    pub reason: WakeReason,
+    pub deadline_ms: Option<u64>,
+}
+
+#[non_exhaustive]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClaimActivation {
+    pub worker_id: WorkerId,
+    pub lease_ms: u64,
+}
+
+#[non_exhaustive]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActivationFence {
+    pub worker_id: WorkerId,
+    pub epoch: ControllerEpoch,
+    pub token: ActivationToken,
+}
+
+#[non_exhaustive]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResidencyInspection {
+    pub run_id: RunId,
+    pub revision: RunRevision,
+    pub wake: WakeIntent,
+    pub lease: Option<ActivationLease>,
+    pub overdue: bool,
 }
 
 #[non_exhaustive]
@@ -623,6 +694,52 @@ pub struct ArtifactRef {
     pub workspace_digest: Option<String>,
 }
 
+/// Exact skill content selected for durable execution.
+#[non_exhaustive]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkillDescriptorPin {
+    pub name: String,
+    pub version: String,
+    pub descriptor: ArtifactRef,
+}
+
+impl SkillDescriptorPin {
+    pub fn validate(&self) -> Result<(), RunError> {
+        validate_text(&self.name, 256, "skill name", false)?;
+        validate_text(&self.version, 128, "skill version", false)?;
+        self.descriptor.validate()
+    }
+}
+
+/// Content-addressed compaction output with explicit evidence continuity.
+#[non_exhaustive]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompactionCheckpoint {
+    pub artifact: ArtifactRef,
+    pub history_start: u64,
+    pub history_end: u64,
+    pub cursor: u64,
+    pub evidence: Vec<ArtifactRef>,
+}
+
+impl CompactionCheckpoint {
+    pub fn validate(&self) -> Result<(), RunError> {
+        if self.history_start > self.history_end
+            || self.cursor < self.history_end
+            || self.evidence.len() > MAX_LIST_ITEMS
+        {
+            return Err(RunError::Validation(
+                "invalid compaction evidence continuity".into(),
+            ));
+        }
+        self.artifact.validate()?;
+        for evidence in &self.evidence {
+            evidence.validate()?;
+        }
+        Ok(())
+    }
+}
+
 impl ArtifactRef {
     pub fn new(
         digest: impl Into<String>,
@@ -703,6 +820,8 @@ pub struct IterationContextManifest {
     pub memory_snapshot: Option<String>,
     pub artifacts: Vec<ArtifactRef>,
     pub steering_high_water: u64,
+    /// Exact immutable Harness content selected by the Run reducer.
+    pub harness_snapshot_digest: String,
 }
 
 impl IterationContextManifest {
@@ -724,6 +843,7 @@ impl IterationContextManifest {
             memory_snapshot: None,
             artifacts: Vec::new(),
             steering_high_water: 0,
+            harness_snapshot_digest: String::new(),
         }
     }
 
@@ -752,9 +872,19 @@ impl IterationContextManifest {
         self
     }
 
+    pub fn harness_snapshot(mut self, digest: impl Into<String>) -> Self {
+        self.harness_snapshot_digest = digest.into();
+        self
+    }
+
     pub fn validate(&self) -> Result<(), RunError> {
         validate_text(&self.policy_digest, 256, "iteration policy digest", false)?;
         validate_text(&self.model_revision, 256, "iteration model revision", false)?;
+        if !valid_sha256(&self.harness_snapshot_digest) {
+            return Err(RunError::Validation(
+                "iteration omitted a valid Harness snapshot pin".into(),
+            ));
+        }
         validate_text(
             &self.workspace_revision,
             512,
@@ -795,7 +925,7 @@ pub struct IterationManifest {
 }
 
 impl IterationManifest {
-    pub fn validate(&self) -> Result<(), RunError> {
+    pub(crate) fn validate(&self) -> Result<(), RunError> {
         if self.iteration_id.get() == 0
             || self
                 .summary
@@ -846,6 +976,11 @@ impl<'de> Deserialize<'de> for EffectClass {
 }
 
 #[non_exhaustive]
+// This public durable-schema enum keeps its structured variants inline so the
+// serialized contract and consumer construction remain uniform. Boxing only
+// the current largest variant would add API indirection without reducing any
+// persisted payload.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum EffectSpec {
@@ -875,6 +1010,21 @@ pub enum EffectSpec {
         provider: String,
         version: String,
         payload: ArtifactRef,
+    },
+    ProgramExecution {
+        program: ArtifactRef,
+        context: ArtifactRef,
+        skills: Vec<SkillDescriptorPin>,
+        compaction: Option<CompactionCheckpoint>,
+        checkpoint: Option<ArtifactRef>,
+        action_limit: u32,
+        provider: String,
+        capability_revision: String,
+        /// Non-secret Host key identity. The executable opaque credential
+        /// handle is never serialized into the Run.
+        credential_key_id: String,
+        credential_generation: u64,
+        credential_scope: String,
     },
     #[serde(other)]
     Unknown,
@@ -915,6 +1065,46 @@ impl EffectSpec {
                 validate_text(provider, 256, "effect provider", false)?;
                 validate_text(version, 256, "effect provider version", false)?;
                 payload.validate()
+            }
+            Self::ProgramExecution {
+                program,
+                context,
+                skills,
+                compaction,
+                checkpoint,
+                action_limit,
+                provider,
+                capability_revision,
+                credential_key_id,
+                credential_scope,
+                ..
+            } => {
+                if *action_limit == 0 || *action_limit > 1024 || skills.len() > 128 {
+                    return Err(RunError::Validation(
+                        "invalid bounded program effect".into(),
+                    ));
+                }
+                validate_text(provider, 256, "program provider", false)?;
+                validate_text(
+                    capability_revision,
+                    256,
+                    "program capability revision",
+                    false,
+                )?;
+                validate_text(credential_key_id, 512, "credential key id", false)?;
+                validate_text(credential_scope, 512, "credential scope", false)?;
+                program.validate()?;
+                context.validate()?;
+                for skill in skills {
+                    skill.validate()?;
+                }
+                if let Some(compaction) = compaction {
+                    compaction.validate()?;
+                }
+                if let Some(checkpoint) = checkpoint {
+                    checkpoint.validate()?;
+                }
+                Ok(())
             }
             Self::Unknown => Err(RunError::Integrity(
                 "unknown durable Run effect requires schema migration".into(),
@@ -959,6 +1149,7 @@ impl<'de> Deserialize<'de> for OperationState {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OperationAttempt {
     pub attempt: u32,
+    pub claim_command_id: CommandId,
     pub token: DispatchToken,
     pub epoch: ControllerEpoch,
 }
@@ -1081,6 +1272,36 @@ pub struct EffectReceipt {
     /// dimension is measured.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub actual_usage: Option<Box<EffectUsage>>,
+    /// Typed binding required for ProgramExecution receipts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub program: Option<Box<ProgramReceiptBinding>>,
+}
+
+#[non_exhaustive]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProgramReceiptBinding {
+    pub operation_id: OperationId,
+    pub handle_id: String,
+    pub handle_generation: u64,
+    pub result: ArtifactRef,
+    pub checkpoint: Option<ArtifactRef>,
+}
+impl ProgramReceiptBinding {
+    pub fn new(
+        operation_id: OperationId,
+        handle_id: impl Into<String>,
+        handle_generation: u64,
+        result: ArtifactRef,
+        checkpoint: Option<ArtifactRef>,
+    ) -> Self {
+        Self {
+            operation_id,
+            handle_id: handle_id.into(),
+            handle_generation,
+            result,
+            checkpoint,
+        }
+    }
 }
 
 #[non_exhaustive]
@@ -1118,6 +1339,7 @@ impl EffectReceipt {
             outcome: None,
             session_usage: None,
             actual_usage: None,
+            program: None,
         }
     }
 
@@ -1147,11 +1369,40 @@ impl EffectReceipt {
             outcome: Some(outcome),
             session_usage: Some(Box::new(session_usage)),
             actual_usage: Some(Box::new(actual_usage)),
+            program: None,
         }
+    }
+
+    pub fn for_program(
+        binding: ProgramReceiptBinding,
+        actual_usage: EffectUsage,
+    ) -> Result<Self, RunError> {
+        actual_usage.validate()?;
+        if !actual_usage.unknown.is_empty() {
+            return Err(RunError::Validation(
+                "program receipt requires fully measured usage".into(),
+            ));
+        }
+        validate_program_binding(&binding)?;
+        let digest = canonical_digest(&(&binding, &actual_usage))?;
+        Ok(Self {
+            receipt_id: format!("program:sha256:{digest}"),
+            settlement_id: None,
+            runtime_prompt_index: None,
+            outcome: None,
+            session_usage: None,
+            actual_usage: Some(Box::new(actual_usage)),
+            program: Some(Box::new(binding)),
+        })
     }
 
     pub fn actual_usage(mut self, usage: EffectUsage) -> Self {
         self.actual_usage = Some(Box::new(usage));
+        self
+    }
+
+    pub fn program_binding(mut self, binding: ProgramReceiptBinding) -> Self {
+        self.program = Some(Box::new(binding));
         self
     }
 }
@@ -1241,6 +1492,42 @@ pub(crate) fn validate_effect_receipt(
                 "Session turn receipt does not match its durable intent".into(),
             ));
         }
+    }
+    if let EffectSpec::ProgramExecution { .. } = spec {
+        let binding = receipt.program.as_ref().ok_or_else(|| {
+            RunError::Integrity(
+                "program receipt omitted exact operation/handle/result binding".into(),
+            )
+        })?;
+        validate_program_binding(binding)?;
+        let actual_usage = receipt.actual_usage.as_ref().ok_or_else(|| {
+            RunError::Integrity("program receipt omitted measured actual usage".into())
+        })?;
+        if !actual_usage.unknown.is_empty()
+            || receipt.receipt_id
+                != format!(
+                    "program:sha256:{}",
+                    canonical_digest(&(binding.as_ref(), actual_usage.as_ref()))?
+                )
+        {
+            return Err(RunError::Integrity(
+                "program receipt identity does not match its exact binding and usage".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_program_binding(binding: &ProgramReceiptBinding) -> Result<(), RunError> {
+    validate_text(&binding.handle_id, 512, "program handle", false)?;
+    if binding.handle_generation == 0 {
+        return Err(RunError::Validation(
+            "program handle generation must be non-zero".into(),
+        ));
+    }
+    binding.result.validate()?;
+    if let Some(checkpoint) = &binding.checkpoint {
+        checkpoint.validate()?;
     }
     Ok(())
 }
@@ -1562,6 +1849,8 @@ impl WorkflowRevision {
 pub struct RunRecord {
     pub revision: RunRevision,
     pub controller_epoch: ControllerEpoch,
+    pub wake: WakeIntent,
+    pub activation_lease: Option<ActivationLease>,
     pub created_at_ms: u64,
     pub updated_at_ms: u64,
     pub id: RunId,
@@ -1594,6 +1883,7 @@ pub struct RunRecord {
     pub current_strategy_revision: u64,
     pub workflow_revisions: Vec<WorkflowRevision>,
     pub current_workflow_revision: Option<u64>,
+    pub harness: HarnessGovernance,
     pub verdict: Option<GoalVerdict>,
     pub pending_approval: bool,
     /// Non-active state to restore after reconciling work that was still in
@@ -1604,6 +1894,91 @@ pub struct RunRecord {
     pub command_receipts: BTreeMap<CommandId, CommandReceipt>,
     pub terminal_report_claimed: bool,
     pub event_cursor: RunEventCursor,
+}
+
+#[non_exhaustive]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HarnessSnapshotPin {
+    pub digest: String,
+    pub descriptor_digest: String,
+    pub capability_revision: String,
+    pub negotiated_capabilities: BTreeSet<String>,
+    pub revision: u64,
+    pub evidence: Vec<ArtifactRef>,
+    pub provenance: String,
+}
+
+impl HarnessSnapshotPin {
+    pub fn new(
+        digest: impl Into<String>,
+        descriptor_digest: impl Into<String>,
+        capability_revision: impl Into<String>,
+        revision: u64,
+        provenance: impl Into<String>,
+    ) -> Self {
+        Self {
+            digest: digest.into(),
+            descriptor_digest: descriptor_digest.into(),
+            capability_revision: capability_revision.into(),
+            negotiated_capabilities: BTreeSet::new(),
+            revision,
+            evidence: Vec::new(),
+            provenance: provenance.into(),
+        }
+    }
+    pub fn validate(&self) -> Result<(), RunError> {
+        if !valid_sha256(&self.digest)
+            || !valid_sha256(&self.descriptor_digest)
+            || self.revision == 0
+        {
+            return Err(RunError::Validation(
+                "invalid immutable Harness snapshot pin".into(),
+            ));
+        }
+        validate_text(
+            &self.capability_revision,
+            256,
+            "Harness capability revision",
+            false,
+        )?;
+        validate_text(&self.provenance, 1024, "Harness provenance", false)?;
+        validate_text_set(
+            &self.negotiated_capabilities,
+            MAX_LIST_ITEMS,
+            256,
+            "Harness capability",
+        )?;
+        for evidence in &self.evidence {
+            evidence.validate()?;
+        }
+        Ok(())
+    }
+}
+
+#[non_exhaustive]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HarnessProposalState {
+    Proposed,
+    Validated,
+    Active,
+    Rejected,
+    RolledBack,
+}
+
+#[non_exhaustive]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HarnessProposal {
+    pub pin: HarnessSnapshotPin,
+    pub state: HarnessProposalState,
+}
+
+#[non_exhaustive]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HarnessGovernance {
+    pub active: Option<HarnessSnapshotPin>,
+    pub previous: Option<HarnessSnapshotPin>,
+    pub proposals: BTreeMap<String, HarnessProposal>,
 }
 
 impl RunRecord {
@@ -1737,6 +2112,36 @@ impl RunEnvelope {
         self.run.goal.validate()?;
         self.run.capabilities.validate()?;
         self.run.driver.validate()?;
+        let active_harness = self
+            .run
+            .harness
+            .active
+            .as_ref()
+            .ok_or_else(|| RunError::Integrity("Run omitted active Harness snapshot".into()))?;
+        active_harness.validate()?;
+        for (digest, proposal) in &self.run.harness.proposals {
+            proposal.pin.validate()?;
+            if digest != &proposal.pin.digest {
+                return Err(RunError::Integrity(
+                    "Harness proposal identity mismatch".into(),
+                ));
+            }
+        }
+        if self.run.wake.reasons.len() > 8
+            || self.run.activation_lease.as_ref().is_some_and(|lease| {
+                lease.expires_at_ms == 0
+                    || lease.reasons.is_empty()
+                    || lease.epoch != self.run.controller_epoch
+            })
+            || ((self.run.status.is_terminal() || self.run.status != RunStatus::Active)
+                && (self.run.activation_lease.is_some()
+                    || !self.run.wake.reasons.is_empty()
+                    || self.run.wake.deadline_ms.is_some()))
+        {
+            return Err(RunError::Integrity(
+                "invalid durable Run residency state".into(),
+            ));
+        }
         if self.events.len() > MAX_EVENTS
             || self.run.command_receipts.len() > MAX_COMMAND_RECEIPTS
             || self.run.iterations.len() > MAX_ITERATION_SUMMARIES
@@ -1840,6 +2245,15 @@ impl RunEnvelope {
                 ));
             }
             if let Some(receipt) = &operation.receipt {
+                if receipt
+                    .program
+                    .as_ref()
+                    .is_some_and(|binding| binding.operation_id != *operation_id)
+                {
+                    return Err(RunError::Integrity(
+                        "program receipt operation identity mismatch".into(),
+                    ));
+                }
                 if operation.state == OperationState::Uncertain {
                     // An Applied callback may carry incomplete or unusable
                     // usage evidence. Preserve it only behind the recovery
@@ -2056,6 +2470,8 @@ pub fn migrate_legacy_goal(
     let run = RunRecord {
         revision: RunRevision::new(1),
         controller_epoch: ControllerEpoch::new(1),
+        wake: WakeIntent::default(),
+        activation_lease: None,
         created_at_ms: now_ms,
         updated_at_ms: now_ms,
         id,
@@ -2091,6 +2507,19 @@ pub fn migrate_legacy_goal(
         current_strategy_revision: 0,
         workflow_revisions: Vec::new(),
         current_workflow_revision: None,
+        harness: HarnessGovernance {
+            active: Some(HarnessSnapshotPin {
+                digest: format!("{:064x}", 0),
+                descriptor_digest: format!("{:064x}", 0),
+                capability_revision: "legacy-import".into(),
+                negotiated_capabilities: BTreeSet::new(),
+                revision: 1,
+                evidence: Vec::new(),
+                provenance: "legacy-import".into(),
+            }),
+            previous: None,
+            proposals: BTreeMap::new(),
+        },
         verdict,
         pending_approval: false,
         recovery_prior_status: None,
@@ -2183,6 +2612,7 @@ pub struct CreateRunRequest {
     pub required_gates: BTreeSet<String>,
     pub verifier_policy_digest: String,
     pub budget: ResourceVector,
+    pub harness_snapshot: Option<HarnessSnapshotPin>,
 }
 
 impl CreateRunRequest {
@@ -2204,6 +2634,7 @@ impl CreateRunRequest {
             required_gates: BTreeSet::new(),
             verifier_policy_digest: "default".into(),
             budget,
+            harness_snapshot: None,
         }
     }
 
@@ -2221,6 +2652,36 @@ impl CreateRunRequest {
         self.verifier_policy_digest = value.into();
         self
     }
+
+    pub fn harness_snapshot(mut self, pin: HarnessSnapshotPin) -> Self {
+        self.harness_snapshot = Some(pin);
+        self
+    }
+}
+
+#[non_exhaustive]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProposeHarness {
+    pub pin: HarnessSnapshotPin,
+}
+
+#[non_exhaustive]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ValidateHarness {
+    pub digest: String,
+    pub accepted: bool,
+}
+
+#[non_exhaustive]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActivateHarness {
+    pub digest: String,
+}
+
+#[non_exhaustive]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RollbackHarness {
+    pub expected_active_digest: String,
 }
 
 #[non_exhaustive]
@@ -2339,6 +2800,8 @@ impl PrepareOperation {
 pub struct ClaimEffect {
     pub operation_id: OperationId,
     pub reservation: ResourceVector,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activation: Option<ActivationFence>,
 }
 
 impl ClaimEffect {
@@ -2346,11 +2809,17 @@ impl ClaimEffect {
         Self {
             operation_id,
             reservation: ResourceVector::default(),
+            activation: None,
         }
     }
 
     pub fn reservation(mut self, reservation: ResourceVector) -> Self {
         self.reservation = reservation;
+        self
+    }
+
+    pub fn activation(mut self, activation: ActivationFence) -> Self {
+        self.activation = Some(activation);
         self
     }
 }

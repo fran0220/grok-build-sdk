@@ -16,6 +16,7 @@ pub struct AutonomousActivation {
     /// deliberately not a RunEventCursor.
     pub after_session_sequence: u64,
     pub max_iterations: u32,
+    activation_fence: Option<run::ActivationFence>,
 }
 
 impl AutonomousActivation {
@@ -30,6 +31,7 @@ impl AutonomousActivation {
             workspace_revision: workspace_revision.into(),
             after_session_sequence: 0,
             max_iterations: 1,
+            activation_fence: None,
         }
     }
 
@@ -73,6 +75,20 @@ impl Runtime {
 }
 
 impl AutonomousTurnLoop {
+    /// Executes only while holding the exact durable residency lease. A lease
+    /// takeover advances the Run revision/epoch, so every subsequent reducer
+    /// command from this activation is CAS-fenced even if takeover races this
+    /// initial check.
+    pub async fn activate_claimed(
+        &self,
+        mut activation: AutonomousActivation,
+        fence: run::ActivationFence,
+    ) -> Result<AutonomousActivationResult, Error> {
+        ensure_activation_fence(&self.runtime, &activation.run_id, Some(&fence)).await?;
+        activation.activation_fence = Some(fence);
+        self.activate(activation).await
+    }
+
     pub async fn activate(
         &self,
         activation: AutonomousActivation,
@@ -98,6 +114,12 @@ impl AutonomousTurnLoop {
         else {
             return Err(run::RunError::NotFound.into());
         };
+        ensure_activation_fence(
+            &self.runtime,
+            &activation.run_id,
+            activation.activation_fence.as_ref(),
+        )
+        .await?;
         ensure_autonomous_driver(&snapshot)?;
 
         let mut sequence = activation.after_session_sequence;
@@ -207,6 +229,20 @@ impl AutonomousTurnLoop {
                 activation.model_revision.clone(),
                 activation.workspace_revision.clone(),
             )
+            .harness_snapshot(
+                snapshot
+                    .run
+                    .harness
+                    .active
+                    .as_ref()
+                    .ok_or_else(|| {
+                        run::RunError::Integrity(
+                            "autonomous Run omitted Harness snapshot pin".into(),
+                        )
+                    })?
+                    .digest
+                    .clone(),
+            )
             .history_range(0, sequence)
             .steering_high_water(snapshot.run.steering_high_water);
             let begin = self
@@ -259,6 +295,11 @@ impl AutonomousTurnLoop {
                 ))
                 .await?;
             snapshot = prepared.snapshot;
+            let mut claim = run::ClaimEffect::new(operation_id)
+                .reservation(session_turn_reservation(&snapshot.run)?);
+            if let Some(fence) = activation.activation_fence.clone() {
+                claim = claim.activation(fence);
+            }
             let claimed = self
                 .runtime
                 .inner
@@ -266,14 +307,19 @@ impl AutonomousTurnLoop {
                     activation.run_id.clone(),
                     snapshot.run.revision,
                     command_id(&snapshot, "claim_turn", Some(handle.iteration_id))?,
-                    run::ClaimEffect::new(operation_id)
-                        .reservation(session_turn_reservation(&snapshot.run)?),
+                    claim,
                 ))
                 .await?;
             let effect = claimed.output;
             snapshot = claimed.command.snapshot;
 
             let session_id = SessionId::from_stored(snapshot.run.session.as_str());
+            ensure_activation_fence(
+                &self.runtime,
+                &activation.run_id,
+                activation.activation_fence.as_ref(),
+            )
+            .await?;
             let receipt = match self.runtime.prompt(&session_id, &turn_id, &prompt).await {
                 Ok(receipt) => receipt,
                 Err(error) => {
@@ -507,6 +553,34 @@ impl AutonomousTurnLoop {
         } else {
             Ok(snapshot)
         }
+    }
+}
+
+async fn ensure_activation_fence(
+    runtime: &Runtime,
+    run_id: &run::RunId,
+    fence: Option<&run::ActivationFence>,
+) -> Result<(), Error> {
+    let residency = runtime.inspect_run_residency(run_id).await?;
+    match (residency.lease.as_ref(), fence) {
+        (None, None) => Ok(()),
+        (Some(lease), Some(fence)) => {
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(|error| run::RunError::Storage(error.to_string()))?
+                .as_millis()
+                .min(u64::MAX as u128) as u64;
+            if lease.worker_id == fence.worker_id
+                && lease.epoch == fence.epoch
+                && lease.token == fence.token
+                && lease.expires_at_ms > now_ms
+            {
+                Ok(())
+            } else {
+                Err(run::RunError::StaleEpoch.into())
+            }
+        }
+        _ => Err(run::RunError::StaleEpoch.into()),
     }
 }
 

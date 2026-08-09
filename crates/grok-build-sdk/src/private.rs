@@ -2,9 +2,10 @@ use crate::{
     AvailableModel, ConversationRewindReceipt, ConversationRewindStatus, Error, Event, EventUpdate,
     ExtensionNotification, ExtensionRequest, ExtensionResponse, HarnessDigest, HarnessError,
     LedgerTurnState, ModelCatalog, Prompt, PromptBlock, PromptReceipt, RewindPoint,
-    RuntimeCapabilities, RuntimeConfig, RuntimeOptions, SessionConfig, SessionId, SessionLedger,
-    SessionLedgerEntry, TurnBindingKey, TurnBindingReceipt, TurnBindingRecord, TurnBindingStatus,
-    TurnOutcome,
+    RuntimeCapabilities, RuntimeConfig, RuntimeOptions, SessionConfig, SessionEvidenceCommit,
+    SessionEvidenceDocument, SessionEvidenceKey, SessionEvidenceKind, SessionEvidenceStore,
+    SessionEvidenceVersion, SessionId, SessionLedger, SessionLedgerEntry, TurnBindingKey,
+    TurnBindingReceipt, TurnBindingRecord, TurnBindingStatus, TurnOutcome,
 };
 use agent_client_protocol as acp;
 use agent_client_protocol::Agent as _;
@@ -156,6 +157,15 @@ impl Runtime {
         options: RuntimeOptions,
         run_store: Option<Arc<dyn xai_agent_lifecycle::run::RunStore>>,
     ) -> Result<(Self, mpsc::UnboundedReceiver<Event>), Error> {
+        Self::start_with_stores(input, options, run_store, None).await
+    }
+
+    pub async fn start_with_stores(
+        input: RuntimeConfig,
+        options: RuntimeOptions,
+        run_store: Option<Arc<dyn xai_agent_lifecycle::run::RunStore>>,
+        evidence_store: Option<Arc<dyn SessionEvidenceStore>>,
+    ) -> Result<(Self, mpsc::UnboundedReceiver<Event>), Error> {
         validate(&input, &options)?;
         if options.event_journal_capacity == 0 {
             return Err(Error::InvalidConfig(
@@ -186,6 +196,12 @@ impl Runtime {
             ),
         };
         let runs = xai_agent_lifecycle::run::RunController::open(run_store).map_err(run_error)?;
+        let evidence_store = match evidence_store {
+            Some(store) => store,
+            None => {
+                Arc::new(crate::LocalSessionEvidenceStore::new(&input.session_storage).map_err(op)?)
+            }
+        };
         let (events, event_rx) = mpsc::unbounded_channel();
         let (commands, command_rx) = mpsc::unbounded_channel();
         let (ready_tx, ready_rx) = oneshot::channel();
@@ -199,7 +215,7 @@ impl Runtime {
                     Ok(rt) => {
                         let local = tokio::task::LocalSet::new();
                         local.block_on(&rt, async move {
-                            match Core::start(input, options, events).await {
+                            match Core::start(input, options, events, evidence_store).await {
                                 Ok((core, capabilities)) => {
                                     let _ = ready_tx.send(Ok(capabilities));
                                     Rc::new(core).run(command_rx).await;
@@ -280,6 +296,76 @@ impl Runtime {
     ) -> Result<Vec<xai_agent_lifecycle::run::RunEnvelope>, Error> {
         self.ensure_running()?;
         Ok(self.shared.runs.lock().await.list_recoverable_runs())
+    }
+    pub async fn inspect_run_residency(
+        &self,
+        run_id: &xai_agent_lifecycle::run::RunId,
+    ) -> Result<xai_agent_lifecycle::run::ResidencyInspection, Error> {
+        self.ensure_running()?;
+        self.shared
+            .runs
+            .lock()
+            .await
+            .inspect_residency(run_id, now_ms())
+            .map_err(run_error)
+    }
+    pub async fn request_run_wake(
+        &self,
+        request: xai_agent_lifecycle::run::MutationRequest<xai_agent_lifecycle::run::WakeRequest>,
+    ) -> Result<xai_agent_lifecycle::run::RunCommandResult, Error> {
+        self.ensure_running()?;
+        self.shared
+            .runs
+            .lock()
+            .await
+            .request_wake(request, now_ms())
+            .map_err(run_error)
+    }
+    pub async fn claim_run_activation(
+        &self,
+        request: xai_agent_lifecycle::run::MutationRequest<
+            xai_agent_lifecycle::run::ClaimActivation,
+        >,
+    ) -> Result<
+        xai_agent_lifecycle::run::CommandOutput<xai_agent_lifecycle::run::ActivationLease>,
+        Error,
+    > {
+        self.ensure_running()?;
+        self.shared
+            .runs
+            .lock()
+            .await
+            .claim_activation(request, now_ms())
+            .map_err(run_error)
+    }
+    pub async fn renew_run_activation(
+        &self,
+        request: xai_agent_lifecycle::run::MutationRequest<(
+            xai_agent_lifecycle::run::ActivationFence,
+            u64,
+        )>,
+    ) -> Result<xai_agent_lifecycle::run::RunCommandResult, Error> {
+        self.ensure_running()?;
+        self.shared
+            .runs
+            .lock()
+            .await
+            .renew_activation(request, now_ms())
+            .map_err(run_error)
+    }
+    pub async fn release_run_activation(
+        &self,
+        request: xai_agent_lifecycle::run::MutationRequest<
+            xai_agent_lifecycle::run::ActivationFence,
+        >,
+    ) -> Result<xai_agent_lifecycle::run::RunCommandResult, Error> {
+        self.ensure_running()?;
+        self.shared
+            .runs
+            .lock()
+            .await
+            .release_activation(request, now_ms())
+            .map_err(run_error)
     }
     pub async fn control_run(
         &self,
@@ -373,6 +459,62 @@ impl Runtime {
             .begin_iteration(request, now_ms())
             .map_err(run_error)
     }
+    pub async fn propose_harness(
+        &self,
+        request: xai_agent_lifecycle::run::MutationRequest<
+            xai_agent_lifecycle::run::ProposeHarness,
+        >,
+    ) -> Result<xai_agent_lifecycle::run::RunCommandResult, Error> {
+        self.ensure_running()?;
+        self.shared
+            .runs
+            .lock()
+            .await
+            .propose_harness(request, now_ms())
+            .map_err(run_error)
+    }
+    pub async fn validate_harness(
+        &self,
+        request: xai_agent_lifecycle::run::MutationRequest<
+            xai_agent_lifecycle::run::ValidateHarness,
+        >,
+    ) -> Result<xai_agent_lifecycle::run::RunCommandResult, Error> {
+        self.ensure_running()?;
+        self.shared
+            .runs
+            .lock()
+            .await
+            .validate_harness(request, now_ms())
+            .map_err(run_error)
+    }
+    pub async fn activate_harness(
+        &self,
+        request: xai_agent_lifecycle::run::MutationRequest<
+            xai_agent_lifecycle::run::ActivateHarness,
+        >,
+    ) -> Result<xai_agent_lifecycle::run::RunCommandResult, Error> {
+        self.ensure_running()?;
+        self.shared
+            .runs
+            .lock()
+            .await
+            .activate_harness(request, now_ms())
+            .map_err(run_error)
+    }
+    pub async fn rollback_harness(
+        &self,
+        request: xai_agent_lifecycle::run::MutationRequest<
+            xai_agent_lifecycle::run::RollbackHarness,
+        >,
+    ) -> Result<xai_agent_lifecycle::run::RunCommandResult, Error> {
+        self.ensure_running()?;
+        self.shared
+            .runs
+            .lock()
+            .await
+            .rollback_harness(request, now_ms())
+            .map_err(run_error)
+    }
     pub async fn finish_iteration(
         &self,
         callback: xai_agent_lifecycle::run::FinishIteration,
@@ -438,6 +580,57 @@ impl Runtime {
             .lock()
             .await
             .reconcile_effect(request, now_ms())
+            .map_err(run_error)
+    }
+    pub async fn admit_child(
+        &self,
+        request: xai_agent_lifecycle::run::MutationRequest<xai_agent_lifecycle::run::AdmitChild>,
+    ) -> Result<xai_agent_lifecycle::run::CommandOutput<xai_agent_lifecycle::run::ChildRun>, Error>
+    {
+        self.ensure_running()?;
+        self.shared
+            .runs
+            .lock()
+            .await
+            .admit_child(request, now_ms())
+            .map_err(run_error)
+    }
+    pub async fn child_callback(
+        &self,
+        callback: xai_agent_lifecycle::run::ChildCallback,
+    ) -> Result<xai_agent_lifecycle::run::CallbackResult, Error> {
+        self.ensure_running()?;
+        self.shared
+            .runs
+            .lock()
+            .await
+            .child_callback(callback, now_ms())
+            .map_err(run_error)
+    }
+    pub async fn accept_run_message(
+        &self,
+        request: xai_agent_lifecycle::run::MutationRequest<xai_agent_lifecycle::run::AcceptMessage>,
+    ) -> Result<xai_agent_lifecycle::run::RunCommandResult, Error> {
+        self.ensure_running()?;
+        self.shared
+            .runs
+            .lock()
+            .await
+            .accept_message(request, now_ms())
+            .map_err(run_error)
+    }
+    pub async fn transition_run_message(
+        &self,
+        request: xai_agent_lifecycle::run::MutationRequest<
+            xai_agent_lifecycle::run::TransitionMessage,
+        >,
+    ) -> Result<xai_agent_lifecycle::run::RunCommandResult, Error> {
+        self.ensure_running()?;
+        self.shared
+            .runs
+            .lock()
+            .await
+            .transition_message(request, now_ms())
             .map_err(run_error)
     }
     pub async fn list_models(&self) -> Result<ModelCatalog, Error> {
@@ -1788,6 +1981,13 @@ struct RewindIntent {
     recovery_prompt_digest: Option<String>,
 }
 
+#[derive(serde::Deserialize, serde::Serialize)]
+#[serde(tag = "state", content = "value", rename_all = "snake_case")]
+enum RewindEvidence {
+    Intent(RewindIntent),
+    Receipt(ConversationRewindReceipt),
+}
+
 fn native_rewind_already_applied(
     points: &[RewindPointWire],
     target_prompt_index: u64,
@@ -1893,15 +2093,15 @@ struct Core {
     turn_usages: TurnUsageMap,
     prompt_tasks: RefCell<HashMap<String, tokio::task::AbortHandle>>,
     replay: Rc<RefCell<HashMap<String, ReplayMode>>>,
-    ledger_root: std::path::PathBuf,
-    turn_binding_root: std::path::PathBuf,
-    rewind_root: std::path::PathBuf,
+    evidence_store: Arc<dyn SessionEvidenceStore>,
+    evidence_versions: RefCell<HashMap<SessionEvidenceKey, SessionEvidenceVersion>>,
 }
 impl Core {
     async fn start(
         input: RuntimeConfig,
         options: RuntimeOptions,
         events: mpsc::UnboundedSender<Event>,
+        evidence_store: Arc<dyn SessionEvidenceStore>,
     ) -> Result<(Self, RuntimeCapabilities), Error> {
         std::fs::create_dir_all(&input.grok_home).map_err(op)?;
         std::fs::create_dir_all(&input.session_storage).map_err(op)?;
@@ -2172,9 +2372,8 @@ impl Core {
                 turn_usages,
                 prompt_tasks: RefCell::new(HashMap::new()),
                 replay,
-                ledger_root: input.session_storage.join("origin-turn-ledger"),
-                turn_binding_root: input.session_storage.join("origin-harness-turn-bindings"),
-                rewind_root: input.session_storage.join("origin-rewind-receipts"),
+                evidence_store,
+                evidence_versions: RefCell::new(HashMap::new()),
             },
             capabilities,
         ))
@@ -2704,14 +2903,10 @@ impl Core {
         }
         if !xai_grok_shell::origin_runtime::register_root_session(&id.0) {
             let cleanup = self.detach_unregistered_session(&id).await;
-            let ledger_cleanup = std::fs::remove_file(self.ledger_path(&id));
             let mut detail =
                 "native session identity collided with an existing embedded root".to_owned();
             if let Err(error) = cleanup {
                 detail.push_str(&format!("; native session cleanup failed: {error}"));
-            }
-            if let Err(error) = ledger_cleanup {
-                detail.push_str(&format!("; native Turn ledger cleanup failed: {error}"));
             }
             return Err(Error::Operation(detail));
         }
@@ -2910,7 +3105,7 @@ impl Core {
             .get(&id.0)
             .copied()
             .unwrap_or_default();
-        let prompt_digest = crate::prompt_digest_content(&prompt)?;
+        let prompt_digest = crate::prompt_digest_content(prompt)?;
         Ok(PreparedHarnessTurn {
             prompt_digest,
             snapshot_digest: bound_digest,
@@ -3130,18 +3325,68 @@ impl Core {
         self.save_ledger(id, &ledger)
     }
 
-    fn ledger_path(&self, id: &SessionId) -> std::path::PathBuf {
-        use sha2::Digest as _;
-        let digest = sha2::Sha256::digest(id.0.as_bytes());
-        self.ledger_root.join(format!("{:x}.json", digest))
+    fn evidence_key(kind: SessionEvidenceKind, identity: String) -> SessionEvidenceKey {
+        SessionEvidenceKey { kind, identity }
+    }
+
+    fn load_evidence(
+        &self,
+        key: &SessionEvidenceKey,
+        max: usize,
+    ) -> Result<Option<Vec<u8>>, Error> {
+        let document = self.evidence_store.load(key).map_err(op)?;
+        if let Some(SessionEvidenceDocument { version, bytes }) = document {
+            if bytes.len() > max {
+                return Err(Error::Operation(
+                    "session evidence exceeds its bounded schema size".into(),
+                ));
+            }
+            if !version.validates(&bytes) {
+                return Err(Error::Operation(
+                    "session evidence CAS digest or revision is invalid".into(),
+                ));
+            }
+            self.evidence_versions
+                .borrow_mut()
+                .insert(key.clone(), version);
+            Ok(Some(bytes))
+        } else {
+            self.evidence_versions.borrow_mut().remove(key);
+            Ok(None)
+        }
+    }
+
+    fn commit_evidence(&self, key: &SessionEvidenceKey, bytes: &[u8]) -> Result<(), Error> {
+        let expected = self.evidence_versions.borrow().get(key).cloned();
+        let required = SessionEvidenceVersion::successor(expected.as_ref(), bytes).map_err(op)?;
+        match self
+            .evidence_store
+            .compare_and_swap(key, expected.as_ref(), bytes)
+            .map_err(op)?
+        {
+            SessionEvidenceCommit::Committed(version) if version == required => {
+                self.evidence_versions
+                    .borrow_mut()
+                    .insert(key.clone(), version);
+                Ok(())
+            }
+            SessionEvidenceCommit::Committed(_) => Err(Error::Operation(
+                "session evidence store returned an invalid successor identity".into(),
+            )),
+            SessionEvidenceCommit::Conflict => Err(Error::Operation(
+                "session evidence CAS conflict; reconciliation is required".into(),
+            )),
+            SessionEvidenceCommit::CommitUnknown => Err(Error::Operation(
+                "session evidence commit acknowledgement is unknown; reconciliation is required"
+                    .into(),
+            )),
+        }
     }
 
     fn load_ledger(&self, id: &SessionId) -> Result<SessionLedger, Error> {
-        let path = self.ledger_path(id);
-        let bytes = std::fs::read(&path).map_err(|error| {
-            Error::Operation(format!(
-                "native Turn ledger is unavailable for session reconciliation: {error}"
-            ))
+        let key = Self::evidence_key(SessionEvidenceKind::Ledger, id.0.clone());
+        let bytes = self.load_evidence(&key, 8 * 1024 * 1024)?.ok_or_else(|| {
+            Error::Operation("native Turn ledger is unavailable for session reconciliation".into())
         })?;
         let ledger: SessionLedger = serde_json::from_slice(&bytes).map_err(op)?;
         validate_session_ledger(id, &ledger)?;
@@ -3149,36 +3394,17 @@ impl Core {
     }
 
     fn save_ledger(&self, id: &SessionId, ledger: &SessionLedger) -> Result<(), Error> {
-        use std::io::Write as _;
         validate_session_ledger(id, ledger)?;
-        std::fs::create_dir_all(&self.ledger_root).map_err(op)?;
-        let path = self.ledger_path(id);
-        let temporary = path.with_extension("json.tmp");
         let bytes = serde_json::to_vec(ledger).map_err(op)?;
-        let mut file = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .open(&temporary)
-            .map_err(op)?;
-        file.write_all(&bytes).map_err(op)?;
-        file.sync_all().map_err(op)?;
-        drop(file);
-        std::fs::rename(&temporary, &path).map_err(op)?;
-        #[cfg(unix)]
-        std::fs::File::open(&self.ledger_root)
-            .and_then(|directory| directory.sync_all())
-            .map_err(op)?;
-        Ok(())
-    }
-
-    fn turn_binding_path(&self, id: &SessionId, turn_id: &str) -> std::path::PathBuf {
-        use sha2::Digest as _;
-        let session = format!("{:x}", sha2::Sha256::digest(id.as_str().as_bytes()));
-        let turn = format!("{:x}", sha2::Sha256::digest(turn_id.as_bytes()));
-        self.turn_binding_root
-            .join(session)
-            .join(format!("{turn}.json"))
+        if bytes.len() > 8 * 1024 * 1024 {
+            return Err(Error::Operation(
+                "native Turn ledger exceeds maximum size".into(),
+            ));
+        }
+        self.commit_evidence(
+            &Self::evidence_key(SessionEvidenceKind::Ledger, id.0.clone()),
+            &bytes,
+        )
     }
 
     fn load_turn_binding_record(
@@ -3186,19 +3412,21 @@ impl Core {
         id: &SessionId,
         turn_id: &str,
     ) -> Result<Option<TurnBindingRecord>, Error> {
-        match std::fs::read(self.turn_binding_path(id, turn_id)) {
-            Ok(bytes) => TurnBindingRecord::from_json_slice(&bytes)
-                .map(Some)
-                .map_err(Error::Harness),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(error) => Err(op(error)),
-        }
+        let key = Self::evidence_key(
+            SessionEvidenceKind::TurnBinding,
+            format!("{}\0{turn_id}", id.0),
+        );
+        self.load_evidence(&key, crate::MAX_TURN_BINDING_RECORD_BYTES)?
+            .map(|bytes| TurnBindingRecord::from_json_slice(&bytes).map_err(Error::Harness))
+            .transpose()
     }
 
     fn save_turn_binding_record(&self, record: &TurnBindingRecord) -> Result<(), Error> {
-        use std::io::Write as _;
         let receipt = record.receipt();
-        let path = self.turn_binding_path(receipt.session_id(), receipt.turn_id());
+        let key = Self::evidence_key(
+            SessionEvidenceKind::TurnBinding,
+            format!("{}\0{}", receipt.session_id().0, receipt.turn_id()),
+        );
         if let Some(existing) =
             self.load_turn_binding_record(receipt.session_id(), receipt.turn_id())?
         {
@@ -3210,60 +3438,8 @@ impl Core {
                 )))
             };
         }
-        let directory = path
-            .parent()
-            .ok_or_else(|| Error::Operation("Turn binding record path has no parent".into()))?;
-        std::fs::create_dir_all(directory).map_err(op)?;
-        let temporary = path.with_extension("json.tmp");
         let bytes = record.to_json_vec().map_err(Error::Harness)?;
-        let mut file = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .open(&temporary)
-            .map_err(op)?;
-        file.write_all(&bytes).map_err(op)?;
-        file.sync_all().map_err(op)?;
-        drop(file);
-        if let Some(existing) =
-            self.load_turn_binding_record(receipt.session_id(), receipt.turn_id())?
-        {
-            let _ = std::fs::remove_file(&temporary);
-            return if existing == *record {
-                Ok(())
-            } else {
-                Err(Error::Harness(HarnessError::BindingRecordConflict(
-                    "a conflicting immutable record appeared during persistence".into(),
-                )))
-            };
-        }
-        match std::fs::hard_link(&temporary, &path) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                let existing = self
-                    .load_turn_binding_record(receipt.session_id(), receipt.turn_id())?
-                    .ok_or_else(|| {
-                        Error::Operation(
-                            "Turn binding record appeared but could not be loaded".into(),
-                        )
-                    })?;
-                let _ = std::fs::remove_file(&temporary);
-                return if existing == *record {
-                    Ok(())
-                } else {
-                    Err(Error::Harness(HarnessError::BindingRecordConflict(
-                        "a conflicting immutable record won persistence".into(),
-                    )))
-                };
-            }
-            Err(error) => return Err(op(error)),
-        }
-        std::fs::remove_file(&temporary).map_err(op)?;
-        #[cfg(unix)]
-        std::fs::File::open(directory)
-            .and_then(|directory| directory.sync_all())
-            .map_err(op)?;
-        Ok(())
+        self.commit_evidence(&key, &bytes)
     }
 
     fn turn_binding_status(
@@ -3777,53 +3953,18 @@ impl Core {
             recovery_prompt_digest: requested_intent.recovery_prompt_digest,
         };
         self.save_rewind_receipt(&receipt)?;
-        match std::fs::remove_file(self.rewind_intent_path(&receipt.operation_id)) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                return Err(Error::Operation(format!(
-                    "rewind applied and receipt was saved, but intent cleanup failed: {error}"
-                )));
-            }
-        }
         Ok(receipt)
     }
 
-    fn rewind_intent_path(&self, operation_id: &str) -> std::path::PathBuf {
-        use sha2::Digest as _;
-        self.rewind_root.join(format!(
-            "{:x}.intent.json",
-            sha2::Sha256::digest(operation_id.as_bytes())
-        ))
-    }
-
-    fn load_rewind_intent(&self, operation_id: &str) -> Result<Option<RewindIntent>, Error> {
-        match std::fs::read(self.rewind_intent_path(operation_id)) {
-            Ok(bytes) => {
-                let intent: RewindIntent = serde_json::from_slice(&bytes).map_err(op)?;
-                if intent.operation_id != operation_id {
-                    return Err(Error::Operation("rewind intent digest mismatch".into()));
-                }
-                Ok(Some(intent))
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(error) => Err(op(error)),
-        }
+    fn rewind_key(operation_id: &str) -> SessionEvidenceKey {
+        Self::evidence_key(SessionEvidenceKind::Rewind, operation_id.to_owned())
     }
 
     fn save_rewind_intent(&self, intent: &RewindIntent) -> Result<(), Error> {
-        self.save_rewind_document(
-            &self.rewind_intent_path(&intent.operation_id),
-            &serde_json::to_vec(intent).map_err(op)?,
+        self.commit_evidence(
+            &Self::rewind_key(&intent.operation_id),
+            &serde_json::to_vec(&RewindEvidence::Intent(intent.clone())).map_err(op)?,
         )
-    }
-
-    fn rewind_receipt_path(&self, operation_id: &str) -> std::path::PathBuf {
-        use sha2::Digest as _;
-        self.rewind_root.join(format!(
-            "{:x}.json",
-            sha2::Sha256::digest(operation_id.as_bytes())
-        ))
     }
 
     fn rewind_status(
@@ -3831,69 +3972,66 @@ impl Core {
         id: &SessionId,
         operation_id: &str,
     ) -> Result<ConversationRewindStatus, Error> {
-        match std::fs::read(self.rewind_receipt_path(operation_id)) {
-            Ok(bytes) => {
-                let receipt: ConversationRewindReceipt =
-                    serde_json::from_slice(&bytes).map_err(op)?;
-                if receipt.operation_id != operation_id {
-                    return Err(Error::Operation("rewind receipt digest mismatch".into()));
+        match self.load_evidence(&Self::rewind_key(operation_id), 1024 * 1024)? {
+            Some(bytes) => match serde_json::from_slice::<RewindEvidence>(&bytes).map_err(op)? {
+                RewindEvidence::Receipt(receipt) => {
+                    if receipt.operation_id != operation_id {
+                        return Err(Error::Operation("rewind receipt digest mismatch".into()));
+                    }
+                    if receipt.session_id != id.0 {
+                        return Err(Error::Operation(
+                            "rewind receipt belongs to a different native session".into(),
+                        ));
+                    }
+                    Ok(ConversationRewindStatus::Applied { receipt })
                 }
-                if receipt.session_id != id.0 {
-                    return Err(Error::Operation(
-                        "rewind receipt belongs to a different native session".into(),
-                    ));
+                RewindEvidence::Intent(intent) => {
+                    if intent.operation_id != operation_id || intent.session_id != id.0 {
+                        return Err(Error::Operation(
+                            "rewind intent identity does not match its evidence key".into(),
+                        ));
+                    }
+                    let valid_identity =
+                        |value: &str, max: usize| !value.trim().is_empty() && value.len() <= max;
+                    if !valid_identity(&intent.operation_id, 512)
+                        || !valid_identity(&intent.session_id, 512)
+                        || !valid_identity(&intent.target_turn_id, 512)
+                        || !valid_identity(&intent.target_prompt_digest, 160)
+                        || match (
+                            intent.recovery_turn_id.as_deref(),
+                            intent.recovery_prompt_digest.as_deref(),
+                        ) {
+                            (None, None) => false,
+                            (Some(turn), Some(digest)) => {
+                                !valid_identity(turn, 512) || !valid_identity(digest, 160)
+                            }
+                            _ => true,
+                        }
+                    {
+                        return Err(Error::Operation(
+                            "rewind intent contains invalid bounded identities".into(),
+                        ));
+                    }
+                    Ok(ConversationRewindStatus::Pending {
+                        operation_id: intent.operation_id,
+                        session_id: intent.session_id,
+                        target_prompt_index: intent.target_prompt_index,
+                        target_turn_id: intent.target_turn_id,
+                        target_prompt_digest: intent.target_prompt_digest,
+                        recovery_turn_id: intent.recovery_turn_id,
+                        recovery_prompt_digest: intent.recovery_prompt_digest,
+                    })
                 }
-                Ok(ConversationRewindStatus::Applied { receipt })
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                let Some(intent) = self.load_rewind_intent(operation_id)? else {
-                    return Ok(ConversationRewindStatus::Absent);
-                };
-                if intent.session_id != id.0 {
-                    return Err(Error::Operation(
-                        "rewind intent belongs to a different native session".into(),
-                    ));
-                }
-                Ok(ConversationRewindStatus::Pending {
-                    operation_id: intent.operation_id,
-                    session_id: intent.session_id,
-                    target_prompt_index: intent.target_prompt_index,
-                    target_turn_id: intent.target_turn_id,
-                    target_prompt_digest: intent.target_prompt_digest,
-                    recovery_turn_id: intent.recovery_turn_id,
-                    recovery_prompt_digest: intent.recovery_prompt_digest,
-                })
-            }
-            Err(error) => Err(op(error)),
+            },
+            None => Ok(ConversationRewindStatus::Absent),
         }
     }
 
     fn save_rewind_receipt(&self, receipt: &ConversationRewindReceipt) -> Result<(), Error> {
-        self.save_rewind_document(
-            &self.rewind_receipt_path(&receipt.operation_id),
-            &serde_json::to_vec(receipt).map_err(op)?,
+        self.commit_evidence(
+            &Self::rewind_key(&receipt.operation_id),
+            &serde_json::to_vec(&RewindEvidence::Receipt(receipt.clone())).map_err(op)?,
         )
-    }
-
-    fn save_rewind_document(&self, path: &std::path::Path, bytes: &[u8]) -> Result<(), Error> {
-        use std::io::Write as _;
-        std::fs::create_dir_all(&self.rewind_root).map_err(op)?;
-        let temporary = path.with_extension("json.tmp");
-        let mut file = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .open(&temporary)
-            .map_err(op)?;
-        file.write_all(bytes).map_err(op)?;
-        file.sync_all().map_err(op)?;
-        drop(file);
-        std::fs::rename(temporary, path).map_err(op)?;
-        #[cfg(unix)]
-        std::fs::File::open(&self.rewind_root)
-            .and_then(|directory| directory.sync_all())
-            .map_err(op)?;
-        Ok(())
     }
     fn require_resident(&self, id: &SessionId) -> Result<(), Error> {
         if self.resident.borrow().contains(&id.0) {
