@@ -70,12 +70,12 @@ fn controller() -> (tempfile::TempDir, RunController<LocalRunStore>) {
     (directory, RunController::open(store).unwrap())
 }
 
-fn create(controller: &mut RunController<LocalRunStore>) -> RunCommandResult {
+fn create<S: RunStore>(controller: &mut RunController<S>) -> RunCommandResult {
     controller.create_run(create_request(), 1).unwrap()
 }
 
-fn begin_iteration(
-    controller: &mut RunController<LocalRunStore>,
+fn begin_iteration<S: RunStore>(
+    controller: &mut RunController<S>,
     run: &RunEnvelope,
 ) -> CommandOutput<IterationHandle> {
     let context = IterationContextManifest::new(
@@ -99,8 +99,11 @@ fn begin_iteration(
 }
 
 #[test]
-fn golden_v1_round_trips_and_future_values_fail_closed() {
-    let fixture = include_str!("fixtures/run-envelope-v1.json");
+fn current_v2_fixture_round_trips_and_future_values_fail_closed() {
+    // This fixture documents the current v2 wire shape; it is not historical
+    // compatibility evidence. Release fixtures become immutable only after
+    // their originating release has shipped.
+    let fixture = include_str!("fixtures/run-envelope-current-v2.json");
     let expected: serde_json::Value = serde_json::from_str(fixture).unwrap();
     let envelope: RunEnvelope = serde_json::from_str(fixture).unwrap();
     envelope.validate().unwrap();
@@ -127,6 +130,20 @@ fn golden_v1_round_trips_and_future_values_fail_closed() {
         .unwrap(),
         RunLifecycle::Recovering
     );
+    assert!(
+        serde_json::from_value::<RunLifecycle>(serde_json::json!({
+            "state":"active",
+            "detail":{"malformed":true}
+        }))
+        .is_err()
+    );
+    assert!(
+        serde_json::from_value::<RunLifecycle>(serde_json::json!({
+            "state":"recovering",
+            "detail":{"malformed":true}
+        }))
+        .is_err()
+    );
 
     assert_eq!(
         serde_json::from_str::<EffectClass>("\"future_class\"").unwrap(),
@@ -142,6 +159,116 @@ fn golden_v1_round_trips_and_future_values_fail_closed() {
     );
     assert!(serde_json::from_str::<RunId>("\"bad/id\"").is_err());
     assert!(serde_json::from_str::<RunEventKind>("\"bad/event\"").is_err());
+}
+
+#[test]
+fn durable_deserialize_rejects_nested_and_journal_corruption() {
+    let (_directory, mut controller) = controller();
+    let created = create(&mut controller);
+    let begun = begin_iteration(&mut controller, &created.snapshot);
+
+    let mut malformed_context = serde_json::to_value(&begun.command.snapshot).unwrap();
+    malformed_context["run"]["active_iteration"]["context"]["model_revision"] =
+        serde_json::json!("x".repeat(257));
+    assert!(serde_json::from_value::<RunEnvelope>(malformed_context).is_err());
+
+    let operation_id = OperationId::new("nested_validation").unwrap();
+    let prepared = controller
+        .prepare_operation(
+            MutationRequest::new(
+                run_id(),
+                begun.command.snapshot.run.revision,
+                command("prepare_nested_validation"),
+                PrepareOperation::new(
+                    operation_id.clone(),
+                    begun.output.iteration_id,
+                    EffectClass::Reconcilable,
+                    EffectSpec::External {
+                        provider: "test".into(),
+                        version: "1".into(),
+                        payload: artifact(None, None),
+                    },
+                ),
+            ),
+            3,
+        )
+        .unwrap();
+    let mut malformed_spec = serde_json::to_value(&prepared.snapshot).unwrap();
+    malformed_spec["run"]["operations"][operation_id.as_str()]["spec"]["payload"]["retention"] =
+        serde_json::json!("x".repeat(129));
+    assert!(serde_json::from_value::<RunEnvelope>(malformed_spec).is_err());
+
+    let admitted = controller
+        .admit_child(
+            MutationRequest::new(
+                run_id(),
+                prepared.snapshot.run.revision,
+                command("admit_nested_validation"),
+                AdmitChild::new(
+                    ChildId::new("nested_child").unwrap(),
+                    begun.output.iteration_id,
+                    ResourceVector::default().agent_calls(1),
+                    "isolated",
+                    ChildCompletionPolicy::MayFail,
+                ),
+            ),
+            4,
+        )
+        .unwrap();
+    let mut malformed_child = serde_json::to_value(&admitted.command.snapshot).unwrap();
+    malformed_child["run"]["children"]["nested_child"]["artifacts"] = serde_json::json!([{
+        "digest":"a".repeat(64),
+        "media_type":"application/json",
+        "size":1,
+        "provenance":"test",
+        "owner":"x".repeat(161),
+        "retention":"run",
+        "evidence_labels":[]
+    }]);
+    assert!(serde_json::from_value::<RunEnvelope>(malformed_child).is_err());
+
+    let mut too_many_messages = serde_json::to_value(&created.snapshot).unwrap();
+    let mailbox = too_many_messages["run"]["mailbox"].as_object_mut().unwrap();
+    for sequence in 1..=(MAX_MESSAGES + 1) {
+        let id = format!("message_{sequence}");
+        mailbox.insert(
+            id.clone(),
+            serde_json::json!({
+                "id":id,
+                "sequence":sequence,
+                "causation_id":null,
+                "sender":"test",
+                "trust_label":"trusted",
+                "body":"bounded",
+                "state":"accepted"
+            }),
+        );
+    }
+    assert!(serde_json::from_value::<RunEnvelope>(too_many_messages).is_err());
+
+    let mut gap = created.snapshot.clone();
+    gap.run.revision = RunRevision::new(3);
+    gap.run.event_cursor = RunEventCursor::new(3);
+    gap.events.push_back(RunEvent {
+        cursor: RunEventCursor::new(3),
+        revision: RunRevision::new(3),
+        kind: RunEventKind::new("gap_tail").unwrap(),
+        at_ms: 3,
+    });
+    assert!(serde_json::from_value::<RunEnvelope>(serde_json::to_value(gap).unwrap()).is_err());
+
+    let mut truncated = created.snapshot;
+    truncated.run.revision = RunRevision::new(2);
+    truncated.run.event_cursor = RunEventCursor::new(2);
+    assert!(
+        serde_json::from_value::<RunEnvelope>(serde_json::to_value(truncated).unwrap()).is_err()
+    );
+
+    let oversized = vec![b'x'; MAX_RUN_ENVELOPE_BYTES + 2];
+    assert!(RunEnvelope::from_json_slice(&oversized).is_err());
+    let mut reader = std::io::Cursor::new(oversized);
+    assert!(RunEnvelope::from_json_reader(&mut reader).is_err());
+    assert_eq!(reader.position(), MAX_RUN_ENVELOPE_BYTES as u64 + 1);
 }
 
 #[test]
@@ -195,15 +322,25 @@ fn durable_session_receipts_are_bound_to_exact_turn_intent() {
             .is_err()
     );
 
+    let usage = EffectUsage::measured(
+        ResourceVector::default()
+            .iterations(1)
+            .agent_calls(1)
+            .agent_concurrency(1)
+            .artifact_bytes(10),
+    );
     let valid = EffectReceipt::for_session_turn(
         &session(),
         turn_id,
         &prompt_digest,
         0,
         SessionTurnOutcome::End,
+        usage.clone(),
+        usage.clone(),
     );
     let epoch = malformed.run.controller_epoch;
     let operation = malformed.run.operations.get_mut(&operation_id).unwrap();
+    operation.reservation = Some(usage.resources.clone());
     operation.receipt = Some(valid.clone());
     operation.active_attempt = Some(OperationAttempt {
         attempt: 1,
@@ -230,8 +367,398 @@ fn durable_session_receipts_are_bound_to_exact_turn_intent() {
         &prompt_digest,
         0,
         SessionTurnOutcome::End,
+        &usage,
     );
     assert_eq!(valid.settlement_id.as_deref(), Some(expected.as_str()));
+}
+
+#[test]
+fn session_turn_applied_without_usage_is_deduplicated_and_recovery_fenced() {
+    let (_directory, mut controller) = controller();
+    let created = create(&mut controller);
+    let iteration = begin_iteration(&mut controller, &created.snapshot);
+    let operation_id = OperationId::new("missing_usage_turn").unwrap();
+    let turn_id = "missing-usage-turn";
+    let prompt_digest = "d".repeat(64);
+    let prepared = controller
+        .prepare_operation(
+            MutationRequest::new(
+                run_id(),
+                iteration.command.snapshot.run.revision,
+                command("prepare_missing_usage"),
+                PrepareOperation::new(
+                    operation_id.clone(),
+                    iteration.output.iteration_id,
+                    EffectClass::Reconcilable,
+                    EffectSpec::SessionTurn {
+                        session: session(),
+                        turn_id: turn_id.into(),
+                        prompt_digest: prompt_digest.clone(),
+                        input: artifact(None, None),
+                    },
+                ),
+            ),
+            3,
+        )
+        .unwrap();
+    let resources = ResourceVector::default()
+        .iterations(1)
+        .agent_calls(1)
+        .agent_concurrency(1)
+        .artifact_bytes(10);
+    let claimed = controller
+        .claim_effect(
+            MutationRequest::new(
+                run_id(),
+                prepared.snapshot.run.revision,
+                command("claim_missing_usage"),
+                ClaimEffect::new(operation_id.clone()).reservation(resources.clone()),
+            ),
+            4,
+        )
+        .unwrap();
+    let usage = EffectUsage::measured(resources);
+    let corrected_receipt = EffectReceipt::for_session_turn(
+        &session(),
+        turn_id,
+        &prompt_digest,
+        0,
+        SessionTurnOutcome::End,
+        usage.clone(),
+        usage,
+    );
+    let mut incomplete_receipt = corrected_receipt.clone();
+    incomplete_receipt.actual_usage = None;
+    let callback = EffectCallback::new(
+        &claimed.output,
+        EffectOutcome::Applied {
+            receipt: incomplete_receipt.clone(),
+        },
+    );
+    let first = controller.acknowledge_effect(callback.clone(), 5).unwrap();
+    let duplicate = controller.acknowledge_effect(callback, 6).unwrap();
+    assert!(!first.duplicate);
+    assert!(duplicate.duplicate);
+    assert_eq!(duplicate.snapshot.run.revision, first.snapshot.run.revision);
+    assert_eq!(first.snapshot.run.status, RunStatus::RecoveryRequired);
+    assert_eq!(
+        first.snapshot.run.operations[&operation_id].state,
+        OperationState::Uncertain
+    );
+    assert_eq!(
+        first.snapshot.run.operations[&operation_id].receipt,
+        Some(incomplete_receipt)
+    );
+
+    let reconciled = controller
+        .reconcile_effect(
+            MutationRequest::new(
+                run_id(),
+                first.snapshot.run.revision,
+                command("reconcile_missing_usage"),
+                ReconcileEffect::new(
+                    operation_id,
+                    ReconcileDecision::Applied {
+                        receipt: corrected_receipt,
+                    },
+                ),
+            ),
+            7,
+        )
+        .unwrap();
+    assert_eq!(reconciled.snapshot.run.status, RunStatus::RecoveryRequired);
+}
+
+#[test]
+fn session_turn_budget_overrun_is_durably_fenced_for_recovery() {
+    let (_directory, mut controller) = controller();
+    let created = create(&mut controller);
+    let iteration = begin_iteration(&mut controller, &created.snapshot);
+    let operation_id = OperationId::new("overrun_turn").unwrap();
+    let turn_id = "overrun-turn";
+    let prompt_digest = "d".repeat(64);
+    let prepared = controller
+        .prepare_operation(
+            MutationRequest::new(
+                run_id(),
+                iteration.command.snapshot.run.revision,
+                command("prepare_overrun"),
+                PrepareOperation::new(
+                    operation_id.clone(),
+                    iteration.output.iteration_id,
+                    EffectClass::Reconcilable,
+                    EffectSpec::SessionTurn {
+                        session: session(),
+                        turn_id: turn_id.into(),
+                        prompt_digest: prompt_digest.clone(),
+                        input: artifact(None, None),
+                    },
+                ),
+            ),
+            3,
+        )
+        .unwrap();
+    let reservation = ResourceVector::default()
+        .iterations(1)
+        .agent_calls(1)
+        .agent_concurrency(1)
+        .tokens(10)
+        .artifact_bytes(10);
+    let claimed = controller
+        .claim_effect(
+            MutationRequest::new(
+                run_id(),
+                prepared.snapshot.run.revision,
+                command("claim_overrun"),
+                ClaimEffect::new(operation_id.clone()).reservation(reservation.clone()),
+            ),
+            4,
+        )
+        .unwrap();
+    let actual = EffectUsage::measured(
+        ResourceVector::default()
+            .iterations(1)
+            .agent_calls(1)
+            .agent_concurrency(1)
+            .tokens(11)
+            .artifact_bytes(10),
+    );
+    let receipt = EffectReceipt::for_session_turn(
+        &session(),
+        turn_id,
+        &prompt_digest,
+        0,
+        SessionTurnOutcome::End,
+        actual.clone(),
+        actual,
+    );
+    let acknowledged = controller
+        .acknowledge_effect(
+            EffectCallback::new(
+                &claimed.output,
+                EffectOutcome::Applied {
+                    receipt: receipt.clone(),
+                },
+            ),
+            5,
+        )
+        .unwrap();
+    assert_eq!(
+        acknowledged.snapshot.run.status,
+        RunStatus::RecoveryRequired
+    );
+    assert_eq!(
+        acknowledged.snapshot.run.operations[&operation_id].state,
+        OperationState::Uncertain
+    );
+    assert_eq!(
+        acknowledged.snapshot.run.operations[&operation_id].receipt,
+        Some(receipt.clone())
+    );
+    assert!(matches!(
+        controller.reconcile_effect(
+            MutationRequest::new(
+                run_id(),
+                acknowledged.snapshot.run.revision,
+                command("reconcile_overrun_not_applied"),
+                ReconcileEffect::new(operation_id.clone(), ReconcileDecision::NotApplied),
+            ),
+            6,
+        ),
+        Err(RunError::InvalidTransition(_))
+    ));
+    let still_uncertain = controller.get_run(&run_id()).unwrap();
+    assert_eq!(
+        still_uncertain.run.revision, acknowledged.snapshot.run.revision,
+        "NotApplied must not consume a revision when Applied evidence is retained"
+    );
+    assert_eq!(
+        still_uncertain.run.operations[&operation_id].state,
+        OperationState::Uncertain
+    );
+    assert_eq!(
+        still_uncertain.run.operations[&operation_id].receipt,
+        Some(receipt.clone())
+    );
+    assert!(matches!(
+        controller.finish_recovery(
+            MutationRequest::new(
+                run_id(),
+                still_uncertain.run.revision,
+                command("finish_overrun_while_uncertain"),
+                RecoveryResolution::new(true, true),
+            ),
+            7,
+        ),
+        Err(RunError::InvalidTransition(_))
+    ));
+    assert_eq!(
+        controller
+            .reconcile_effect(
+                MutationRequest::new(
+                    run_id(),
+                    still_uncertain.run.revision,
+                    command("reconcile_overrun"),
+                    ReconcileEffect::new(
+                        operation_id.clone(),
+                        ReconcileDecision::Applied {
+                            receipt: receipt.clone(),
+                        },
+                    ),
+                ),
+                8,
+            )
+            .unwrap_err(),
+        RunError::Budget
+    );
+    let after_overrun = controller.get_run(&run_id()).unwrap();
+    assert_eq!(after_overrun.run.status, RunStatus::RecoveryRequired);
+    assert_eq!(
+        after_overrun.run.revision, still_uncertain.run.revision,
+        "rejected overrun evidence must remain correctable"
+    );
+    let corrected_usage = EffectUsage::measured(reservation);
+    let corrected = controller
+        .reconcile_effect(
+            MutationRequest::new(
+                run_id(),
+                after_overrun.run.revision,
+                command("reconcile_overrun_not_applied"),
+                ReconcileEffect::new(
+                    operation_id,
+                    ReconcileDecision::Applied {
+                        receipt: EffectReceipt::for_session_turn(
+                            &session(),
+                            turn_id,
+                            &prompt_digest,
+                            0,
+                            SessionTurnOutcome::End,
+                            corrected_usage.clone(),
+                            corrected_usage,
+                        ),
+                    },
+                ),
+            ),
+            9,
+        )
+        .unwrap();
+    let finished = controller
+        .finish_recovery(
+            MutationRequest::new(
+                run_id(),
+                corrected.snapshot.run.revision,
+                command("finish_corrected_overrun"),
+                RecoveryResolution::new(true, true),
+            ),
+            10,
+        )
+        .unwrap();
+    assert_eq!(finished.snapshot.run.status, RunStatus::Active);
+    assert_eq!(finished.snapshot.run.usage.tokens, 10);
+}
+
+#[test]
+fn unknown_usage_is_allowed_only_by_an_explicitly_unbounded_dimension() {
+    let (_directory, mut controller) = controller();
+    let mut request = create_request();
+    request.command_id = command("create_unbounded_usage");
+    request.run_id = Some(RunId::new("run_unknown_usage").unwrap());
+    request.budget.tokens = u64::MAX;
+    let run_id = request.run_id.clone().unwrap();
+    let created = controller.create_run(request, 1).unwrap();
+    let context = IterationContextManifest::new(
+        created.snapshot.run.revision,
+        created.snapshot.run.current_strategy_revision,
+        created.snapshot.run.verifier_policy_digest.clone(),
+        "model-v1",
+        "workspace-v1",
+    );
+    let iteration = controller
+        .begin_iteration(
+            MutationRequest::new(
+                run_id.clone(),
+                created.snapshot.run.revision,
+                command("begin_unknown_usage"),
+                BeginIteration::new(context),
+            ),
+            2,
+        )
+        .unwrap();
+    let operation_id = OperationId::new("unknown_usage_turn").unwrap();
+    let prompt_digest = "e".repeat(64);
+    let prepared = controller
+        .prepare_operation(
+            MutationRequest::new(
+                run_id.clone(),
+                iteration.command.snapshot.run.revision,
+                command("prepare_unknown_usage"),
+                PrepareOperation::new(
+                    operation_id.clone(),
+                    iteration.output.iteration_id,
+                    EffectClass::Reconcilable,
+                    EffectSpec::SessionTurn {
+                        session: session(),
+                        turn_id: "unknown-usage-turn".into(),
+                        prompt_digest: prompt_digest.clone(),
+                        input: artifact(None, None),
+                    },
+                ),
+            ),
+            3,
+        )
+        .unwrap();
+    let resources = ResourceVector::default()
+        .iterations(1)
+        .agent_calls(1)
+        .agent_concurrency(1)
+        .artifact_bytes(10);
+    let claimed = controller
+        .claim_effect(
+            MutationRequest::new(
+                run_id.clone(),
+                prepared.snapshot.run.revision,
+                command("claim_unknown_usage"),
+                ClaimEffect::new(operation_id).reservation(resources.clone()),
+            ),
+            4,
+        )
+        .unwrap();
+    let usage = EffectUsage::measured(resources.clone()).unknown([ResourceDimension::Tokens]);
+    let receipt = EffectReceipt::for_session_turn(
+        &session(),
+        "unknown-usage-turn",
+        &prompt_digest,
+        0,
+        SessionTurnOutcome::End,
+        usage.clone(),
+        usage,
+    );
+    let acknowledged = controller
+        .acknowledge_effect(
+            EffectCallback::new(&claimed.output, EffectOutcome::Applied { receipt }),
+            5,
+        )
+        .unwrap();
+    let finished = controller
+        .finish_iteration(
+            FinishIteration::new(
+                &iteration.output,
+                false,
+                "usage remains explicit",
+                GoalVerdict::NotAchieved,
+                resources,
+            ),
+            6,
+        )
+        .unwrap();
+    assert_eq!(acknowledged.snapshot.run.status, RunStatus::Active);
+    assert!(
+        finished
+            .snapshot
+            .run
+            .usage_unknown
+            .contains(&ResourceDimension::Tokens)
+    );
 }
 
 #[test]
@@ -294,9 +821,23 @@ fn sqlite_cas_allows_only_one_stale_writer() {
     let mut first = created.snapshot.clone();
     first.run.revision = RunRevision::new(2);
     first.run.status = RunStatus::UserPaused;
+    first.run.event_cursor = RunEventCursor::new(2);
+    first.events.push_back(RunEvent {
+        cursor: RunEventCursor::new(2),
+        revision: RunRevision::new(2),
+        kind: RunEventKind::new("cas_first").unwrap(),
+        at_ms: 2,
+    });
     let mut second = created.snapshot.clone();
     second.run.revision = RunRevision::new(2);
     second.run.status = RunStatus::Blocked;
+    second.run.event_cursor = RunEventCursor::new(2);
+    second.events.push_back(RunEvent {
+        cursor: RunEventCursor::new(2),
+        revision: RunRevision::new(2),
+        kind: RunEventKind::new("cas_second").unwrap(),
+        at_ms: 2,
+    });
 
     let store_a = LocalRunStore::new(directory.path()).unwrap();
     let store_b = LocalRunStore::new(directory.path()).unwrap();
@@ -358,6 +899,10 @@ impl ScriptedStore {
 
     fn fail(&self, mode: FailureMode) {
         *self.mode.lock().unwrap() = mode;
+    }
+
+    fn replace(&self, envelope: RunEnvelope) {
+        *self.state.lock().unwrap() = Some(envelope);
     }
 }
 
@@ -512,6 +1057,112 @@ fn cache_changes_only_after_acknowledged_commit_and_unknown_commit_fences_author
 }
 
 #[test]
+fn failed_reload_keeps_identity_and_authority_fences_until_valid_replacement() {
+    let store = ScriptedStore::new();
+    let mut controller = RunController::open(store.clone()).unwrap();
+    let created = controller.create_run(create_request(), 1).unwrap();
+    store.fail(FailureMode::UnknownCommit);
+    assert!(matches!(
+        controller.control_run(
+            MutationRequest::new(
+                run_id(),
+                created.snapshot.run.revision,
+                command("reload_fence_pause"),
+                RunAction::Pause,
+            ),
+            2,
+        ),
+        Err(RunError::CommitUnknown(_))
+    ));
+    store.fail(FailureMode::Healthy);
+
+    let mut wrong_identity = created.snapshot.clone();
+    wrong_identity.run.id = RunId::new("different_run").unwrap();
+    store.replace(wrong_identity);
+    assert!(matches!(
+        controller.reload_run(&run_id()),
+        Err(RunError::Integrity(_))
+    ));
+    assert_eq!(
+        controller
+            .begin_recovery(
+                MutationRequest::new(
+                    run_id(),
+                    created.snapshot.run.revision,
+                    command("reload_wrong_id_recovery"),
+                    (),
+                ),
+                3,
+            )
+            .unwrap_err(),
+        RunError::ReloadRequired
+    );
+    assert_eq!(
+        controller.get_run(&run_id()).unwrap().run.revision,
+        created.snapshot.run.revision
+    );
+
+    let mut malformed = created.snapshot.clone();
+    malformed.run.event_cursor = RunEventCursor::new(2);
+    store.replace(malformed);
+    assert!(matches!(
+        controller.reload_run(&run_id()),
+        Err(RunError::Integrity(_))
+    ));
+    assert_eq!(
+        controller
+            .begin_recovery(
+                MutationRequest::new(
+                    run_id(),
+                    created.snapshot.run.revision,
+                    command("reload_invalid_recovery"),
+                    (),
+                ),
+                4,
+            )
+            .unwrap_err(),
+        RunError::ReloadRequired
+    );
+
+    store.replace(created.snapshot.clone());
+    let reloaded = controller.reload_run(&run_id()).unwrap().unwrap();
+    let recovery = controller
+        .begin_recovery(
+            MutationRequest::new(
+                run_id(),
+                reloaded.run.revision,
+                command("reload_valid_recovery"),
+                (),
+            ),
+            5,
+        )
+        .unwrap();
+    let resumed = controller
+        .finish_recovery(
+            MutationRequest::new(
+                run_id(),
+                recovery.snapshot.run.revision,
+                command("reload_valid_finish_recovery"),
+                RecoveryResolution::new(true, false),
+            ),
+            6,
+        )
+        .unwrap();
+    let paused = controller
+        .control_run(
+            MutationRequest::new(
+                run_id(),
+                resumed.snapshot.run.revision,
+                command("reload_valid_pause"),
+                RunAction::Pause,
+            ),
+            7,
+        )
+        .unwrap();
+    assert_eq!(paused.snapshot.run.status, RunStatus::UserPaused);
+}
+
+#[test]
 fn restart_never_replays_a_duplicate_claim_handle() {
     let directory = tempfile::tempdir().unwrap();
     let store = LocalRunStore::new(directory.path()).unwrap();
@@ -543,7 +1194,8 @@ fn restart_never_replays_a_duplicate_claim_handle() {
         run_id(),
         prepared.snapshot.run.revision,
         command("claim_restart"),
-        ClaimEffect::new(operation_id.clone()),
+        ClaimEffect::new(operation_id.clone())
+            .reservation(ResourceVector::default().agent_calls(1)),
     );
     let claimed = controller.claim_effect(claim_request.clone(), 4).unwrap();
     drop(controller);
@@ -698,7 +1350,8 @@ fn late_unknown_after_cancel_recovers_back_to_cancelled() {
                 run_id(),
                 prepared.snapshot.run.revision,
                 command("late_cancel_claim"),
-                ClaimEffect::new(operation_id.clone()),
+                ClaimEffect::new(operation_id.clone())
+                    .reservation(ResourceVector::default().agent_calls(1)),
             ),
             4,
         )
@@ -754,6 +1407,177 @@ fn late_unknown_after_cancel_recovers_back_to_cancelled() {
         )
         .unwrap();
     assert_eq!(finished.snapshot.run.status, RunStatus::Cancelled);
+}
+
+#[test]
+fn cancelled_run_cannot_tombstone_late_applied_usage_before_recovery() {
+    let (_directory, mut controller) = controller();
+    let created = create(&mut controller);
+    let iteration = begin_iteration(&mut controller, &created.snapshot);
+    let operation_id = OperationId::new("late_applied_cancel_operation").unwrap();
+    let turn_id = "late_applied_cancel_turn";
+    let prompt_digest = "e".repeat(64);
+    let prepared = controller
+        .prepare_operation(
+            MutationRequest::new(
+                run_id(),
+                iteration.command.snapshot.run.revision,
+                command("late_applied_cancel_prepare"),
+                PrepareOperation::new(
+                    operation_id.clone(),
+                    iteration.output.iteration_id,
+                    EffectClass::Reconcilable,
+                    EffectSpec::SessionTurn {
+                        session: session(),
+                        turn_id: turn_id.into(),
+                        prompt_digest: prompt_digest.clone(),
+                        input: artifact(None, None),
+                    },
+                ),
+            ),
+            3,
+        )
+        .unwrap();
+    let reservation = ResourceVector::default()
+        .iterations(1)
+        .agent_calls(1)
+        .agent_concurrency(1)
+        .active_ms(100)
+        .wall_ms(100)
+        .tokens(100)
+        .cost_micros(100)
+        .artifact_bytes(100);
+    let claimed = controller
+        .claim_effect(
+            MutationRequest::new(
+                run_id(),
+                prepared.snapshot.run.revision,
+                command("late_applied_cancel_claim"),
+                ClaimEffect::new(operation_id.clone()).reservation(reservation),
+            ),
+            4,
+        )
+        .unwrap();
+    let cancelled = controller
+        .control_run(
+            MutationRequest::new(
+                run_id(),
+                claimed.command.snapshot.run.revision,
+                command("late_applied_cancel"),
+                RunAction::Cancel,
+            ),
+            5,
+        )
+        .unwrap();
+    assert_eq!(cancelled.snapshot.run.status, RunStatus::Cancelled);
+    let usage = EffectUsage::measured(
+        ResourceVector::default()
+            .iterations(1)
+            .agent_calls(1)
+            .agent_concurrency(1)
+            .active_ms(10)
+            .wall_ms(20)
+            .tokens(30)
+            .cost_micros(40)
+            .artifact_bytes(10),
+    );
+    let late = controller
+        .acknowledge_effect(
+            EffectCallback::new(
+                &claimed.output,
+                EffectOutcome::Applied {
+                    receipt: EffectReceipt::for_session_turn(
+                        &session(),
+                        turn_id,
+                        &prompt_digest,
+                        0,
+                        SessionTurnOutcome::End,
+                        usage.clone(),
+                        usage.clone(),
+                    ),
+                },
+            ),
+            6,
+        )
+        .unwrap();
+    assert_eq!(late.snapshot.run.status, RunStatus::Cancelled);
+    assert_eq!(
+        late.snapshot.run.operations[&operation_id].state,
+        OperationState::Acknowledged
+    );
+    assert!(late.snapshot.run.active_iteration.is_some());
+    assert!(late.snapshot.run.usage.is_zero());
+    for (index, action) in [RunAction::ClaimTerminalReport, RunAction::Tombstone]
+        .into_iter()
+        .enumerate()
+    {
+        assert!(matches!(
+            controller.control_run(
+                MutationRequest::new(
+                    run_id(),
+                    late.snapshot.run.revision,
+                    command(&format!("late_applied_terminal_guard_{index}")),
+                    action,
+                ),
+                7 + index as u64,
+            ),
+            Err(RunError::InvalidTransition(_))
+        ));
+    }
+
+    let recovery = controller
+        .begin_recovery(
+            MutationRequest::new(
+                run_id(),
+                late.snapshot.run.revision,
+                command("late_applied_cancel_recovery"),
+                (),
+            ),
+            9,
+        )
+        .unwrap();
+    assert_eq!(
+        recovery.snapshot.run.recovery_prior_status,
+        Some(RunStatus::Cancelled)
+    );
+    let finished = controller
+        .finish_recovery(
+            MutationRequest::new(
+                run_id(),
+                recovery.snapshot.run.revision,
+                command("late_applied_cancel_recovery_finish"),
+                RecoveryResolution::new(false, true),
+            ),
+            10,
+        )
+        .unwrap();
+    assert_eq!(finished.snapshot.run.status, RunStatus::Cancelled);
+    assert!(finished.snapshot.run.active_iteration.is_none());
+    assert_eq!(finished.snapshot.run.usage, usage.resources);
+
+    let reported = controller
+        .control_run(
+            MutationRequest::new(
+                run_id(),
+                finished.snapshot.run.revision,
+                command("late_applied_terminal_report"),
+                RunAction::ClaimTerminalReport,
+            ),
+            11,
+        )
+        .unwrap();
+    let tombstoned = controller
+        .control_run(
+            MutationRequest::new(
+                run_id(),
+                reported.snapshot.run.revision,
+                command("late_applied_tombstone"),
+                RunAction::Tombstone,
+            ),
+            12,
+        )
+        .unwrap();
+    assert_eq!(tombstoned.snapshot.run.status, RunStatus::Tombstoned);
 }
 
 #[test]
@@ -903,7 +1727,8 @@ fn late_unknown_after_pause_recovers_back_to_paused() {
                 run_id(),
                 prepared.snapshot.run.revision,
                 command("late_pause_claim"),
-                ClaimEffect::new(operation_id.clone()),
+                ClaimEffect::new(operation_id.clone())
+                    .reservation(ResourceVector::default().agent_calls(1)),
             ),
             4,
         )
@@ -1001,7 +1826,8 @@ fn effect_must_be_committed_and_claimed_and_callbacks_are_fenced_and_deduplicate
                 run_id(),
                 prepared.snapshot.run.revision,
                 command("claim"),
-                ClaimEffect::new(operation_id.clone()),
+                ClaimEffect::new(operation_id.clone())
+                    .reservation(ResourceVector::default().iterations(1).agent_calls(1)),
             ),
             4,
         )
@@ -1025,10 +1851,107 @@ fn effect_must_be_committed_and_claimed_and_callbacks_are_fenced_and_deduplicate
         RunError::StaleEpoch
     );
     let first = controller.acknowledge_effect(callback.clone(), 5).unwrap();
-    let duplicate = controller.acknowledge_effect(callback, 6).unwrap();
+    let duplicate = controller.acknowledge_effect(callback.clone(), 6).unwrap();
     assert!(!first.duplicate);
     assert!(duplicate.duplicate);
     assert_eq!(duplicate.snapshot.run.revision, first.snapshot.run.revision);
+    assert_eq!(first.snapshot.run.status, RunStatus::RecoveryRequired);
+    assert_eq!(
+        first.snapshot.run.operations[&operation_id].state,
+        OperationState::Uncertain
+    );
+    assert!(
+        first.snapshot.run.operations[&operation_id]
+            .receipt
+            .as_ref()
+            .is_some_and(|receipt| receipt.actual_usage.is_none()),
+        "an applied generic effect without usage is retained but recovery-fenced"
+    );
+
+    let mut abandoned_with_receipt = first.snapshot.clone();
+    abandoned_with_receipt
+        .run
+        .operations
+        .get_mut(&operation_id)
+        .unwrap()
+        .state = OperationState::Abandoned;
+    assert!(abandoned_with_receipt.validate().is_err());
+
+    assert!(matches!(
+        controller.reconcile_effect(
+            MutationRequest::new(
+                run_id(),
+                first.snapshot.run.revision,
+                command("generic_applied_reconcile"),
+                ReconcileEffect::new(operation_id.clone(), ReconcileDecision::NotApplied),
+            ),
+            7,
+        ),
+        Err(RunError::InvalidTransition(_))
+    ));
+    let still_uncertain = controller.get_run(&run_id()).unwrap();
+    assert_eq!(
+        still_uncertain.run.revision, first.snapshot.run.revision,
+        "NotApplied must not consume a revision when Applied evidence is retained"
+    );
+    assert_eq!(
+        still_uncertain.run.operations[&operation_id].state,
+        OperationState::Uncertain
+    );
+    assert!(
+        still_uncertain.run.operations[&operation_id]
+            .receipt
+            .is_some()
+    );
+    let duplicate_after_rejected = controller.acknowledge_effect(callback, 8).unwrap();
+    assert!(duplicate_after_rejected.duplicate);
+    assert_eq!(
+        duplicate_after_rejected.snapshot.run.revision,
+        still_uncertain.run.revision
+    );
+    assert!(matches!(
+        controller.finish_recovery(
+            MutationRequest::new(
+                run_id(),
+                still_uncertain.run.revision,
+                command("finish_generic_while_uncertain"),
+                RecoveryResolution::new(true, true),
+            ),
+            9,
+        ),
+        Err(RunError::InvalidTransition(_))
+    ));
+
+    let usage = EffectUsage::measured(ResourceVector::default().iterations(1).agent_calls(1));
+    let reconciled = controller
+        .reconcile_effect(
+            MutationRequest::new(
+                run_id(),
+                still_uncertain.run.revision,
+                command("generic_applied_reconcile"),
+                ReconcileEffect::new(
+                    operation_id,
+                    ReconcileDecision::Applied {
+                        receipt: EffectReceipt::new("receipt-1").actual_usage(usage.clone()),
+                    },
+                ),
+            ),
+            10,
+        )
+        .unwrap();
+    let finished = controller
+        .finish_recovery(
+            MutationRequest::new(
+                run_id(),
+                reconciled.snapshot.run.revision,
+                command("finish_generic_with_usage"),
+                RecoveryResolution::new(true, true),
+            ),
+            11,
+        )
+        .unwrap();
+    assert_eq!(finished.snapshot.run.status, RunStatus::Active);
+    assert_eq!(finished.snapshot.run.usage, usage.resources);
 }
 
 #[test]
@@ -1065,7 +1988,8 @@ fn cancelled_run_reconciles_inflight_effect_before_restoring_terminal_status() {
                 run_id(),
                 prepared.snapshot.run.revision,
                 command("claim_cancelled"),
-                ClaimEffect::new(operation_id.clone()),
+                ClaimEffect::new(operation_id.clone())
+                    .reservation(ResourceVector::default().iterations(1).agent_calls(1)),
             ),
             4,
         )
@@ -1110,7 +2034,11 @@ fn cancelled_run_reconciles_inflight_effect_before_restoring_terminal_status() {
                 ReconcileEffect::new(
                     operation_id,
                     ReconcileDecision::Applied {
-                        receipt: EffectReceipt::new("cancelled-effect-receipt"),
+                        receipt: EffectReceipt::new("cancelled-effect-receipt").actual_usage(
+                            EffectUsage::measured(
+                                ResourceVector::default().iterations(1).agent_calls(1),
+                            ),
+                        ),
                     },
                 ),
             ),
@@ -1123,8 +2051,7 @@ fn cancelled_run_reconciles_inflight_effect_before_restoring_terminal_status() {
                 run_id(),
                 reconciled.snapshot.run.revision,
                 command("finish_cancelled"),
-                RecoveryResolution::new(false, true)
-                    .recovered_usage(ResourceVector::default().iterations(1).agent_calls(1)),
+                RecoveryResolution::new(false, true),
             ),
             8,
         )
@@ -1135,8 +2062,9 @@ fn cancelled_run_reconciles_inflight_effect_before_restoring_terminal_status() {
 }
 
 #[test]
-fn uncertain_non_repeatable_effect_requires_recovery() {
-    let (_directory, mut controller) = controller();
+fn uncertain_non_repeatable_effect_recovers_only_with_typed_usage() {
+    let store = ScriptedStore::new();
+    let mut controller = RunController::open(store.clone()).unwrap();
     let created = create(&mut controller);
     let iteration = begin_iteration(&mut controller, &created.snapshot);
     let operation_id = OperationId::new("op_nonrepeatable").unwrap();
@@ -1166,7 +2094,8 @@ fn uncertain_non_repeatable_effect_requires_recovery() {
                 run_id(),
                 prepared.snapshot.run.revision,
                 command("claim_nonrepeatable"),
-                ClaimEffect::new(operation_id.clone()),
+                ClaimEffect::new(operation_id.clone())
+                    .reservation(ResourceVector::default().iterations(1).agent_calls(1)),
             ),
             4,
         )
@@ -1187,6 +2116,92 @@ fn uncertain_non_repeatable_effect_requires_recovery() {
         result.snapshot.run.operations[&operation_id].state,
         OperationState::Uncertain
     );
+
+    let missing_usage = controller.reconcile_effect(
+        MutationRequest::new(
+            run_id(),
+            result.snapshot.run.revision,
+            command("reconcile_nonrepeatable_missing_usage"),
+            ReconcileEffect::new(
+                operation_id.clone(),
+                ReconcileDecision::Applied {
+                    receipt: EffectReceipt::new("nonrepeatable-applied"),
+                },
+            ),
+        ),
+        6,
+    );
+    assert!(matches!(missing_usage, Err(RunError::InvalidTransition(_))));
+    let still_uncertain = controller.get_run(&run_id()).unwrap();
+    assert_eq!(
+        still_uncertain.run.revision, result.snapshot.run.revision,
+        "rejected evidence must not consume a revision or reconciliation command"
+    );
+    assert_eq!(
+        still_uncertain.run.operations[&operation_id].state,
+        OperationState::Uncertain
+    );
+
+    let usage = EffectUsage::measured(ResourceVector::default().iterations(1).agent_calls(1));
+    let reconciled = controller
+        .reconcile_effect(
+            MutationRequest::new(
+                run_id(),
+                still_uncertain.run.revision,
+                command("reconcile_nonrepeatable_with_usage"),
+                ReconcileEffect::new(
+                    operation_id.clone(),
+                    ReconcileDecision::Applied {
+                        receipt: EffectReceipt::new("nonrepeatable-applied")
+                            .actual_usage(usage.clone()),
+                    },
+                ),
+            ),
+            7,
+        )
+        .unwrap();
+    assert_eq!(
+        reconciled.snapshot.run.operations[&operation_id].state,
+        OperationState::Reconciled
+    );
+
+    let mut malformed_reload = reconciled.snapshot.clone();
+    malformed_reload
+        .run
+        .operations
+        .get_mut(&operation_id)
+        .unwrap()
+        .receipt
+        .as_mut()
+        .unwrap()
+        .actual_usage = None;
+    assert!(malformed_reload.validate().is_err());
+
+    let mut above_budget_reload = reconciled.snapshot.clone();
+    above_budget_reload.run.budget.agent_calls = 0;
+    assert!(above_budget_reload.validate().is_err());
+
+    let finished = controller
+        .finish_recovery(
+            MutationRequest::new(
+                run_id(),
+                reconciled.snapshot.run.revision,
+                command("finish_nonrepeatable_recovery"),
+                RecoveryResolution::new(true, true),
+            ),
+            8,
+        )
+        .unwrap();
+    assert_eq!(finished.snapshot.run.status, RunStatus::Active);
+    assert_eq!(finished.snapshot.run.usage, usage.resources);
+    assert!(finished.snapshot.run.active_iteration.is_none());
+
+    store.replace(malformed_reload);
+    drop(controller);
+    assert!(matches!(
+        RunController::open(store),
+        Err(RunError::Integrity(_))
+    ));
 }
 
 #[test]

@@ -39,14 +39,18 @@ The event receiver provides push delivery. `events_after` reads the same bounded
 This revision implements one executable driver, `AutonomousTurnLoop`, end to end:
 
 1. A Host creates a Run and invokes a bounded `AutonomousActivation`. The SDK freezes the iteration context and builds the next goal prompt.
-2. The SDK commits the Session Turn intent and fenced outbox claim before calling `Runtime::prompt`. Effect class is fixed by the capability implementation, not selected by model output.
-3. `Runtime::prompt` durably writes Pending and Completed SessionLedger entries around native dispatch. The Run accepts only an exact typed receipt bound to Session, Turn ID, prompt digest, prompt index, outcome, and settlement ID.
+2. The SDK commits the Session Turn intent and a fenced claim with a durable resource reservation before calling `Runtime::prompt`. Effect class is fixed by SDK driver code, not selected by model output.
+3. `Runtime::prompt` durably writes Pending and Completed SessionLedger entries around native dispatch. Completed entries bind provider-derived usage into the settlement identity; missing, incomplete, or partial accounting remains typed unknown usage rather than zero. The Run accepts only an exact typed receipt bound to Session, Turn ID, prompt digest, prompt index, outcome, usage, and settlement ID.
 4. Gates and the skeptic `GoalVerifier` decide whether an iteration may complete the Run. Reaching an iteration/agent budget produces `Waiting(BudgetExhausted)`, never success.
 5. On restart, the previous controller epoch is fenced before SessionLedger/rewind reconciliation. Missing, conflicting, merely Discarded, or otherwise uncertain evidence remains `Recovering`; an uncertain Turn is never guessed or silently repeated. Paused, waiting, cancelled, and failed states survive reconciliation and require an explicit Resume where applicable.
 
 The public façade exposes `create_run`, `get_run`, `list_runs`, `list_recoverable_runs`, `control_run`, `wake_run`, `attach_run`, `reconcile_run`, `resolve_run_recovery`, and `autonomous_turn_loop(...).activate(...)`. Low-level prepare/claim/acknowledge/iteration choreography is intentionally not part of the normal SDK façade. `RunId`, `RunRevision`, `RunEventCursor`, `ControllerEpoch`, `OperationId`, and `IterationId` use distinct Rust types and namespaces; Session `Event.sequence` is not a Run cursor. `attach_run` falls back to `RunAttach::Snapshot` when bounded journal replay is not contiguous.
 
-The default `LocalRunStore` is a standalone SQLite authority with transactional revision CAS. `Runtime::start_with_run_store` and `RuntimeBuilder::run_store` replace it with one Host-provided authority; they do not mirror or write through to a second store. A custom store must atomically commit snapshot, event journal, command receipt, and outbox state, and must report acknowledgement uncertainty as `CommitUnknown`.
+The default `LocalRunStore` is a standalone SQLite authority with transactional revision CAS. `Runtime::start_with_run_store` and `RuntimeBuilder::run_store` replace **only that Run SQLite store** with one Host-provided authority; they do not mirror or write through to a second Run store. A custom store must atomically commit snapshot, event journal, command receipt, and outbox state, and must report acknowledgement uncertainty as `CommitUnknown`.
+
+This is not a remote-only Runtime mode. Startup still creates `grok_home` and `session_storage`; the native session, SessionLedger, and rewind receipts remain local-filesystem authorities for conversation and Turn evidence. A Host that needs remote workers must place or synchronize that local session storage consistently in addition to implementing `RunStore`. Injecting `RunStore` alone does not relocate those authorities.
+
+`AutonomousTurnLoop` currently has enforceable exact upper bounds only for iteration count, agent calls, and concurrency. Until a model/runtime capability contract supplies enforceable per-Turn maxima, finite `tokens`, `cost_micros`, `active_ms`, `wall_ms`, or `artifact_bytes` budgets are rejected before an iteration or prompt is dispatched. Use `u64::MAX` to mark those dimensions explicitly unbounded. Actual typed usage is still settled and recorded; an overrun or unknown value against a finite reservation durably enters recovery rather than being treated as free work.
 
 | SDK owns | Embedding Host owns |
 |---|---|
@@ -59,9 +63,9 @@ The default `LocalRunStore` is a standalone SQLite authority with transactional 
 
 The target SDK architecture still includes heartbeat/schedule runtime semantics, background worker claim/resume/wake residency, child Runs and A2A mailbox, context/artifact policy and compaction, skills, an independent mutable Harness aggregate with immutable `HarnessSnapshot` pinning/refinement/history/rollback, bounded Rhai workflow execution, and a `ProgramRuntime`/`PersistentKernelDriver` boundary for persistent programmable environments. Kernel/VM snapshots may be best effort; durable truth will remain explicit Run state, artifacts, handles, effects, and receipts. Rhai will be a bounded workflow driver, not a claim of RLM/IPython equivalence.
 
-Some lifecycle support types reserve future driver, child, mailbox, and revision concepts, but they are not wired through the SDK façade and are not claimed as working parity. Run schema v1 rejects non-`AutonomousTurnLoop` creation. `HarnessDescriptor` negotiation and provider credential rotation are also unimplemented additive follow-ups, not hidden behavior in this release.
+Some lifecycle support types reserve future driver, child, mailbox, and revision concepts, but they are not wired through the SDK façade and are not claimed as working parity. Run schema v2 rejects non-`AutonomousTurnLoop` creation. Schema v1 Run SQLite databases and envelopes are rejected rather than silently upgraded because v1 lacks durable reservations and usage-bound receipts; migration requires an explicit offline policy. `HarnessDescriptor` negotiation and provider credential rotation are also unimplemented additive follow-ups, not hidden behavior in this release.
 
-The first Run schema uses non-exhaustive public enums/DTO constructors, checked identifier deserialization, conservative unknown-value handling, validated envelope deserialization, and a checked-in v1 golden fixture.
+The Run API uses non-exhaustive public enums/DTO constructors, checked identifier deserialization, conservative unknown-value handling, and a checked-in fixture documenting the current v2 shape. Durable JSON must enter through bounded, validated `RunEnvelope::from_json_slice` or `RunEnvelope::from_json_reader`; generic serde deserialization performs recursive schema validation but cannot impose a source-byte limit. The same-revision fixture is not described as historical compatibility evidence; release fixtures become immutable only after their originating release ships.
 
 ## Agent API coverage
 
@@ -117,6 +121,13 @@ Capability descriptors describe public typed SDK features, not every internal sh
 ## Public release status
 
 This repository can be published as an Apache-2.0 source release or consumed from a pinned public Git tag, provided the bundled third-party notices and upstream provenance remain intact. The crate is intentionally `publish = false`: its current `xai-grok-*` dependency closure is workspace-local and cannot yet be resolved independently by crates.io. A crates.io release requires publishing or replacing that full dependency closure, removing workspace-only patches, and validating a packaged source archive first. Do not present a Git release as a crates.io-compatible standalone package until those gates pass.
+
+Cargo patch declarations are not inherited from Git dependencies. An external full-SDK workspace such as Sophon must reproduce this repository root's exact `[patch.crates-io] async-openai` pin (or consume the repository as its workspace root); otherwise dependency resolution can select a different crates.io implementation. This is an integration and build-reproducibility requirement, not part of the Durable Run state contract.
+
+```toml
+[patch.crates-io]
+async-openai = { git = "https://github.com/our-forks/async-openai.git", rev = "95b52ebdedf42143083cf3d6f0e0be7c84e9c808" }
+```
 
 For the current upstream-synchronized release, a Rust host can pin the SDK
 without relying on a moving branch:

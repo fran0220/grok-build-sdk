@@ -65,6 +65,15 @@ fn to_acp_mcp_server(server: &crate::McpServerConfig) -> acp::McpServer {
 }
 type Reply<T> = oneshot::Sender<Result<T, Error>>;
 type SessionMeta = serde_json::Map<String, serde_json::Value>;
+type PromptUsage = xai_grok_shell::extensions::notification::PromptUsage;
+
+#[derive(Clone, Debug, PartialEq)]
+enum CapturedTurnUsage {
+    Exact(Option<PromptUsage>),
+    Conflict,
+}
+
+type TurnUsageMap = Rc<RefCell<HashMap<(String, String), CapturedTurnUsage>>>;
 enum Command {
     Create(SessionConfig, Reply<SessionId>),
     Load(SessionId, SessionConfig, Reply<()>),
@@ -617,6 +626,7 @@ struct Client {
     host_extension_methods: HashSet<String>,
     agent_hooks: HashMap<String, Arc<dyn crate::AgentHookHandler>>,
     turns: Rc<RefCell<HashMap<String, String>>>,
+    turn_usages: TurnUsageMap,
     replay: Rc<RefCell<HashMap<String, ReplayMode>>>,
 }
 
@@ -848,6 +858,49 @@ enum ReplayMode {
 }
 
 impl Client {
+    fn capture_turn_usage(&self, session_id: &str, update: &serde_json::Value) -> acp::Result<()> {
+        if update
+            .get("sessionUpdate")
+            .and_then(serde_json::Value::as_str)
+            != Some("turn_completed")
+        {
+            return Ok(());
+        }
+        let Some(root_session_id) =
+            xai_grok_shell::origin_runtime::resolve_root_session(session_id, None)
+        else {
+            return Ok(());
+        };
+        if root_session_id.as_str() != session_id {
+            return Ok(());
+        }
+        let Some(turn_id) = self.turns.borrow().get(&root_session_id).cloned() else {
+            return Ok(());
+        };
+        if update.get("prompt_id").and_then(serde_json::Value::as_str) != Some(turn_id.as_str()) {
+            return Ok(());
+        }
+        let usage = update
+            .get("usage")
+            .cloned()
+            .map(serde_json::from_value)
+            .transpose()
+            .map_err(|_| acp::Error::invalid_params())?;
+        let key = (root_session_id, turn_id);
+        let mut captured = self.turn_usages.borrow_mut();
+        match captured.entry(key) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(CapturedTurnUsage::Exact(usage));
+            }
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                if entry.get() != &CapturedTurnUsage::Exact(usage) {
+                    entry.insert(CapturedTurnUsage::Conflict);
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn typed_permission_request(
         args: &acp::RequestPermissionRequest,
     ) -> acp::Result<crate::ToolPermissionRequest> {
@@ -1058,14 +1111,27 @@ fn validate_session_ledger(id: &SessionId, ledger: &SessionLedger) -> Result<(),
             LedgerTurnState::Completed {
                 outcome,
                 settlement_id,
+                usage,
             } => {
-                let expected = ledger_settlement_id(
-                    id.as_str(),
-                    &entry.turn_id,
-                    &entry.prompt_digest,
-                    entry.runtime_prompt_index,
-                    *outcome,
-                );
+                let expected = if let Some(usage) = usage {
+                    usage.validate().map_err(run_error)?;
+                    ledger_settlement_id(
+                        id.as_str(),
+                        &entry.turn_id,
+                        &entry.prompt_digest,
+                        entry.runtime_prompt_index,
+                        *outcome,
+                        usage,
+                    )?
+                } else {
+                    legacy_ledger_settlement_id(
+                        id.as_str(),
+                        &entry.turn_id,
+                        &entry.prompt_digest,
+                        entry.runtime_prompt_index,
+                        *outcome,
+                    )
+                };
                 if settlement_id != &expected {
                     return Err(Error::Operation(
                         "native Turn ledger settlement identity is invalid".into(),
@@ -1080,6 +1146,25 @@ fn validate_session_ledger(id: &SessionId, ledger: &SessionLedger) -> Result<(),
 }
 
 fn ledger_settlement_id(
+    session_id: &str,
+    turn_id: &str,
+    prompt_digest: &str,
+    runtime_prompt_index: u64,
+    outcome: TurnOutcome,
+    usage: &xai_agent_lifecycle::run::EffectUsage,
+) -> Result<String, Error> {
+    let session = xai_agent_lifecycle::run::SessionRef::new(session_id).map_err(run_error)?;
+    Ok(xai_agent_lifecycle::run::session_turn_settlement_id(
+        &session,
+        turn_id,
+        prompt_digest,
+        runtime_prompt_index,
+        crate::durable_turn_outcome(outcome),
+        usage,
+    ))
+}
+
+fn legacy_ledger_settlement_id(
     session_id: &str,
     turn_id: &str,
     prompt_digest: &str,
@@ -1103,6 +1188,58 @@ fn ledger_settlement_id(
         digest.update(field);
     }
     format!("sha256:{:x}", digest.finalize())
+}
+
+fn prompt_effect_usage(
+    usage: Option<&PromptUsage>,
+    wall_ms: u64,
+) -> xai_agent_lifecycle::run::EffectUsage {
+    use xai_agent_lifecycle::run::{EffectUsage, ResourceDimension, ResourceVector};
+
+    let mut resources = ResourceVector::default()
+        .iterations(1)
+        .agent_calls(1)
+        .agent_concurrency(1)
+        .wall_ms(wall_ms);
+    let mut unknown = std::collections::BTreeSet::from([ResourceDimension::ArtifactBytes]);
+    match usage {
+        Some(usage) if !usage.usage_is_incomplete => {
+            let totals = &usage.totals;
+            if totals.total_tokens > 0
+                && totals.model_calls > 0
+                && totals
+                    .input_tokens
+                    .checked_add(totals.output_tokens)
+                    .is_some_and(|total| total == totals.total_tokens)
+            {
+                resources.tokens = totals.total_tokens;
+            } else {
+                unknown.insert(ResourceDimension::Tokens);
+            }
+            if totals.api_duration_ms > 0 {
+                resources.active_ms = totals.api_duration_ms;
+            } else {
+                unknown.insert(ResourceDimension::ActiveMs);
+            }
+            if !totals.cost_is_partial
+                && let Some(ticks) = totals.cost_usd_ticks
+                && let Ok(ticks) = u64::try_from(ticks)
+                && let Some(micros) = ticks.checked_add(9_999).map(|value| value / 10_000)
+            {
+                resources.cost_micros = micros;
+            } else {
+                unknown.insert(ResourceDimension::CostMicros);
+            }
+        }
+        _ => {
+            unknown.extend([
+                ResourceDimension::Tokens,
+                ResourceDimension::CostMicros,
+                ResourceDimension::ActiveMs,
+            ]);
+        }
+    }
+    EffectUsage::measured(resources).unknown(unknown)
 }
 
 #[async_trait::async_trait(?Send)]
@@ -1190,6 +1327,7 @@ impl acp::Client for Client {
     async fn session_notification(&self, args: acp::SessionNotification) -> acp::Result<()> {
         let payload = serde_json::to_value(&args.update).unwrap_or(serde_json::Value::Null);
         let raw = serde_json::to_string(&payload).unwrap_or_else(|_| "null".into());
+        self.capture_turn_usage(&args.session_id.0, &payload)?;
         let update = match args.update {
             acp::SessionUpdate::UserMessageChunk(chunk) => content_update(
                 chunk.content,
@@ -1332,6 +1470,14 @@ impl acp::Client for Client {
         let raw = args.params.get().to_owned();
         let payload =
             serde_json::from_str(&raw).unwrap_or_else(|_| serde_json::Value::String(raw.clone()));
+        if args.method.as_ref() == "x.ai/session_notification"
+            && let (Some(session_id), Some(update)) = (
+                payload.get("sessionId").and_then(serde_json::Value::as_str),
+                payload.get("update"),
+            )
+        {
+            self.capture_turn_usage(session_id, update)?;
+        }
         let root = payload
             .get("sessionId")
             .and_then(|value| value.as_str())
@@ -1620,12 +1766,23 @@ struct UnloadWire {
 
 struct TurnReservation {
     turns: Rc<RefCell<HashMap<String, String>>>,
+    turn_usages: TurnUsageMap,
     session_id: String,
+    turn_id: String,
 }
 
 impl Drop for TurnReservation {
     fn drop(&mut self) {
-        self.turns.borrow_mut().remove(&self.session_id);
+        let mut turns = self.turns.borrow_mut();
+        if turns
+            .get(&self.session_id)
+            .is_some_and(|active_turn| active_turn == &self.turn_id)
+        {
+            turns.remove(&self.session_id);
+        }
+        self.turn_usages
+            .borrow_mut()
+            .remove(&(self.session_id.clone(), self.turn_id.clone()));
     }
 }
 
@@ -1640,6 +1797,7 @@ struct Core {
     resident: RefCell<HashSet<String>>,
     mcp_bindings: Arc<McpBindingRegistry>,
     turns: Rc<RefCell<HashMap<String, String>>>,
+    turn_usages: TurnUsageMap,
     prompt_tasks: RefCell<HashMap<String, tokio::task::AbortHandle>>,
     replay: Rc<RefCell<HashMap<String, ReplayMode>>>,
     ledger_root: std::path::PathBuf,
@@ -1843,6 +2001,7 @@ impl Core {
         let sequences = Rc::new(RefCell::new(HashMap::new()));
         let retained = Rc::new(RefCell::new(HashMap::new()));
         let turns = Rc::new(RefCell::new(HashMap::new()));
+        let turn_usages = Rc::new(RefCell::new(HashMap::new()));
         let replay = Rc::new(RefCell::new(HashMap::new()));
         let client = Client {
             events: events.clone(),
@@ -1871,6 +2030,7 @@ impl Core {
                 HashMap::new()
             },
             turns: turns.clone(),
+            turn_usages: turn_usages.clone(),
             replay: replay.clone(),
         };
         tokio::task::spawn_local(
@@ -1914,6 +2074,7 @@ impl Core {
                 resident: RefCell::new(HashSet::new()),
                 mcp_bindings,
                 turns,
+                turn_usages,
                 prompt_tasks: RefCell::new(HashMap::new()),
                 replay,
                 ledger_root: input.session_storage.join("origin-turn-ledger"),
@@ -1951,7 +2112,9 @@ impl Core {
                     let task_session_id = task_key.clone();
                     let reservation = TurnReservation {
                         turns: self.turns.clone(),
+                        turn_usages: self.turn_usages.clone(),
                         session_id: task_session_id.clone(),
+                        turn_id: t.clone(),
                     };
                     let task = tokio::task::spawn_local(async move {
                         let _reservation = reservation;
@@ -1980,7 +2143,9 @@ impl Core {
                     let task_session_id = task_key.clone();
                     let reservation = TurnReservation {
                         turns: self.turns.clone(),
+                        turn_usages: self.turn_usages.clone(),
                         session_id: task_session_id.clone(),
+                        turn_id: t.clone(),
                     };
                     let task = tokio::task::spawn_local(async move {
                         let _reservation = reservation;
@@ -2479,38 +2644,69 @@ impl Core {
             state: LedgerTurnState::Pending,
         });
         self.save_ledger(&id, &ledger)?;
+        let usage_key = (id.0.clone(), t.clone());
+        self.turn_usages.borrow_mut().remove(&usage_key);
         let req = acp::PromptRequest::new(acp::SessionId::new(id.0.clone()), blocks).meta(
             serde_json::json!({
                 "originTurnId":t,
+                "promptId":t,
                 "originPromptDigest": prompt_digest,
                 "originMetadata": metadata
             })
             .as_object()
             .cloned(),
         );
+        let started = std::time::Instant::now();
         let response = self
             .agent
             .prompt(req)
             .await
             .map_err(|error| protocol("session/prompt", error));
-        let outcome = match response?.stop_reason {
+        let response = match response {
+            Ok(response) => response,
+            Err(error) => {
+                self.turn_usages.borrow_mut().remove(&usage_key);
+                return Err(error);
+            }
+        };
+        let outcome = match response.stop_reason {
             acp::StopReason::EndTurn => TurnOutcome::End,
             acp::StopReason::Cancelled => TurnOutcome::Cancelled,
             acp::StopReason::MaxTokens => TurnOutcome::MaxTokens,
             acp::StopReason::MaxTurnRequests => TurnOutcome::MaxTurnRequests,
             acp::StopReason::Refusal => TurnOutcome::Refusal,
-            _ => return Err(Error::Operation("unrecognized Grok stop reason".into())),
+            _ => {
+                self.turn_usages.borrow_mut().remove(&usage_key);
+                return Err(Error::Operation("unrecognized Grok stop reason".into()));
+            }
         };
         let raw = serde_json::value::RawValue::from_string(
             serde_json::json!({"sessionId": id.0}).to_string(),
         )
         .map_err(op)?;
-        self.agent
+        if let Err(error) = self
+            .agent
             .ext_method(acp::ExtRequest::new("origin/session/sync", Arc::from(raw)))
             .await
-            .map_err(|error| protocol("origin/session/sync", error))?;
-        let settlement_id =
-            ledger_settlement_id(&id.0, &t, &prompt_digest, runtime_prompt_index, outcome);
+            .map_err(|error| protocol("origin/session/sync", error))
+        {
+            self.turn_usages.borrow_mut().remove(&usage_key);
+            return Err(error);
+        }
+        let wall_ms = started.elapsed().as_millis().min(u64::MAX as u128) as u64;
+        let native_usage = match self.turn_usages.borrow_mut().remove(&usage_key) {
+            Some(CapturedTurnUsage::Exact(usage)) => usage,
+            Some(CapturedTurnUsage::Conflict) | None => None,
+        };
+        let usage = prompt_effect_usage(native_usage.as_ref(), wall_ms);
+        let settlement_id = ledger_settlement_id(
+            &id.0,
+            &t,
+            &prompt_digest,
+            runtime_prompt_index,
+            outcome,
+            &usage,
+        )?;
         ledger
             .entries
             .last_mut()
@@ -2518,6 +2714,7 @@ impl Core {
             .state = LedgerTurnState::Completed {
             outcome,
             settlement_id: settlement_id.clone(),
+            usage: Some(usage.clone()),
         };
         self.save_ledger(&id, &ledger)?;
         self.emit(&id, EventUpdate::TurnFinished(outcome), Some(t));
@@ -2531,6 +2728,7 @@ impl Core {
             final_sequence,
             runtime_prompt_index,
             settlement_id,
+            usage,
         })
     }
 
@@ -4051,8 +4249,180 @@ mod tests {
             host_extension_methods: HashSet::new(),
             agent_hooks: HashMap::new(),
             turns: Rc::new(RefCell::new(HashMap::new())),
+            turn_usages: Rc::new(RefCell::new(HashMap::new())),
             replay: Rc::new(RefCell::new(HashMap::new())),
         }
+    }
+
+    fn completed_turn_usage(prompt_id: &str, input_tokens: u64) -> serde_json::Value {
+        serde_json::json!({
+            "sessionUpdate": "turn_completed",
+            "prompt_id": prompt_id,
+            "usage": {
+                "inputTokens": input_tokens,
+                "outputTokens": 2,
+                "totalTokens": input_tokens + 2,
+                "modelCalls": 1,
+                "costUSD": 0.000001
+            }
+        })
+    }
+
+    #[test]
+    fn turn_usage_is_bound_to_prompt_identity_and_conflicts_fail_closed() {
+        let session_id = "usage-correlation-root";
+        let turn_id = "expected-turn";
+        assert!(xai_grok_shell::origin_runtime::register_root_session(
+            session_id
+        ));
+        let client = permission_client(None);
+        client
+            .turns
+            .borrow_mut()
+            .insert(session_id.into(), turn_id.into());
+
+        client
+            .capture_turn_usage(session_id, &completed_turn_usage("wrong-turn", 100))
+            .unwrap();
+        assert!(client.turn_usages.borrow().is_empty());
+
+        client
+            .capture_turn_usage(session_id, &completed_turn_usage(turn_id, 10))
+            .unwrap();
+        client
+            .capture_turn_usage(session_id, &completed_turn_usage(turn_id, 10))
+            .unwrap();
+        assert!(matches!(
+            client
+                .turn_usages
+                .borrow()
+                .get(&(session_id.into(), turn_id.into())),
+            Some(CapturedTurnUsage::Exact(Some(usage))) if usage.totals.input_tokens == 10
+        ));
+
+        client
+            .capture_turn_usage(session_id, &completed_turn_usage(turn_id, 11))
+            .unwrap();
+        assert_eq!(
+            client
+                .turn_usages
+                .borrow()
+                .get(&(session_id.into(), turn_id.into())),
+            Some(&CapturedTurnUsage::Conflict)
+        );
+        xai_grok_shell::origin_runtime::unregister_session_tree(session_id);
+    }
+
+    #[test]
+    fn child_usage_before_root_receipt_cannot_settle_the_root_turn() {
+        let session_id = "usage-child-before-root";
+        let child_id = "usage-child-before-child";
+        let turn_id = "usage-child-before-turn";
+        assert!(xai_grok_shell::origin_runtime::register_root_session(
+            session_id
+        ));
+        assert!(xai_grok_shell::origin_runtime::register_child_session(
+            child_id, session_id
+        ));
+        let client = permission_client(None);
+        client
+            .turns
+            .borrow_mut()
+            .insert(session_id.into(), turn_id.into());
+
+        client
+            .capture_turn_usage(child_id, &completed_turn_usage(turn_id, 100))
+            .unwrap();
+        assert!(
+            client.turn_usages.borrow().is_empty(),
+            "a child receipt cannot create root Turn usage evidence"
+        );
+
+        client
+            .capture_turn_usage(session_id, &completed_turn_usage(turn_id, 10))
+            .unwrap();
+        assert!(matches!(
+            client
+                .turn_usages
+                .borrow()
+                .get(&(session_id.into(), turn_id.into())),
+            Some(CapturedTurnUsage::Exact(Some(usage))) if usage.totals.input_tokens == 10
+        ));
+        xai_grok_shell::origin_runtime::unregister_session_tree(session_id);
+    }
+
+    #[test]
+    fn child_usage_after_root_receipt_cannot_replace_the_root_turn() {
+        let session_id = "usage-child-after-root";
+        let child_id = "usage-child-after-child";
+        let turn_id = "usage-child-after-turn";
+        assert!(xai_grok_shell::origin_runtime::register_root_session(
+            session_id
+        ));
+        assert!(xai_grok_shell::origin_runtime::register_child_session(
+            child_id, session_id
+        ));
+        let client = permission_client(None);
+        client
+            .turns
+            .borrow_mut()
+            .insert(session_id.into(), turn_id.into());
+
+        client
+            .capture_turn_usage(session_id, &completed_turn_usage(turn_id, 10))
+            .unwrap();
+        client
+            .capture_turn_usage(child_id, &completed_turn_usage(turn_id, 100))
+            .unwrap();
+        assert!(matches!(
+            client
+                .turn_usages
+                .borrow()
+                .get(&(session_id.into(), turn_id.into())),
+            Some(CapturedTurnUsage::Exact(Some(usage))) if usage.totals.input_tokens == 10
+        ));
+        xai_grok_shell::origin_runtime::unregister_session_tree(session_id);
+    }
+
+    #[test]
+    fn dropping_turn_reservation_clears_active_identity_and_usage() {
+        let session_id = "reservation-cleanup-root";
+        let turn_id = "reservation-cleanup-turn";
+        let turns = Rc::new(RefCell::new(HashMap::from([(
+            session_id.into(),
+            turn_id.into(),
+        )])));
+        let turn_usages = Rc::new(RefCell::new(HashMap::from([(
+            (session_id.into(), turn_id.into()),
+            CapturedTurnUsage::Conflict,
+        )])));
+        {
+            let _reservation = TurnReservation {
+                turns: turns.clone(),
+                turn_usages: turn_usages.clone(),
+                session_id: session_id.into(),
+                turn_id: turn_id.into(),
+            };
+        }
+        assert!(turns.borrow().is_empty());
+        assert!(turn_usages.borrow().is_empty());
+
+        turns
+            .borrow_mut()
+            .insert(session_id.into(), "replacement-turn".into());
+        {
+            let _stale_reservation = TurnReservation {
+                turns: turns.clone(),
+                turn_usages: turn_usages.clone(),
+                session_id: session_id.into(),
+                turn_id: turn_id.into(),
+            };
+        }
+        assert_eq!(
+            turns.borrow().get(session_id).map(String::as_str),
+            Some("replacement-turn"),
+            "a late cancelled task cannot clear a newer Turn reservation"
+        );
     }
 
     fn permission_request() -> acp::RequestPermissionRequest {
@@ -4188,6 +4558,7 @@ mod tests {
                 state: LedgerTurnState::Completed {
                     outcome: TurnOutcome::End,
                     settlement_id: "settlement-0".into(),
+                    usage: None,
                 },
             }],
         };
@@ -4322,6 +4693,7 @@ mod tests {
             host_extension_methods: HashSet::new(),
             agent_hooks: HashMap::new(),
             turns: Rc::new(RefCell::new(HashMap::new())),
+            turn_usages: Rc::new(RefCell::new(HashMap::new())),
             replay: Rc::new(RefCell::new(HashMap::new())),
         };
         let payload = serde_json::json!({
@@ -4471,6 +4843,7 @@ mod tests {
             host_extension_methods: HashSet::from(["host.desktop/screenshot".into()]),
             agent_hooks: HashMap::new(),
             turns: Rc::new(RefCell::new(HashMap::new())),
+            turn_usages: Rc::new(RefCell::new(HashMap::new())),
             replay: Rc::new(RefCell::new(HashMap::new())),
         };
         let params = serde_json::json!({"nested":{"future":[1,true,null]}});
@@ -4554,6 +4927,7 @@ mod tests {
             host_extension_methods: HashSet::new(),
             agent_hooks: HashMap::from([("pre".into(), hook.clone() as _)]),
             turns: Rc::new(RefCell::new(HashMap::new())),
+            turn_usages: Rc::new(RefCell::new(HashMap::new())),
             replay: Rc::new(RefCell::new(HashMap::new())),
         };
         let payload = serde_json::json!({

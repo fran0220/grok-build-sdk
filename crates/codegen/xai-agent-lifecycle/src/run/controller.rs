@@ -20,6 +20,11 @@ impl<S: RunStore> RunController<S> {
         let mut authority_fenced = BTreeSet::new();
         for envelope in store.list()? {
             envelope.validate()?;
+            if runs.contains_key(&envelope.run.id) {
+                return Err(RunError::Integrity(
+                    "Run store listed the same Run id more than once".into(),
+                ));
+            }
             if needs_controller_recovery(&envelope.run) {
                 authority_fenced.insert(envelope.run.id.clone());
             }
@@ -57,7 +62,7 @@ impl<S: RunStore> RunController<S> {
         request.capabilities.validate()?;
         if !matches!(&request.driver, RunDriverSpec::AutonomousTurnLoop { .. }) {
             return Err(RunError::Validation(
-                "only AutonomousTurnLoop is executable in Run schema v1".into(),
+                "only AutonomousTurnLoop is executable in Run schema v2".into(),
             ));
         }
         if request
@@ -129,6 +134,7 @@ impl<S: RunStore> RunController<S> {
             verifier_policy_digest: request.verifier_policy_digest,
             budget: request.budget,
             usage: ResourceVector::default(),
+            usage_unknown: BTreeSet::new(),
             child_reserved: ResourceVector::default(),
             next_iteration_id: 1,
             active_iteration: None,
@@ -217,9 +223,13 @@ impl<S: RunStore> RunController<S> {
 
     pub fn reload_run(&mut self, run_id: &RunId) -> Result<Option<RunEnvelope>, RunError> {
         let loaded = self.store.load(run_id)?;
-        self.reload_required.remove(run_id);
         if let Some(envelope) = &loaded {
             envelope.validate()?;
+            if envelope.run.id != *run_id {
+                return Err(RunError::Integrity(
+                    "Run store returned an envelope for a different Run id".into(),
+                ));
+            }
             if needs_controller_recovery(&envelope.run) {
                 self.authority_fenced.insert(run_id.clone());
             } else {
@@ -230,6 +240,7 @@ impl<S: RunStore> RunController<S> {
             self.runs.remove(run_id);
             self.authority_fenced.remove(run_id);
         }
+        self.reload_required.remove(run_id);
         Ok(loaded)
     }
 
@@ -241,7 +252,20 @@ impl<S: RunStore> RunController<S> {
         let envelope = self.runs.get(run_id).ok_or(RunError::NotFound)?;
         let current = envelope.run.event_cursor;
         let first = envelope.events.front().map(|event| event.cursor);
-        let contiguous = after.get() <= current.get()
+        let valid_journal = envelope
+            .events
+            .iter()
+            .zip(envelope.events.iter().skip(1))
+            .all(|(previous, event)| {
+                previous.cursor.get().checked_add(1) == Some(event.cursor.get())
+                    && previous.revision.get().checked_add(1) == Some(event.revision.get())
+            })
+            && match envelope.events.back() {
+                Some(event) => event.cursor == current && event.revision == envelope.run.revision,
+                None => current.get() == 0,
+            };
+        let contiguous = valid_journal
+            && after.get() <= current.get()
             && match first {
                 Some(first) => after
                     .get()
@@ -250,7 +274,7 @@ impl<S: RunStore> RunController<S> {
                 None => after == current,
             };
         if !contiguous {
-            return Ok(RunAttach::Snapshot(envelope.clone()));
+            return Ok(RunAttach::Snapshot(Box::new(envelope.clone())));
         }
         Ok(RunAttach::Replay {
             run_id: run_id.clone(),
@@ -364,30 +388,55 @@ impl<S: RunStore> RunController<S> {
                             )
                     });
                     if applied {
-                        let usage = request.input.recovered_usage.as_ref().ok_or_else(|| {
-                            RunError::InvalidTransition(
-                                "applied iteration recovery requires observed usage".into(),
-                            )
-                        })?;
+                        let mut usage = ResourceVector::default();
+                        let mut unknown = BTreeSet::new();
+                        for operation in run.operations.values().filter(|operation| {
+                            operation.iteration_id == iteration.iteration_id
+                                && matches!(
+                                    operation.state,
+                                    OperationState::Acknowledged | OperationState::Reconciled
+                                )
+                        }) {
+                            let reservation = operation.reservation.as_ref().ok_or_else(|| {
+                                RunError::Integrity(
+                                    "settled recovery effect omitted its reservation".into(),
+                                )
+                            })?;
+                            let actual = operation
+                                .receipt
+                                .as_ref()
+                                .and_then(|receipt| receipt.actual_usage.as_ref())
+                                .ok_or_else(|| {
+                                    RunError::InvalidTransition(
+                                        "applied iteration recovery lacks typed usage evidence"
+                                            .into(),
+                                    )
+                                })?;
+                            actual.validate()?;
+                            if !actual.allows_settlement_with(reservation, &run.budget) {
+                                return Err(RunError::Budget);
+                            }
+                            usage = usage
+                                .add_usage(&actual.resources)
+                                .ok_or(RunError::Budget)?;
+                            unknown.extend(actual.unknown.iter().copied());
+                        }
                         if usage.iterations != 1 || usage.agent_calls == 0 {
                             return Err(RunError::Validation(
-                                "recovered iteration usage must charge one iteration and at least one agent call"
+                                "typed recovery usage must charge one iteration and at least one agent call"
                                     .into(),
                             ));
                         }
                         let total = run
                             .usage
-                            .add_usage(usage)
+                            .add_usage(&usage)
                             .and_then(|value| value.with_reservations(&run.child_reserved))
                             .ok_or(RunError::Budget)?;
                         if !total.within(&run.budget) {
                             return Err(RunError::Budget);
                         }
-                        run.usage = run.usage.add_usage(usage).ok_or(RunError::Budget)?;
-                    } else if request.input.recovered_usage.is_some() {
-                        return Err(RunError::Validation(
-                            "unused recovered iteration usage was supplied".into(),
-                        ));
+                        run.usage = run.usage.add_usage(&usage).ok_or(RunError::Budget)?;
+                        run.usage_unknown.extend(unknown);
                     }
                     for operation in run.operations.values_mut().filter(|operation| {
                         operation.iteration_id == iteration.iteration_id
@@ -620,6 +669,39 @@ impl<S: RunStore> RunController<S> {
                 "iteration has unresolved committed effects".into(),
             ));
         }
+        let settled_session_turns: Vec<_> = old
+            .run
+            .operations
+            .values()
+            .filter(|operation| {
+                operation.iteration_id == callback.iteration_id
+                    && matches!(&operation.spec, EffectSpec::SessionTurn { .. })
+            })
+            .collect();
+        let mut usage_unknown = BTreeSet::new();
+        if !settled_session_turns.is_empty() {
+            let mut receipt_usage = ResourceVector::default();
+            for operation in settled_session_turns {
+                let actual = operation
+                    .receipt
+                    .as_ref()
+                    .and_then(|receipt| receipt.actual_usage.as_ref())
+                    .ok_or_else(|| {
+                        RunError::Integrity(
+                            "finished Session Turn omitted typed usage evidence".into(),
+                        )
+                    })?;
+                receipt_usage = receipt_usage
+                    .add_usage(&actual.resources)
+                    .ok_or(RunError::Budget)?;
+                usage_unknown.extend(actual.unknown.iter().copied());
+            }
+            if callback.usage != receipt_usage {
+                return Err(RunError::Integrity(
+                    "iteration usage differs from its settled effect receipts".into(),
+                ));
+            }
+        }
         let total = old
             .run
             .usage
@@ -647,6 +729,7 @@ impl<S: RunStore> RunController<S> {
             .usage
             .add_usage(&callback.usage)
             .ok_or(RunError::Budget)?;
+        next.run.usage_unknown.extend(usage_unknown);
         next.run.verdict = Some(callback.verdict);
         next.run.stage = if callback.verdict == GoalVerdict::Achieved {
             RunStage::Verifying
@@ -710,6 +793,7 @@ impl<S: RunStore> RunController<S> {
                         state: OperationState::Prepared,
                         next_attempt: 1,
                         active_attempt: None,
+                        reservation: None,
                         receipt: None,
                         terminal_result_digest: None,
                     },
@@ -726,6 +810,7 @@ impl<S: RunStore> RunController<S> {
     ) -> Result<CommandOutput<CommittedEffect>, RunError> {
         let run_id = request.run_id.clone();
         let operation_id = request.input.operation_id.clone();
+        let reservation = request.input.reservation.clone();
         let command = self.apply_command(
             request,
             "claim_effect",
@@ -740,7 +825,7 @@ impl<S: RunStore> RunController<S> {
                 }
                 let operation = run
                     .operations
-                    .get_mut(&operation_id)
+                    .get(&operation_id)
                     .ok_or(RunError::NotFound)?;
                 let active_iteration = run.active_iteration.as_ref().ok_or_else(|| {
                     RunError::InvalidTransition("effect has no active owning iteration".into())
@@ -765,6 +850,39 @@ impl<S: RunStore> RunController<S> {
                         "non-repeatable effect cannot be retried automatically".into(),
                     ));
                 }
+                if reservation.is_zero() {
+                    return Err(RunError::Validation(
+                        "effect claim requires a non-empty durable reservation".into(),
+                    ));
+                }
+                if let EffectSpec::SessionTurn { input, .. } = &operation.spec
+                    && (reservation.iterations != 1
+                        || reservation.agent_calls != 1
+                        || reservation.agent_concurrency != 1
+                        || reservation.artifact_bytes < input.size)
+                {
+                    return Err(RunError::Validation(
+                        "Session Turn reservation does not cover its bounded effect".into(),
+                    ));
+                }
+                let active_reserved = active_operation_reservations(run, Some(&operation_id))?
+                    .add_reservation(&reservation)
+                    .ok_or(RunError::Budget)?;
+                let projected = run
+                    .usage
+                    .with_reservations(
+                        &run.child_reserved
+                            .add_reservation(&active_reserved)
+                            .ok_or(RunError::Budget)?,
+                    )
+                    .ok_or(RunError::Budget)?;
+                if !projected.within(&run.budget) {
+                    return Err(RunError::Budget);
+                }
+                let operation = run
+                    .operations
+                    .get_mut(&operation_id)
+                    .ok_or(RunError::NotFound)?;
                 let attempt = operation.next_attempt;
                 operation.next_attempt = operation
                     .next_attempt
@@ -776,6 +894,7 @@ impl<S: RunStore> RunController<S> {
                     epoch: run.controller_epoch,
                 });
                 operation.terminal_result_digest = None;
+                operation.reservation = Some(reservation.clone());
                 operation.state = OperationState::Dispatching;
                 Ok(())
             },
@@ -800,6 +919,10 @@ impl<S: RunStore> RunController<S> {
                 epoch: attempt.epoch,
                 effect_class: operation.effect_class,
                 spec: operation.spec.clone(),
+                reservation: operation
+                    .reservation
+                    .clone()
+                    .ok_or_else(|| RunError::Integrity("effect claim lost reservation".into()))?,
             },
             command,
         })
@@ -854,6 +977,7 @@ impl<S: RunStore> RunController<S> {
             return Err(RunError::StaleCallback);
         }
         let mut next = old.clone();
+        let budget = next.run.budget.clone();
         let operation = next
             .run
             .operations
@@ -862,10 +986,28 @@ impl<S: RunStore> RunController<S> {
         let mut requires_recovery = false;
         match callback.outcome {
             EffectOutcome::Applied { receipt } => {
-                validate_effect_receipt(&operation.spec, &receipt)?;
+                validate_effect_receipt_evidence(&receipt)?;
+                let reservation = operation.reservation.as_ref().ok_or_else(|| {
+                    RunError::Integrity("applied effect omitted its reservation".into())
+                })?;
+                let usage_is_acceptable = validate_effect_receipt(&operation.spec, &receipt)
+                    .is_ok_and(|()| {
+                        receipt.actual_usage.as_ref().is_some_and(|actual| {
+                            actual.allows_settlement_with(reservation, &budget)
+                        })
+                    });
                 operation.receipt = Some(receipt);
                 operation.terminal_result_digest = Some(result_digest);
-                operation.state = OperationState::Acknowledged;
+                if usage_is_acceptable {
+                    operation.state = OperationState::Acknowledged;
+                } else {
+                    // The effect is already reported applied. Missing,
+                    // unknown-against-finite, or over-reservation usage cannot
+                    // be rejected without losing that evidence, so persist an
+                    // explicit recovery fence instead of treating it as free.
+                    operation.state = OperationState::Uncertain;
+                    requires_recovery = true;
+                }
             }
             EffectOutcome::FailedRetryable { message } => {
                 if message.len() > MAX_ITEM_BYTES {
@@ -922,6 +1064,7 @@ impl<S: RunStore> RunController<S> {
                         "effect reconciliation requires recovery state".into(),
                     ));
                 }
+                let budget = run.budget.clone();
                 let operation = run
                     .operations
                     .get_mut(&request.input.operation_id)
@@ -935,12 +1078,29 @@ impl<S: RunStore> RunController<S> {
                 match &request.input.decision {
                     ReconcileDecision::Applied { receipt } => {
                         validate_effect_receipt(&operation.spec, receipt)?;
+                        let reservation = operation.reservation.as_ref().ok_or_else(|| {
+                            RunError::Integrity("reconciled effect omitted its reservation".into())
+                        })?;
+                        let actual = receipt.actual_usage.as_ref().ok_or_else(|| {
+                            RunError::InvalidTransition(
+                                "applied effect reconciliation requires typed actual usage".into(),
+                            )
+                        })?;
+                        if !actual.allows_settlement_with(reservation, &budget) {
+                            return Err(RunError::Budget);
+                        }
                         operation.receipt = Some(receipt.clone());
                         operation.terminal_result_digest =
                             Some(canonical_digest(&request.input.decision)?);
                         operation.state = OperationState::Reconciled;
                     }
                     ReconcileDecision::NotApplied => {
+                        if operation.receipt.is_some() {
+                            return Err(RunError::InvalidTransition(
+                                "retained Applied evidence requires typed Applied reconciliation"
+                                    .into(),
+                            ));
+                        }
                         operation.state = OperationState::Abandoned;
                     }
                     ReconcileDecision::Unknown { .. } => {
@@ -1555,6 +1715,7 @@ impl<S: RunStore> RunController<S> {
         next: RunEnvelope,
         finished_iteration: Option<IterationManifest>,
     ) -> Result<RunEnvelope, RunError> {
+        next.validate()?;
         let run_id = next.run.id.clone();
         match self.store.commit(StoreCommit {
             run_id: run_id.clone(),
@@ -1800,7 +1961,8 @@ fn validate_completion(run: &RunRecord) -> Result<(), RunError> {
 }
 
 fn has_unsettled_work(run: &RunRecord) -> bool {
-    has_unsettled_operations(run)
+    run.active_iteration.is_some()
+        || has_unsettled_operations(run)
         || run
             .children
             .values()
@@ -1949,6 +2111,34 @@ fn recovery_needs(run: &RunRecord) -> Vec<RecoveryNeed> {
             }),
     );
     needs
+}
+
+fn active_operation_reservations(
+    run: &RunRecord,
+    skip: Option<&OperationId>,
+) -> Result<ResourceVector, RunError> {
+    let mut reserved = ResourceVector::default();
+    for operation in run.operations.values().filter(|operation| {
+        skip != Some(&operation.id)
+            && matches!(
+                operation.state,
+                OperationState::Dispatching
+                    | OperationState::Acknowledged
+                    | OperationState::Reconciled
+                    | OperationState::Uncertain
+            )
+            && run
+                .active_iteration
+                .as_ref()
+                .is_some_and(|iteration| iteration.iteration_id == operation.iteration_id)
+    }) {
+        reserved = reserved
+            .add_reservation(operation.reservation.as_ref().ok_or_else(|| {
+                RunError::Integrity("claimed operation omitted its reservation".into())
+            })?)
+            .ok_or(RunError::Budget)?;
+    }
+    Ok(reserved)
 }
 
 fn push_iteration(run: &mut RunRecord, iteration: IterationManifest) {

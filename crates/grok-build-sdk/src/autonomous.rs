@@ -1,7 +1,6 @@
 use crate::{Error, EventUpdate, Runtime, SessionId, TurnOutcome};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
-use std::time::Instant;
 use xai_agent_lifecycle::run;
 
 /// Host-supplied placement inputs for one bounded autonomous activation. The
@@ -187,6 +186,7 @@ impl AutonomousTurnLoop {
                     .await?;
                 continue;
             }
+            ensure_supported_turn_budget(&snapshot.run)?;
 
             let previous_steering = snapshot
                 .run
@@ -266,13 +266,13 @@ impl AutonomousTurnLoop {
                     activation.run_id.clone(),
                     snapshot.run.revision,
                     command_id(&snapshot, "claim_turn", Some(handle.iteration_id))?,
-                    run::ClaimEffect::new(operation_id),
+                    run::ClaimEffect::new(operation_id)
+                        .reservation(session_turn_reservation(&snapshot.run)?),
                 ))
                 .await?;
             let effect = claimed.output;
             snapshot = claimed.command.snapshot;
 
-            let started = Instant::now();
             let session_id = SessionId::from_stored(snapshot.run.session.as_str());
             let receipt = match self.runtime.prompt(&session_id, &turn_id, &prompt).await {
                 Ok(receipt) => receipt,
@@ -293,36 +293,7 @@ impl AutonomousTurnLoop {
                     return Err(error);
                 }
             };
-            let acknowledged = self
-                .runtime
-                .inner
-                .acknowledge_effect(run::EffectCallback::new(
-                    &effect,
-                    run::EffectOutcome::Applied {
-                        receipt: run::EffectReceipt::for_session_turn(
-                            &snapshot.run.session,
-                            &turn_id,
-                            &prompt_digest,
-                            receipt.runtime_prompt_index,
-                            crate::durable_turn_outcome(receipt.outcome),
-                        ),
-                    },
-                ))
-                .await?;
-            snapshot = acknowledged.snapshot;
             sequence = receipt.final_sequence;
-
-            // Cancellation/pause may have committed while the Turn was in
-            // flight. Its late settlement is evidence only and never revives the
-            // Run or advances the iteration.
-            if snapshot.run.status != run::RunStatus::Active {
-                return Ok(AutonomousActivationResult {
-                    snapshot,
-                    through_session_sequence: sequence,
-                    iterations_executed: executed,
-                    recovery_needs: Vec::new(),
-                });
-            }
 
             let output = self
                 .runtime
@@ -358,6 +329,44 @@ impl AutonomousTurnLoop {
                 activation.run_id.as_str(),
             )
             .workspace_digest(activation.workspace_revision.clone());
+            let artifact_bytes = input_metadata
+                .size
+                .checked_add(output_metadata.size)
+                .ok_or(run::RunError::Budget)?;
+            let actual_usage =
+                crate::measured_session_turn_usage(receipt.usage.clone(), artifact_bytes)?;
+            let acknowledged = self
+                .runtime
+                .inner
+                .acknowledge_effect(run::EffectCallback::new(
+                    &effect,
+                    run::EffectOutcome::Applied {
+                        receipt: run::EffectReceipt::for_session_turn(
+                            &snapshot.run.session,
+                            &turn_id,
+                            &prompt_digest,
+                            receipt.runtime_prompt_index,
+                            crate::durable_turn_outcome(receipt.outcome),
+                            receipt.usage.clone(),
+                            actual_usage.clone(),
+                        ),
+                    },
+                ))
+                .await?;
+            snapshot = acknowledged.snapshot;
+
+            // Cancellation/pause may have committed while the Turn was in
+            // flight. Its late settlement is evidence only and never revives the
+            // Run or advances the iteration.
+            if snapshot.run.status != run::RunStatus::Active {
+                return Ok(AutonomousActivationResult {
+                    snapshot,
+                    through_session_sequence: sequence,
+                    iterations_executed: executed,
+                    recovery_needs: Vec::new(),
+                });
+            }
+
             let mut evidence = vec![output_artifact.clone()];
             let mut gates = BTreeMap::new();
             for gate in &snapshot.run.required_gates {
@@ -406,19 +415,6 @@ impl AutonomousTurnLoop {
                 run::GoalVerdict::Unverifiable
             };
             let driver_terminal_success = receipt.outcome == TurnOutcome::End;
-            let elapsed = started.elapsed().as_millis().min(u64::MAX as u128) as u64;
-            let usage = run::ResourceVector::default()
-                .iterations(1)
-                .agent_calls(1)
-                .agent_concurrency(1)
-                .active_ms(elapsed)
-                .wall_ms(elapsed)
-                .artifact_bytes(
-                    input_metadata
-                        .size
-                        .checked_add(output_metadata.size)
-                        .ok_or_else(|| run::RunError::Budget)?,
-                );
             let finished = self
                 .runtime
                 .inner
@@ -428,7 +424,7 @@ impl AutonomousTurnLoop {
                         driver_terminal_success,
                         summary,
                         verdict,
-                        usage,
+                        actual_usage.resources,
                     )
                     .evidence(evidence)
                     .gates(gates),
@@ -538,6 +534,41 @@ fn next_turn_exceeds_budget(run: &run::RunRecord) -> bool {
             .checked_add(1)
             .is_none_or(|value| value > run.budget.agent_calls)
         || 1 > run.budget.agent_concurrency
+}
+
+fn ensure_supported_turn_budget(run: &run::RunRecord) -> Result<(), Error> {
+    let unsupported = [
+        ("active_ms", run.budget.active_ms),
+        ("wall_ms", run.budget.wall_ms),
+        ("tokens", run.budget.tokens),
+        ("cost_micros", run.budget.cost_micros),
+        ("artifact_bytes", run.budget.artifact_bytes),
+    ]
+    .into_iter()
+    .filter_map(|(name, limit)| (limit != u64::MAX).then_some(name))
+    .collect::<Vec<_>>();
+    if unsupported.is_empty() {
+        Ok(())
+    } else {
+        Err(run::RunError::Validation(format!(
+            "AutonomousTurnLoop cannot dispatch with finite {} budgets until the selected model/runtime capability declares enforceable per-Turn upper bounds",
+            unsupported.join(", ")
+        ))
+        .into())
+    }
+}
+
+fn session_turn_reservation(run: &run::RunRecord) -> Result<run::ResourceVector, Error> {
+    ensure_supported_turn_budget(run)?;
+    Ok(run::ResourceVector::default()
+        .iterations(1)
+        .agent_calls(1)
+        .agent_concurrency(1)
+        .active_ms(u64::MAX - run.usage.active_ms)
+        .wall_ms(u64::MAX - run.usage.wall_ms)
+        .tokens(u64::MAX - run.usage.tokens)
+        .cost_micros(u64::MAX - run.usage.cost_micros)
+        .artifact_bytes(u64::MAX - run.usage.artifact_bytes))
 }
 
 fn autonomous_prompt(

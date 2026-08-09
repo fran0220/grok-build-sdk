@@ -37,15 +37,15 @@ pub mod run {
     pub use xai_agent_lifecycle::run::{
         ApprovalDecision, ApprovalHandler, ApprovalRequest, ArtifactMetadata, ArtifactRef,
         ArtifactStore, CapabilityPolicy, CommandId, ControllerEpoch, CreateRunRequest,
-        DenyApprovalHandler, EffectClass, EffectReceipt, FailClosedGateProvider,
+        DenyApprovalHandler, EffectClass, EffectReceipt, EffectUsage, FailClosedGateProvider,
         FailClosedGoalVerifier, FinishedOutcome, GateEvaluation, GateProvider, GateRequest,
         GoalSpec, GoalVerdict, GoalVerification, GoalVerificationRequest, GoalVerifier,
-        IterationId, LocalArtifactStore, LocalRunStore, MessageId, MutationRequest,
-        NoopTelemetrySink, OperationId, OperationState, ProviderSet, RUN_SCHEMA_VERSION,
-        ReconcileDecision, ReconcileEffect, RecoveryNeed, RecoveryPlan, RecoveryResolution,
-        ResourceVector, RunAction, RunAttach, RunCommandResult, RunDriverSpec, RunEnvelope,
-        RunError, RunEvent, RunEventCursor, RunEventKind, RunId, RunLifecycle, RunRevision,
-        RunStage, RunStatus, RunStore, SessionRef, SessionTurnOutcome, StoreCommit,
+        IterationId, LocalArtifactStore, LocalRunStore, MAX_RUN_ENVELOPE_BYTES, MessageId,
+        MutationRequest, NoopTelemetrySink, OperationId, OperationState, ProviderSet,
+        RUN_SCHEMA_VERSION, ReconcileDecision, RecoveryNeed, RecoveryPlan, RecoveryResolution,
+        ResourceDimension, ResourceVector, RunAction, RunAttach, RunCommandResult, RunDriverSpec,
+        RunEnvelope, RunError, RunEvent, RunEventCursor, RunEventKind, RunId, RunLifecycle,
+        RunRevision, RunStage, RunStatus, RunStore, SessionRef, SessionTurnOutcome, StoreCommit,
         StoreCommitResult, TelemetryRecord, TelemetrySink, WaitingReason, migrate_legacy_goal,
     };
     #[cfg(test)]
@@ -1880,6 +1880,9 @@ pub struct PromptReceipt {
     pub runtime_prompt_index: u64,
     /// Stable receipt from the fork-owned durable Turn ledger.
     pub settlement_id: String,
+    /// Provider-derived usage bound into `settlement_id`. Unknown dimensions
+    /// remain explicit and are never interpreted as zero.
+    pub usage: run::EffectUsage,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -1889,6 +1892,10 @@ pub enum LedgerTurnState {
     Completed {
         outcome: TurnOutcome,
         settlement_id: String,
+        /// `None` is accepted only for ledgers written before usage-bound
+        /// settlements. Such an entry cannot recover an SDK-owned Run effect.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        usage: Option<run::EffectUsage>,
     },
     Discarded,
 }
@@ -2126,23 +2133,32 @@ impl Runtime {
                     LedgerTurnState::Completed {
                         outcome,
                         settlement_id,
-                    } => {
-                        let receipt = run::EffectReceipt::for_session_turn(
-                            &session,
-                            &turn_id,
-                            &prompt_digest,
-                            entry.runtime_prompt_index,
-                            durable_turn_outcome(*outcome),
-                        );
-                        if receipt.settlement_id.as_deref() == Some(settlement_id.as_str()) {
-                            run::ReconcileDecision::Applied { receipt }
-                        } else {
-                            run::ReconcileDecision::Unknown {
-                                message: "SessionLedger settlement identity failed validation"
-                                    .into(),
+                        usage,
+                    } => match usage {
+                        Some(session_usage) => {
+                            let actual_usage = recovered_session_turn_usage(session_usage.clone())?;
+                            let receipt = run::EffectReceipt::for_session_turn(
+                                &session,
+                                &turn_id,
+                                &prompt_digest,
+                                entry.runtime_prompt_index,
+                                durable_turn_outcome(*outcome),
+                                session_usage.clone(),
+                                actual_usage,
+                            );
+                            if receipt.settlement_id.as_deref() == Some(settlement_id.as_str()) {
+                                run::ReconcileDecision::Applied { receipt }
+                            } else {
+                                run::ReconcileDecision::Unknown {
+                                    message: "SessionLedger settlement identity failed validation"
+                                        .into(),
+                                }
                             }
                         }
-                    }
+                        _ => run::ReconcileDecision::Unknown {
+                            message: "SessionLedger completion lacks typed usage evidence".into(),
+                        },
+                    },
                     LedgerTurnState::Pending | LedgerTurnState::Discarded => {
                         match self.rewind_status(&session_id, operation_id.as_str()).await {
                             Ok(ConversationRewindStatus::Applied { receipt })
@@ -2193,7 +2209,7 @@ impl Runtime {
                     run_id.clone(),
                     plan.snapshot.run.revision,
                     command_id,
-                    run::ReconcileEffect::new(operation_id, decision),
+                    xai_agent_lifecycle::run::ReconcileEffect::new(operation_id, decision),
                 ))
                 .await?;
             plan.snapshot = result.snapshot;
@@ -3107,6 +3123,27 @@ impl Runtime {
     pub async fn shutdown(&self) -> Result<(), Error> {
         self.inner.shutdown().await
     }
+}
+
+pub(crate) fn measured_session_turn_usage(
+    mut usage: run::EffectUsage,
+    artifact_bytes: u64,
+) -> Result<run::EffectUsage, Error> {
+    usage.resources.artifact_bytes = artifact_bytes;
+    usage.unknown.remove(&run::ResourceDimension::ArtifactBytes);
+    usage.validate()?;
+    Ok(usage)
+}
+
+fn recovered_session_turn_usage(mut usage: run::EffectUsage) -> Result<run::EffectUsage, Error> {
+    // SessionLedger proves native Turn usage, but cannot prove whether the
+    // SDK output artifact was persisted immediately before a crash. Keep the
+    // whole dimension explicitly unknown instead of fabricating input-only
+    // accounting.
+    usage.resources.artifact_bytes = 0;
+    usage.unknown.insert(run::ResourceDimension::ArtifactBytes);
+    usage.validate()?;
+    Ok(usage)
 }
 
 pub struct RuntimeBuilder {
@@ -7499,11 +7536,11 @@ done
                 .iterations(iteration_budget)
                 .agent_calls(iteration_budget)
                 .agent_concurrency(1)
-                .active_ms(1_000_000)
-                .wall_ms(1_000_000)
-                .tokens(1_000_000)
-                .cost_micros(1_000_000)
-                .artifact_bytes(10_000_000),
+                .active_ms(u64::MAX)
+                .wall_ms(u64::MAX)
+                .tokens(u64::MAX)
+                .cost_micros(u64::MAX)
+                .artifact_bytes(u64::MAX),
         )
         .run_id(run::RunId::new(run_id).unwrap())
         .verifier_policy_digest("test-verifier")
@@ -7608,7 +7645,17 @@ done
                 created.snapshot.run.id.clone(),
                 prepared.snapshot.run.revision,
                 run::CommandId::new(format!("{command_prefix}_claim")).unwrap(),
-                run::ClaimEffect::new(operation_id.clone()),
+                run::ClaimEffect::new(operation_id.clone()).reservation(
+                    run::ResourceVector::default()
+                        .iterations(1)
+                        .agent_calls(1)
+                        .agent_concurrency(1)
+                        .active_ms(created.snapshot.run.budget.active_ms)
+                        .wall_ms(created.snapshot.run.budget.wall_ms)
+                        .tokens(created.snapshot.run.budget.tokens)
+                        .cost_micros(created.snapshot.run.budget.cost_micros)
+                        .artifact_bytes(created.snapshot.run.budget.artifact_bytes),
+                ),
             ))
             .await
             .unwrap();
@@ -7652,18 +7699,33 @@ done
             run::RunLifecycle::Finished(run::FinishedOutcome::Succeeded)
         );
         assert_eq!(result.iterations_executed, 2);
-        assert_eq!(
-            runtime
-                .session_ledger(&session)
-                .await
-                .unwrap()
-                .entries
-                .len(),
-            2
+        let ledger = runtime.session_ledger(&session).await.unwrap();
+        assert_eq!(ledger.entries.len(), 2);
+        for entry in &ledger.entries {
+            let LedgerTurnState::Completed {
+                settlement_id,
+                usage: Some(usage),
+                ..
+            } = &entry.state
+            else {
+                panic!("autonomous Turns must persist typed usage evidence");
+            };
+            assert_eq!(usage.resources.tokens, 14);
+            assert!(!usage.is_unknown(run::ResourceDimension::Tokens));
+            assert!(usage.is_unknown(run::ResourceDimension::CostMicros));
+            assert!(settlement_id.starts_with("sha256:"));
+        }
+        assert_eq!(result.snapshot.run.usage.tokens, 28);
+        assert!(
+            result
+                .snapshot
+                .run
+                .usage_unknown
+                .contains(&run::ResourceDimension::CostMicros)
         );
 
         let budget_session = runtime
-            .create_session(session_config(workspace))
+            .create_session(session_config(workspace.clone()))
             .await
             .expect("budget session starts");
         let budget_run = runtime
@@ -7690,6 +7752,42 @@ done
             run::RunLifecycle::Waiting(run::WaitingReason::BudgetExhausted)
         );
         assert_ne!(budget_result.snapshot.run.status, run::RunStatus::Complete);
+
+        let finite_session = runtime
+            .create_session(session_config(workspace.clone()))
+            .await
+            .expect("finite-budget session starts");
+        let mut finite_request = autonomous_run_request("finite_token_run", &finite_session, 1);
+        finite_request.budget.tokens = 100;
+        let finite_run = runtime
+            .create_run(finite_request)
+            .await
+            .expect("finite-budget Run created");
+        let requests_before = server.requests().len();
+        let error = runtime
+            .autonomous_turn_loop(autonomous_providers(
+                &root.path().join("finite-budget-artifacts"),
+                0,
+            ))
+            .activate(AutonomousActivation::new(
+                finite_run.snapshot.run.id.clone(),
+                "test-model-v1",
+                "workspace-v1",
+            ))
+            .await
+            .expect_err("unsupported finite budget must fail before dispatch");
+        assert!(matches!(
+            error,
+            Error::DurableRun(run::RunError::Validation(_))
+        ));
+        assert_eq!(server.requests().len(), requests_before);
+        let unchanged = runtime
+            .get_run(&finite_run.snapshot.run.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(unchanged.run.active_iteration.is_none());
+        assert!(unchanged.run.operations.is_empty());
         runtime.shutdown().await.expect("runtime shuts down");
     }
 
@@ -7824,7 +7922,17 @@ done
                 created.snapshot.run.id.clone(),
                 prepared.snapshot.run.revision,
                 run::CommandId::new("crash_claim").unwrap(),
-                run::ClaimEffect::new(operation_id.clone()),
+                run::ClaimEffect::new(operation_id.clone()).reservation(
+                    run::ResourceVector::default()
+                        .iterations(1)
+                        .agent_calls(1)
+                        .agent_concurrency(1)
+                        .active_ms(u64::MAX)
+                        .wall_ms(u64::MAX)
+                        .tokens(u64::MAX)
+                        .cost_micros(u64::MAX)
+                        .artifact_bytes(u64::MAX),
+                ),
             ))
             .await
             .unwrap();
@@ -7921,6 +8029,16 @@ done
             result.snapshot.run.operations[&operation_id].state,
             run::OperationState::Reconciled
         );
+        let recovered_usage = result.snapshot.run.operations[&operation_id]
+            .receipt
+            .as_ref()
+            .and_then(|receipt| receipt.actual_usage.as_deref())
+            .expect("recovery persists typed actual usage");
+        assert_eq!(recovered_usage.resources.artifact_bytes, 0);
+        assert!(
+            recovered_usage.is_unknown(run::ResourceDimension::ArtifactBytes),
+            "SessionLedger cannot prove whether the SDK artifact committed before a crash"
+        );
         assert_eq!(
             result.snapshot.run.lifecycle(),
             run::RunLifecycle::Recovering
@@ -7936,15 +8054,10 @@ done
                 result.snapshot.run.id.clone(),
                 result.snapshot.run.revision,
                 run::CommandId::new("resolve_completed_ledger_iteration").unwrap(),
-                run::RecoveryResolution::new(true, true).recovered_usage(
-                    run::ResourceVector::default()
-                        .iterations(1)
-                        .agent_calls(1)
-                        .agent_concurrency(1),
-                ),
+                run::RecoveryResolution::new(true, true),
             ))
             .await
-            .expect("Host supplies observed usage and abandons the uncertain iteration");
+            .expect("SDK derives usage from typed ledger evidence");
         assert_eq!(resolved.snapshot.run.lifecycle(), run::RunLifecycle::Active);
         let continued = restarted
             .autonomous_turn_loop(autonomous_providers(
@@ -7974,6 +8087,63 @@ done
             "the settled Turn identity must never be replayed"
         );
         restarted.shutdown().await.expect("runtime shuts down");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn finite_artifact_budget_cannot_be_recovered_from_session_ledger_as_zero() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let server = MockInferenceServer::start().await.expect("mock server");
+        server.set_response("completed under a finite artifact budget");
+        let root = TempDir::new().expect("temp root");
+        let workspace = root.path().join("workspace");
+        std::fs::create_dir(&workspace).expect("workspace");
+        let (runtime, _) = Runtime::start(runtime_config(&root, server.url()))
+            .await
+            .expect("runtime starts");
+        let session = runtime
+            .create_session(session_config(workspace))
+            .await
+            .expect("session starts");
+        let mut request = autonomous_run_request("finite_artifact_recovery", &session, 2);
+        request.budget.artifact_bytes = 1;
+        let created = runtime.create_run(request).await.expect("Run created");
+        let turn_id = "finite_artifact_recovery_turn";
+        let prompt = "durable prompt with unknown recovered artifact usage";
+        let (operation_id, claimed) = claim_test_session_turn(
+            &runtime,
+            &created,
+            "finite_artifact_recovery",
+            turn_id,
+            crate::prompt_digest(prompt),
+        )
+        .await;
+        runtime
+            .prompt(&session, turn_id, prompt)
+            .await
+            .expect("SessionLedger completion commits");
+
+        let error = runtime
+            .reconcile_run(run::MutationRequest::new(
+                created.snapshot.run.id.clone(),
+                claimed.run.revision,
+                run::CommandId::new("finite_artifact_reconcile").unwrap(),
+                (),
+            ))
+            .await
+            .expect_err("unknown artifact usage cannot settle a finite budget");
+        assert!(matches!(error, Error::DurableRun(run::RunError::Budget)));
+        let persisted = runtime
+            .get_run(&created.snapshot.run.id)
+            .await
+            .unwrap()
+            .expect("Run remains durable");
+        assert_eq!(persisted.run.lifecycle(), run::RunLifecycle::Recovering);
+        assert_eq!(
+            persisted.run.operations[&operation_id].state,
+            run::OperationState::Uncertain,
+            "the applied Turn must remain fenced rather than reactivate with fabricated zero usage"
+        );
+        runtime.shutdown().await.expect("runtime shuts down");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

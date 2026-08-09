@@ -1,12 +1,12 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "run": {
     "revision": 1,
     "controller_epoch": 1,
     "created_at_ms": 1000,
     "updated_at_ms": 1000,
-    "id": "run_golden",
-    "session": "session_golden",
+    "id": "run_fixture",
+    "session": "session_fixture",
     "goal": {
       "objective": "Produce verified output",
       "acceptance_criteria": [],
@@ -15,7 +15,7 @@
     },
     "driver": {
       "type": "autonomous_turn_loop",
-      "session": "session_golden",
+      "session": "session_fixture",
       "strategy_revision": 0
     },
     "status": "user_paused",

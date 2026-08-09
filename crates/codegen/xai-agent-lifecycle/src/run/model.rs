@@ -3,7 +3,8 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
 
-pub const RUN_SCHEMA_VERSION: u32 = 1;
+pub const RUN_SCHEMA_VERSION: u32 = 2;
+pub const MAX_RUN_ENVELOPE_BYTES: usize = 16 * 1024 * 1024;
 pub(crate) const MAX_OBJECTIVE_BYTES: usize = 16 * 1024;
 pub(crate) const MAX_LIST_ITEMS: usize = 128;
 pub(crate) const MAX_ITEM_BYTES: usize = 8 * 1024;
@@ -11,6 +12,38 @@ pub(crate) const MAX_EVENTS: usize = 256;
 pub(crate) const MAX_COMMAND_RECEIPTS: usize = 4096;
 pub(crate) const MAX_MESSAGES: usize = 1024;
 pub(crate) const MAX_ITERATION_SUMMARIES: usize = 128;
+pub(crate) const MAX_OPERATIONS: usize = 1024;
+pub(crate) const MAX_ARTIFACT_SIZE: u64 = 1 << 50;
+
+fn validate_text(
+    value: &str,
+    max: usize,
+    description: &str,
+    allow_empty: bool,
+) -> Result<(), RunError> {
+    if value.len() > max || (!allow_empty && value.trim().is_empty()) {
+        Err(RunError::Validation(format!("invalid {description}")))
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_text_set(
+    values: &BTreeSet<String>,
+    max_items: usize,
+    max_item_bytes: usize,
+    description: &str,
+) -> Result<(), RunError> {
+    if values.len() > max_items {
+        return Err(RunError::Validation(format!(
+            "{description} exceeds its item bound"
+        )));
+    }
+    for value in values {
+        validate_text(value, max_item_bytes, description, false)?;
+    }
+    Ok(())
+}
 
 fn valid_identifier(value: &str, max: usize) -> bool {
     !value.is_empty()
@@ -281,7 +314,8 @@ impl<'de> Deserialize<'de> for RunLifecycle {
         use serde::de::Error as _;
         let wire = RunLifecycleWire::deserialize(deserializer)?;
         match wire.state.as_str() {
-            "active" => Ok(Self::Active),
+            "active" if wire.detail.is_none() => Ok(Self::Active),
+            "active" => Err(D::Error::custom("active lifecycle must not contain detail")),
             "waiting" => serde_json::from_value(
                 wire.detail
                     .ok_or_else(|| D::Error::custom("waiting lifecycle omitted its detail"))?,
@@ -294,7 +328,10 @@ impl<'de> Deserialize<'de> for RunLifecycle {
             )
             .map(Self::Finished)
             .map_err(D::Error::custom),
-            "recovering" => Ok(Self::Recovering),
+            "recovering" if wire.detail.is_none() => Ok(Self::Recovering),
+            "recovering" => Err(D::Error::custom(
+                "recovering lifecycle must not contain detail",
+            )),
             _ => Ok(Self::Recovering),
         }
     }
@@ -385,6 +422,30 @@ impl RunDriverSpec {
             Self::External { .. } | Self::Unknown => None,
         }
     }
+
+    fn validate(&self) -> Result<(), RunError> {
+        match self {
+            Self::AutonomousTurnLoop { .. } => Ok(()),
+            Self::RhaiWorkflow {
+                workflow_name,
+                args_digest,
+                ..
+            } => {
+                validate_text(workflow_name, 256, "workflow name", false)?;
+                validate_text(args_digest, 512, "workflow args digest", false)
+            }
+            Self::External {
+                driver_name,
+                driver_version,
+            } => {
+                validate_text(driver_name, 256, "external driver name", false)?;
+                validate_text(driver_version, 256, "external driver version", false)
+            }
+            Self::Unknown => Err(RunError::Integrity(
+                "unknown durable Run driver requires schema migration".into(),
+            )),
+        }
+    }
 }
 
 #[non_exhaustive]
@@ -412,13 +473,15 @@ impl CapabilityPolicy {
     }
 
     pub fn validate(&self) -> Result<(), RunError> {
-        if self.required.is_subset(&self.available) && self.required.is_subset(&self.ceiling) {
-            Ok(())
-        } else {
-            Err(RunError::Capability(
-                "required capabilities exceed runtime availability or Run ceiling".into(),
-            ))
+        for values in [&self.required, &self.available, &self.ceiling] {
+            validate_text_set(values, MAX_LIST_ITEMS, 256, "capability name")?;
         }
+        if !self.required.is_subset(&self.available) || !self.required.is_subset(&self.ceiling) {
+            return Err(RunError::Capability(
+                "required capabilities exceed runtime availability or Run ceiling".into(),
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -536,9 +599,11 @@ impl ResourceVector {
 
     pub(crate) fn with_reservations(&self, reservations: &Self) -> Option<Self> {
         let mut combined = self.add_reservation(reservations)?;
-        combined.agent_concurrency = self
-            .agent_concurrency
-            .checked_add(reservations.agent_concurrency)?;
+        // Settled usage records the historical concurrency high-water mark;
+        // only concurrently active reservations add to one another. Combining
+        // the two therefore takes the maximum rather than charging history as
+        // if it were still running.
+        combined.agent_concurrency = self.agent_concurrency.max(reservations.agent_concurrency);
         Some(combined)
     }
 }
@@ -597,8 +662,22 @@ impl ArtifactRef {
         if !valid_sha256(&self.digest)
             || self.media_type.trim().is_empty()
             || self.owner.trim().is_empty()
+            || self.size > MAX_ARTIFACT_SIZE
         {
             return Err(RunError::Validation("invalid artifact reference".into()));
+        }
+        validate_text(&self.media_type, 256, "artifact media type", false)?;
+        validate_text(&self.provenance, 1024, "artifact provenance", false)?;
+        validate_text(&self.owner, 160, "artifact owner", false)?;
+        validate_text(&self.retention, 128, "artifact retention", false)?;
+        validate_text_set(
+            &self.evidence_labels,
+            MAX_LIST_ITEMS,
+            256,
+            "artifact evidence label",
+        )?;
+        if let Some(workspace_digest) = &self.workspace_digest {
+            validate_text(workspace_digest, 512, "artifact workspace digest", false)?;
         }
         Ok(())
     }
@@ -672,6 +751,29 @@ impl IterationContextManifest {
         self.steering_high_water = value;
         self
     }
+
+    pub fn validate(&self) -> Result<(), RunError> {
+        validate_text(&self.policy_digest, 256, "iteration policy digest", false)?;
+        validate_text(&self.model_revision, 256, "iteration model revision", false)?;
+        validate_text(
+            &self.workspace_revision,
+            512,
+            "iteration workspace revision",
+            false,
+        )?;
+        if self.history_range.0 > self.history_range.1 || self.artifacts.len() > MAX_LIST_ITEMS {
+            return Err(RunError::Validation(
+                "iteration context range or artifact count is invalid".into(),
+            ));
+        }
+        if let Some(memory_snapshot) = &self.memory_snapshot {
+            validate_text(memory_snapshot, 512, "iteration memory snapshot", false)?;
+        }
+        for artifact in &self.artifacts {
+            artifact.validate()?;
+        }
+        Ok(())
+    }
 }
 
 #[non_exhaustive]
@@ -690,6 +792,33 @@ pub struct IterationManifest {
     pub result_digest: Option<String>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub recovery_abandoned: bool,
+}
+
+impl IterationManifest {
+    pub fn validate(&self) -> Result<(), RunError> {
+        if self.iteration_id.get() == 0
+            || self
+                .summary
+                .as_ref()
+                .is_some_and(|value| value.len() > MAX_ITEM_BYTES)
+            || self.evidence.len() > MAX_LIST_ITEMS
+            || self.gates.len() > MAX_LIST_ITEMS
+            || self
+                .result_digest
+                .as_ref()
+                .is_some_and(|digest| !valid_sha256(digest))
+        {
+            return Err(RunError::Validation("invalid iteration manifest".into()));
+        }
+        self.context.validate()?;
+        for artifact in &self.evidence {
+            artifact.validate()?;
+        }
+        for gate in self.gates.keys() {
+            validate_text(gate, 256, "gate name", false)?;
+        }
+        Ok(())
+    }
 }
 
 #[non_exhaustive]
@@ -755,6 +884,43 @@ impl EffectSpec {
     pub fn digest(&self) -> Result<String, RunError> {
         canonical_digest(self)
     }
+
+    pub fn validate(&self) -> Result<(), RunError> {
+        match self {
+            Self::SessionTurn {
+                turn_id,
+                prompt_digest,
+                input,
+                ..
+            } => {
+                validate_text(turn_id, 512, "Session Turn id", false)?;
+                validate_text(prompt_digest, 160, "Session Turn prompt digest", false)?;
+                input.validate()
+            }
+            Self::RhaiWorkflow { workflow, args, .. } => {
+                workflow.validate()?;
+                args.validate()
+            }
+            Self::ChildAgent { request, .. } => request.validate(),
+            Self::Gate { name, input } => {
+                validate_text(name, 256, "gate name", false)?;
+                input.validate()
+            }
+            Self::ArtifactMutation { mutation } => mutation.validate(),
+            Self::External {
+                provider,
+                version,
+                payload,
+            } => {
+                validate_text(provider, 256, "effect provider", false)?;
+                validate_text(version, 256, "effect provider version", false)?;
+                payload.validate()
+            }
+            Self::Unknown => Err(RunError::Integrity(
+                "unknown durable Run effect requires schema migration".into(),
+            )),
+        }
+    }
 }
 
 #[non_exhaustive]
@@ -798,6 +964,105 @@ pub struct OperationAttempt {
 }
 
 #[non_exhaustive]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResourceDimension {
+    Iterations,
+    AgentCalls,
+    AgentConcurrency,
+    ActiveMs,
+    WallMs,
+    Tokens,
+    CostMicros,
+    ArtifactBytes,
+    #[serde(other)]
+    Unknown,
+}
+
+#[non_exhaustive]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EffectUsage {
+    pub resources: ResourceVector,
+    /// Explicitly unknown dimensions. Their numeric resource value must be
+    /// zero, but zero is not interpreted as measured usage.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub unknown: BTreeSet<ResourceDimension>,
+}
+
+impl EffectUsage {
+    pub fn measured(resources: ResourceVector) -> Self {
+        Self {
+            resources,
+            unknown: BTreeSet::new(),
+        }
+    }
+
+    pub fn unknown(mut self, dimensions: impl IntoIterator<Item = ResourceDimension>) -> Self {
+        self.unknown.extend(dimensions);
+        self
+    }
+
+    pub fn validate(&self) -> Result<(), RunError> {
+        if self.unknown.contains(&ResourceDimension::Unknown)
+            || self
+                .unknown
+                .iter()
+                .any(|dimension| resource_value(&self.resources, *dimension) != 0)
+        {
+            return Err(RunError::Validation(
+                "effect usage has an invalid unknown dimension".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn allows_settlement_with(
+        &self,
+        reservation: &ResourceVector,
+        budget: &ResourceVector,
+    ) -> bool {
+        ALL_RESOURCE_DIMENSIONS.iter().all(|dimension| {
+            if self.unknown.contains(dimension) {
+                resource_value(budget, *dimension) == u64::MAX
+            } else {
+                let actual = resource_value(&self.resources, *dimension);
+                actual <= resource_value(reservation, *dimension)
+                    && actual <= resource_value(budget, *dimension)
+            }
+        })
+    }
+
+    pub fn is_unknown(&self, dimension: ResourceDimension) -> bool {
+        self.unknown.contains(&dimension)
+    }
+}
+
+const ALL_RESOURCE_DIMENSIONS: [ResourceDimension; 8] = [
+    ResourceDimension::Iterations,
+    ResourceDimension::AgentCalls,
+    ResourceDimension::AgentConcurrency,
+    ResourceDimension::ActiveMs,
+    ResourceDimension::WallMs,
+    ResourceDimension::Tokens,
+    ResourceDimension::CostMicros,
+    ResourceDimension::ArtifactBytes,
+];
+
+fn resource_value(resources: &ResourceVector, dimension: ResourceDimension) -> u64 {
+    match dimension {
+        ResourceDimension::Iterations => resources.iterations,
+        ResourceDimension::AgentCalls => resources.agent_calls,
+        ResourceDimension::AgentConcurrency => resources.agent_concurrency,
+        ResourceDimension::ActiveMs => resources.active_ms,
+        ResourceDimension::WallMs => resources.wall_ms,
+        ResourceDimension::Tokens => resources.tokens,
+        ResourceDimension::CostMicros => resources.cost_micros,
+        ResourceDimension::ArtifactBytes => resources.artifact_bytes,
+        ResourceDimension::Unknown => 0,
+    }
+}
+
+#[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EffectReceipt {
     pub receipt_id: String,
@@ -807,6 +1072,15 @@ pub struct EffectReceipt {
     pub runtime_prompt_index: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub outcome: Option<SessionTurnOutcome>,
+    /// Usage bound into the SessionLedger settlement identity. This covers the
+    /// native Turn only and may explicitly mark dimensions as unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_usage: Option<Box<EffectUsage>>,
+    /// Complete usage known to the Run callback, including SDK-owned artifacts
+    /// and post-processing. Recovery may use it only when every finite budget
+    /// dimension is measured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actual_usage: Option<Box<EffectUsage>>,
 }
 
 #[non_exhaustive]
@@ -842,6 +1116,8 @@ impl EffectReceipt {
             settlement_id: None,
             runtime_prompt_index: None,
             outcome: None,
+            session_usage: None,
+            actual_usage: None,
         }
     }
 
@@ -851,6 +1127,8 @@ impl EffectReceipt {
         prompt_digest: &str,
         runtime_prompt_index: u64,
         outcome: SessionTurnOutcome,
+        session_usage: EffectUsage,
+        actual_usage: EffectUsage,
     ) -> Self {
         let settlement_id = session_turn_settlement_id(
             session,
@@ -858,13 +1136,23 @@ impl EffectReceipt {
             prompt_digest,
             runtime_prompt_index,
             outcome,
+            &session_usage,
         );
+        let usage_digest =
+            canonical_digest(&actual_usage).expect("EffectUsage serialization cannot fail");
         Self {
-            receipt_id: format!("session-ledger:{settlement_id}"),
+            receipt_id: format!("session-ledger:{settlement_id}:{usage_digest}"),
             settlement_id: Some(settlement_id),
             runtime_prompt_index: Some(runtime_prompt_index),
             outcome: Some(outcome),
+            session_usage: Some(Box::new(session_usage)),
+            actual_usage: Some(Box::new(actual_usage)),
         }
+    }
+
+    pub fn actual_usage(mut self, usage: EffectUsage) -> Self {
+        self.actual_usage = Some(Box::new(usage));
+        self
     }
 }
 
@@ -874,9 +1162,10 @@ pub fn session_turn_settlement_id(
     prompt_digest: &str,
     runtime_prompt_index: u64,
     outcome: SessionTurnOutcome,
+    usage: &EffectUsage,
 ) -> String {
     let mut digest = Sha256::new();
-    digest.update(b"origin-grok-runtime.settlement.v1\0");
+    digest.update(b"origin-grok-runtime.settlement.v2\0");
     let prompt_index = runtime_prompt_index.to_be_bytes();
     for field in [
         session.as_str().as_bytes(),
@@ -888,6 +1177,9 @@ pub fn session_turn_settlement_id(
         digest.update((field.len() as u64).to_be_bytes());
         digest.update(field);
     }
+    let usage = serde_json::to_vec(usage).expect("EffectUsage serialization cannot fail");
+    digest.update((usage.len() as u64).to_be_bytes());
+    digest.update(usage);
     format!("sha256:{:x}", digest.finalize())
 }
 
@@ -895,8 +1187,12 @@ pub(crate) fn validate_effect_receipt(
     spec: &EffectSpec,
     receipt: &EffectReceipt,
 ) -> Result<(), RunError> {
-    if receipt.receipt_id.trim().is_empty() || receipt.receipt_id.len() > 512 {
-        return Err(RunError::Validation("invalid effect receipt".into()));
+    validate_effect_receipt_evidence(receipt)?;
+    if let Some(usage) = &receipt.session_usage {
+        usage.validate()?;
+    }
+    if let Some(usage) = &receipt.actual_usage {
+        usage.validate()?;
     }
     if let EffectSpec::SessionTurn {
         session,
@@ -916,6 +1212,14 @@ pub(crate) fn validate_effect_receipt(
         let outcome = receipt.outcome.ok_or_else(|| {
             RunError::Integrity("Session turn receipt omitted typed outcome".into())
         })?;
+        let session_usage = receipt.session_usage.as_ref().ok_or_else(|| {
+            RunError::Integrity("Session turn receipt omitted ledger usage evidence".into())
+        })?;
+        let actual_usage = receipt.actual_usage.as_ref().ok_or_else(|| {
+            RunError::Integrity("Session turn receipt omitted Run usage evidence".into())
+        })?;
+        session_usage.validate()?;
+        actual_usage.validate()?;
         if outcome == SessionTurnOutcome::Unknown {
             return Err(RunError::Integrity(
                 "unknown Session turn outcome is not settlement evidence".into(),
@@ -927,12 +1231,32 @@ pub(crate) fn validate_effect_receipt(
             prompt_digest,
             runtime_prompt_index,
             outcome,
+            session_usage,
         );
-        if settlement_id != expected || receipt.receipt_id != format!("session-ledger:{expected}") {
+        let usage_digest = canonical_digest(actual_usage)?;
+        if settlement_id != expected
+            || receipt.receipt_id != format!("session-ledger:{expected}:{usage_digest}")
+        {
             return Err(RunError::Integrity(
                 "Session turn receipt does not match its durable intent".into(),
             ));
         }
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_effect_receipt_evidence(receipt: &EffectReceipt) -> Result<(), RunError> {
+    if receipt.receipt_id.trim().is_empty() || receipt.receipt_id.len() > 512 {
+        return Err(RunError::Validation("invalid effect receipt".into()));
+    }
+    if receipt
+        .settlement_id
+        .as_ref()
+        .is_some_and(|value| value.len() > 512 || value.trim().is_empty())
+    {
+        return Err(RunError::Validation(
+            "invalid effect settlement identity".into(),
+        ));
     }
     Ok(())
 }
@@ -948,6 +1272,8 @@ pub struct Operation {
     pub state: OperationState,
     pub next_attempt: u32,
     pub active_attempt: Option<OperationAttempt>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reservation: Option<ResourceVector>,
     pub receipt: Option<EffectReceipt>,
     pub terminal_result_digest: Option<String>,
 }
@@ -963,6 +1289,7 @@ pub struct CommittedEffect {
     pub epoch: ControllerEpoch,
     pub effect_class: EffectClass,
     pub spec: EffectSpec,
+    pub reservation: ResourceVector,
 }
 
 #[non_exhaustive]
@@ -1057,6 +1384,27 @@ pub struct ChildRun {
     pub artifacts: Vec<ArtifactRef>,
 }
 
+impl ChildRun {
+    fn validate(&self) -> Result<(), RunError> {
+        if self.state == ChildState::Unknown
+            || self.completion_policy == ChildCompletionPolicy::Unknown
+            || self.artifacts.len() > MAX_LIST_ITEMS
+        {
+            return Err(RunError::Integrity("invalid durable child Run".into()));
+        }
+        validate_text(
+            &self.workspace_isolation,
+            256,
+            "child workspace isolation",
+            false,
+        )?;
+        for artifact in &self.artifacts {
+            artifact.validate()?;
+        }
+        Ok(())
+    }
+}
+
 #[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChildCallback {
@@ -1119,6 +1467,17 @@ pub struct MailMessage {
     pub state: MessageState,
 }
 
+impl MailMessage {
+    fn validate(&self) -> Result<(), RunError> {
+        if self.sequence == 0 || self.state == MessageState::Unknown {
+            return Err(RunError::Integrity("invalid durable Run message".into()));
+        }
+        validate_text(&self.sender, 256, "message sender", false)?;
+        validate_text(&self.trust_label, 128, "message trust label", false)?;
+        validate_text(&self.body, MAX_ITEM_BYTES, "message body", false)
+    }
+}
+
 #[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StrategyRevision {
@@ -1127,6 +1486,26 @@ pub struct StrategyRevision {
     pub provenance: String,
     pub applied: bool,
     pub promotion_proposal: Option<String>,
+}
+
+impl StrategyRevision {
+    fn validate(&self) -> Result<(), RunError> {
+        if self.revision == 0 || !valid_sha256(&self.digest) {
+            return Err(RunError::Integrity(
+                "invalid durable strategy revision".into(),
+            ));
+        }
+        validate_text(&self.provenance, 512, "strategy revision provenance", false)?;
+        if let Some(proposal) = &self.promotion_proposal {
+            validate_text(
+                proposal,
+                MAX_ITEM_BYTES,
+                "strategy promotion proposal",
+                true,
+            )?;
+        }
+        Ok(())
+    }
 }
 
 #[non_exhaustive]
@@ -1155,6 +1534,29 @@ pub struct WorkflowRevision {
     pub promotion_proposal: Option<String>,
 }
 
+impl WorkflowRevision {
+    fn validate(&self) -> Result<(), RunError> {
+        if self.revision == 0
+            || !valid_sha256(&self.source_digest)
+            || self.state == WorkflowRevisionState::Unknown
+        {
+            return Err(RunError::Integrity(
+                "invalid durable workflow revision".into(),
+            ));
+        }
+        validate_text(&self.provenance, 512, "workflow revision provenance", false)?;
+        if let Some(proposal) = &self.promotion_proposal {
+            validate_text(
+                proposal,
+                MAX_ITEM_BYTES,
+                "workflow promotion proposal",
+                true,
+            )?;
+        }
+        Ok(())
+    }
+}
+
 #[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunRecord {
@@ -1173,6 +1575,11 @@ pub struct RunRecord {
     pub verifier_policy_digest: String,
     pub budget: ResourceVector,
     pub usage: ResourceVector,
+    /// Dimensions for which executed work had no trustworthy exact amount.
+    /// Such a dimension is permitted only when its budget is explicitly
+    /// unbounded (`u64::MAX`); it is never interpreted as zero-cost work.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub usage_unknown: BTreeSet<ResourceDimension>,
     pub child_reserved: ResourceVector,
     pub next_iteration_id: u64,
     pub active_iteration: Option<IterationManifest>,
@@ -1284,36 +1691,125 @@ impl<'de> Deserialize<'de> for RunEnvelope {
         D: Deserializer<'de>,
     {
         use serde::de::Error as _;
-        let wire = RunEnvelopeWire::deserialize(deserializer)?;
-        let envelope = Self {
-            schema_version: wire.schema_version,
-            run: wire.run,
-            events: wire.events,
-        };
+        let envelope = Self::from_wire(RunEnvelopeWire::deserialize(deserializer)?);
         envelope.validate().map_err(D::Error::custom)?;
         Ok(envelope)
     }
 }
 
 impl RunEnvelope {
+    fn from_wire(wire: RunEnvelopeWire) -> Self {
+        Self {
+            schema_version: wire.schema_version,
+            run: wire.run,
+            events: wire.events,
+        }
+    }
+
+    /// Decodes the durable JSON representation after enforcing the total byte
+    /// bound. Generic serde deserialization validates the schema but cannot
+    /// enforce a source-byte limit; untrusted durable input must use this API
+    /// or [`Self::from_json_reader`].
+    pub fn from_json_slice(bytes: &[u8]) -> Result<Self, RunError> {
+        if bytes.len() > MAX_RUN_ENVELOPE_BYTES {
+            return Err(RunError::Storage("Run envelope exceeds size limit".into()));
+        }
+        serde_json::from_slice(bytes).map_err(|error| RunError::Storage(error.to_string()))
+    }
+
+    /// Reads at most one byte beyond the durable envelope limit before
+    /// decoding, so a streaming source cannot force an unbounded allocation.
+    pub fn from_json_reader(reader: impl std::io::Read) -> Result<Self, RunError> {
+        use std::io::Read as _;
+
+        let mut bytes = Vec::new();
+        reader
+            .take(MAX_RUN_ENVELOPE_BYTES as u64 + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|error| RunError::Storage(error.to_string()))?;
+        Self::from_json_slice(&bytes)
+    }
+
     pub(crate) fn validate(&self) -> Result<(), RunError> {
         if self.schema_version != RUN_SCHEMA_VERSION {
             return Err(RunError::UnsupportedSchema(self.schema_version));
         }
         self.run.goal.validate()?;
         self.run.capabilities.validate()?;
+        self.run.driver.validate()?;
+        if self.events.len() > MAX_EVENTS
+            || self.run.command_receipts.len() > MAX_COMMAND_RECEIPTS
+            || self.run.iterations.len() > MAX_ITERATION_SUMMARIES
+            || self.run.mailbox.len() > MAX_MESSAGES
+            || self.run.steering.len() > MAX_MESSAGES
+            || self.run.operations.len() > MAX_OPERATIONS
+            || self.run.children.len() > MAX_MESSAGES
+            || self.run.required_gates.len() > MAX_LIST_ITEMS
+            || self.run.strategy_revisions.len() > MAX_ITERATION_SUMMARIES
+            || self.run.workflow_revisions.len() > MAX_ITERATION_SUMMARIES
+        {
+            return Err(RunError::Integrity(
+                "durable Run collection exceeds its schema bound".into(),
+            ));
+        }
+        validate_text_set(
+            &self.run.required_gates,
+            MAX_LIST_ITEMS,
+            256,
+            "required gate",
+        )?;
+        validate_text(
+            &self.run.verifier_policy_digest,
+            256,
+            "verifier policy digest",
+            false,
+        )?;
+        if self.run.usage_unknown.contains(&ResourceDimension::Unknown)
+            || self
+                .run
+                .usage_unknown
+                .iter()
+                .any(|dimension| resource_value(&self.run.budget, *dimension) != u64::MAX)
+        {
+            return Err(RunError::Integrity(
+                "unknown usage is not permitted by the finite Run budget".into(),
+            ));
+        }
         if self.run.stage == RunStage::Unknown || self.run.driver == RunDriverSpec::Unknown {
             return Err(RunError::Integrity(
                 "unknown durable Run driver or stage requires schema migration".into(),
             ));
         }
+        if let Some(iteration) = &self.run.active_iteration {
+            iteration.validate()?;
+        }
+        for iteration in &self.run.iterations {
+            iteration.validate()?;
+            if iteration.finished_at_ms.is_none() || iteration.result_digest.is_none() {
+                return Err(RunError::Integrity(
+                    "archived iteration is not durably finished".into(),
+                ));
+            }
+        }
         for (operation_id, operation) in &self.run.operations {
             if operation_id != &operation.id
-                || operation.spec == EffectSpec::Unknown
+                || !valid_sha256(&operation.spec_digest)
                 || operation.spec_digest != operation.spec.digest()?
+                || operation
+                    .terminal_result_digest
+                    .as_ref()
+                    .is_some_and(|digest| !valid_sha256(digest))
             {
                 return Err(RunError::Integrity(
                     "unknown or inconsistent durable Run operation".into(),
+                ));
+            }
+            operation.spec.validate()?;
+            if let Some(reservation) = &operation.reservation
+                && reservation.is_zero()
+            {
+                return Err(RunError::Integrity(
+                    "durable effect has an empty reservation".into(),
                 ));
             }
             if matches!(
@@ -1328,14 +1824,50 @@ impl RunEnvelope {
             }
             if matches!(
                 operation.state,
+                OperationState::Dispatching
+                    | OperationState::Acknowledged
+                    | OperationState::Reconciled
+                    | OperationState::Uncertain
+            ) && operation.reservation.is_none()
+            {
+                return Err(RunError::Integrity(
+                    "claimed durable effect omitted its reservation".into(),
+                ));
+            }
+            if operation.state == OperationState::Abandoned && operation.receipt.is_some() {
+                return Err(RunError::Integrity(
+                    "abandoned effect retained Applied receipt evidence".into(),
+                ));
+            }
+            if let Some(receipt) = &operation.receipt {
+                if operation.state == OperationState::Uncertain {
+                    // An Applied callback may carry incomplete or unusable
+                    // usage evidence. Preserve it only behind the recovery
+                    // fence; settlement validation remains strict below.
+                    validate_effect_receipt_evidence(receipt)?;
+                } else {
+                    validate_effect_receipt(&operation.spec, receipt)?;
+                }
+            }
+            if matches!(
+                operation.state,
                 OperationState::Acknowledged | OperationState::Reconciled
             ) {
-                validate_effect_receipt(
-                    &operation.spec,
-                    operation.receipt.as_ref().ok_or_else(|| {
-                        RunError::Integrity("settled operation omitted its receipt".into())
-                    })?,
-                )?;
+                let receipt = operation.receipt.as_ref().ok_or_else(|| {
+                    RunError::Integrity("settled operation omitted its receipt".into())
+                })?;
+                validate_effect_receipt(&operation.spec, receipt)?;
+                let reservation = operation.reservation.as_ref().ok_or_else(|| {
+                    RunError::Integrity("settled effect omitted its reservation".into())
+                })?;
+                let actual = receipt.actual_usage.as_ref().ok_or_else(|| {
+                    RunError::Integrity("settled effect omitted actual usage".into())
+                })?;
+                if !actual.allows_settlement_with(reservation, &self.run.budget) {
+                    return Err(RunError::Integrity(
+                        "settled effect usage exceeds reservation or finite budget".into(),
+                    ));
+                }
             }
             if operation.state == OperationState::Acknowledged
                 && (operation.active_attempt.is_none()
@@ -1362,27 +1894,40 @@ impl RunEnvelope {
                 ));
             }
         }
-        if self.run.children.iter().any(|(child_id, child)| {
-            child_id != &child.id
-                || child.state == ChildState::Unknown
-                || child.completion_policy == ChildCompletionPolicy::Unknown
-        }) || self.run.mailbox.iter().any(|(message_id, message)| {
-            message_id != &message.id || message.state == MessageState::Unknown
-        }) || self.run.steering.iter().any(|(message_id, message)| {
-            message_id != &message.id || message.state == MessageState::Unknown
-        }) || self
+        for (child_id, child) in &self.run.children {
+            if child_id != &child.id {
+                return Err(RunError::Integrity(
+                    "durable child map identity is inconsistent".into(),
+                ));
+            }
+            child.validate()?;
+        }
+        for messages in [&self.run.mailbox, &self.run.steering] {
+            for (message_id, message) in messages {
+                if message_id != &message.id {
+                    return Err(RunError::Integrity(
+                        "durable message map identity is inconsistent".into(),
+                    ));
+                }
+                message.validate()?;
+            }
+        }
+        for revision in &self.run.strategy_revisions {
+            revision.validate()?;
+        }
+        for revision in &self.run.workflow_revisions {
+            revision.validate()?;
+        }
+        if self
             .run
             .command_receipts
             .iter()
             .any(|(command_id, receipt)| {
                 command_id != &receipt.command_id
+                    || !valid_sha256(&receipt.input_digest)
+                    || receipt.committed_revision > self.run.revision
                     || receipt.disposition == CommandDisposition::Unknown
             })
-            || self
-                .run
-                .workflow_revisions
-                .iter()
-                .any(|revision| revision.state == WorkflowRevisionState::Unknown)
             || self.run.recovery_prior_status.is_some_and(|status| {
                 matches!(status, RunStatus::Active | RunStatus::RecoveryRequired)
             })
@@ -1391,16 +1936,42 @@ impl RunEnvelope {
                 "unknown or inconsistent durable Run child, message, or receipt state".into(),
             ));
         }
-        let mut previous_cursor = None;
+        let mut previous_cursor: Option<RunEventCursor> = None;
+        let mut previous_revision: Option<RunRevision> = None;
         for event in &self.events {
             if event.cursor > self.run.event_cursor
-                || previous_cursor.is_some_and(|cursor| event.cursor <= cursor)
+                || previous_cursor.is_some_and(|cursor| {
+                    cursor
+                        .get()
+                        .checked_add(1)
+                        .is_none_or(|next| event.cursor.get() != next)
+                })
+                || previous_revision.is_some_and(|revision| {
+                    revision
+                        .get()
+                        .checked_add(1)
+                        .is_none_or(|next| event.revision.get() != next)
+                })
             {
                 return Err(RunError::Integrity(
                     "Run event cursor ordering is inconsistent".into(),
                 ));
             }
             previous_cursor = Some(event.cursor);
+            previous_revision = Some(event.revision);
+        }
+        let journal_tail_matches = match self.events.back() {
+            Some(event) => {
+                self.run.event_cursor.get() != 0
+                    && event.cursor == self.run.event_cursor
+                    && event.revision == self.run.revision
+            }
+            None => self.run.event_cursor.get() == 0,
+        };
+        if !journal_tail_matches {
+            return Err(RunError::Integrity(
+                "Run event journal is not a complete suffix".into(),
+            ));
         }
         if self
             .run
@@ -1505,6 +2076,7 @@ pub fn migrate_legacy_goal(
         verifier_policy_digest: "legacy-import".into(),
         budget,
         usage,
+        usage_unknown: BTreeSet::new(),
         child_reserved: ResourceVector::default(),
         next_iteration_id: 1,
         active_iteration: None,
@@ -1766,11 +2338,20 @@ impl PrepareOperation {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClaimEffect {
     pub operation_id: OperationId,
+    pub reservation: ResourceVector,
 }
 
 impl ClaimEffect {
     pub fn new(operation_id: OperationId) -> Self {
-        Self { operation_id }
+        Self {
+            operation_id,
+            reservation: ResourceVector::default(),
+        }
+    }
+
+    pub fn reservation(mut self, reservation: ResourceVector) -> Self {
+        self.reservation = reservation;
+        self
     }
 }
 
@@ -1953,11 +2534,6 @@ impl SetWorkflowRevision {
 pub struct RecoveryResolution {
     pub resume: bool,
     pub abandon_active_iteration: bool,
-    /// Required when recovery abandons an iteration whose effect was already
-    /// applied. The Host must provide observed usage; the SDK never invents
-    /// zero-cost usage for an executed Turn.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub recovered_usage: Option<ResourceVector>,
 }
 
 impl RecoveryResolution {
@@ -1965,13 +2541,7 @@ impl RecoveryResolution {
         Self {
             resume,
             abandon_active_iteration,
-            recovered_usage: None,
         }
-    }
-
-    pub fn recovered_usage(mut self, usage: ResourceVector) -> Self {
-        self.recovered_usage = Some(usage);
-        self
     }
 }
 
@@ -2011,7 +2581,7 @@ pub enum RunAttach {
         through: RunEventCursor,
         events: Vec<RunEvent>,
     },
-    Snapshot(RunEnvelope),
+    Snapshot(Box<RunEnvelope>),
 }
 
 #[non_exhaustive]

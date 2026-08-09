@@ -1,11 +1,10 @@
 use super::model::{
-    IterationManifest, RUN_SCHEMA_VERSION, RunEnvelope, RunError, RunId, RunRevision, RunStatus,
+    IterationManifest, MAX_RUN_ENVELOPE_BYTES, RUN_SCHEMA_VERSION, RunEnvelope, RunError, RunId,
+    RunRevision, RunStatus,
 };
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-
-const MAX_ENVELOPE_BYTES: usize = 16 * 1024 * 1024;
 
 #[non_exhaustive]
 #[derive(Clone, Debug)]
@@ -79,7 +78,6 @@ impl LocalRunStore {
                    key TEXT PRIMARY KEY,
                    value INTEGER NOT NULL
                  );
-                 INSERT OR IGNORE INTO metadata(key,value) VALUES('schema_version',1);
                  CREATE TABLE IF NOT EXISTS runs(
                    run_id TEXT PRIMARY KEY,
                    revision INTEGER NOT NULL,
@@ -93,6 +91,12 @@ impl LocalRunStore {
                    PRIMARY KEY(run_id, iteration_id),
                    FOREIGN KEY(run_id) REFERENCES runs(run_id)
                  );",
+            )
+            .map_err(sql_error)?;
+        connection
+            .execute(
+                "INSERT OR IGNORE INTO metadata(key,value) VALUES('schema_version',?1)",
+                [RUN_SCHEMA_VERSION],
             )
             .map_err(sql_error)?;
         let version: u32 = connection
@@ -126,7 +130,15 @@ impl RunStore for LocalRunStore {
             |row| row.get::<_, Vec<u8>>(0),
         );
         match result {
-            Ok(bytes) => decode_envelope(&bytes).map(Some),
+            Ok(bytes) => {
+                let envelope = decode_envelope(&bytes)?;
+                if envelope.run.id != *run_id {
+                    return Err(RunError::Integrity(
+                        "Run store returned an envelope for a different Run id".into(),
+                    ));
+                }
+                Ok(Some(envelope))
+            }
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(error) => Err(sql_error(error)),
         }
@@ -164,7 +176,7 @@ impl RunStore for LocalRunStore {
         }
         let bytes = serde_json::to_vec(&commit.next)
             .map_err(|error| RunError::Storage(error.to_string()))?;
-        if bytes.len() > MAX_ENVELOPE_BYTES {
+        if bytes.len() > MAX_RUN_ENVELOPE_BYTES {
             return Err(RunError::Validation(
                 "serialized Run envelope exceeds 16 MiB".into(),
             ));
@@ -268,13 +280,7 @@ impl LocalRunStore {
 }
 
 fn decode_envelope(bytes: &[u8]) -> Result<RunEnvelope, RunError> {
-    if bytes.len() > MAX_ENVELOPE_BYTES {
-        return Err(RunError::Storage("Run envelope exceeds size limit".into()));
-    }
-    let envelope: RunEnvelope =
-        serde_json::from_slice(bytes).map_err(|error| RunError::Storage(error.to_string()))?;
-    envelope.validate()?;
-    Ok(envelope)
+    RunEnvelope::from_json_slice(bytes)
 }
 
 fn sql_error(error: rusqlite::Error) -> RunError {
