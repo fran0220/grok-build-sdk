@@ -20,6 +20,47 @@ Explicit model providers use the repository's real Chat Completions or Responses
 
 Provider and MCP secret-bearing types deliberately omit both `Debug` and `Serialize`; they support `Deserialize` for host-owned configuration input without offering an accidental secret-export path. An explicit provider never resolves its key from an environment variable, Grok login, or ambient Grok config. Unoverridden catalog models retain the legacy endpoint/key fallback for compatibility. Optional auxiliary roles are disabled when omitted rather than falling through to an ambient first-party credential.
 
+For a desktop credential boundary, set `ApiProviderConfig.base_url` to the
+Host's loopback OpenAI-compatible relay and set `api_key` to the relay-scoped
+bearer. The SDK sends that value as `Authorization: Bearer …` and does not
+persist the provider configuration. Raw provider credentials can therefore
+remain in the Host's OS-keychain/relay boundary. Catalog or credential changes
+are admitted by draining the current Runtime and starting its replacement with
+the new fixed configuration; the SDK intentionally has no runtime registry or
+mutable provider-credential store.
+
+## Native desktop M1–M3 public-contract map
+
+This table records the minimum embedding contract and prevents product hosts
+from replacing runtime-native behavior with a second harness, registry, or
+executable.
+
+| Milestone concern | Current public contract | Gap / decision |
+|---|---|---|
+| Application model catalog | `RuntimeConfig::models`, `ModelSpec`, `Runtime::list_models` | Complete for a Host-owned fixed catalog. Refresh revisions and connection health remain Host state; restart the drained Runtime to admit a new catalog. |
+| Provider endpoint + relay bearer | `ApiProviderConfig`, `RuntimeBuilder::model_provider` | Complete. `api_key` is the Bearer value and may be a loopback-relay token. Provider raw credentials need not enter the SDK. |
+| One Runtime, one Session per Host Thread | `Runtime`, `create_session`, `load_session`, `resume_session`, `unload_session` | Complete; no registry or external executable is required. The Host owns the Thread↔Session mapping. |
+| Session cwd/model/reasoning | `SessionConfig::{cwd, model, reasoning}`, `Runtime::set_route` | Complete for M1. Explicit reasoning wins; omission resolves to the validated fixed-catalog default on create/load/resume and route changes. |
+| Restart, recovery, receipt, cursor | `PromptReceipt`, `SessionLedger`, rewind receipts, `events_after`, Run reconciliation/attach APIs | Complete for M1. A cursor gap is typed and fails closed. |
+| Immutable harness materialization | `HarnessSnapshot`, `HarnessContent`, `MaterializedHarness` | First-batch contract on this branch. A snapshot requires the complete system prompt; rules are deterministically folded into that authoritative override for native create/load/resume. There is no mutable SDK harness store. |
+| Turn binding | `TurnBindingReceipt`, `CompleteEventCursor`, `SdkProvenance`, harness-aware Session/prompt methods | First-batch contract on this branch. Provider-wire tests cover exact prompt replacement, rules update/removal, effective routes, load/resume and Runtime restart before a receipt is issued. |
+| Optimistic refinement | `HarnessRefinementPatch`, `HarnessRefinement` | First-batch contract on this branch. Patch application rejects stale content identity and duplicate typed targets. The Host commits revisions, evidence, activation, history and rollback. |
+| Child agent / A2A | `SubagentSnapshot`, `SubagentCancelReceipt`, live list/get/cancel methods; lifecycle support types include `ChildRun`, `ChildCallback` and `MailMessage` | M3 audit only. The live coordinator uses session/string identities and is not connected to durable Run children/mailbox state. There is no façade handle binding parent Run/Session, child Session, callback token, settlement and complete cursor, nor an A2A delivery receipt. |
+| Persistent kernel | `TerminalBackend`, background task handles, native terminal/PTY/process tools | M3 audit only. Persistent shell state restores cwd/environment around newly spawned commands; it is not a checkpointable programmatic kernel with durable identity, execution receipt, cancel/restart and state-restore semantics. No internal kernel implementation is suitable to publish. |
+| Continuation / gates | Generation-bound `McpContinuation`; Run-scoped `GateRequest`, `GateEvaluation`, `GateProvider` | M3 audit only. MCP continuation is one non-serializable live MRTR retry and a gate evaluation is an immediate provider result. Neither supplies a durable Host aggregate with identity/revision, ownership transfer, replay cursor or content-bound receipt. |
+
+The dependency order is M1 baseline → immutable snapshot/refinement façade →
+runtime-generated Turn binding receipt → Host revision/evidence/activation
+integration → narrow M3 schemas and receipts. M3a can begin only by connecting
+the existing durable child identity/callback token to the native coordinator
+and defining admission, cancellation and settlement receipts; A2A mailbox
+delivery follows that identity boundary. M3b may then define durable
+continuation/gate ownership and replay receipts on top of Turn and child
+cursors. M3c remains blocked until an actual internal kernel driver has a
+stable handle plus checkpoint, cancel, restart and settlement boundaries;
+terminal/PTY APIs must not be renamed into a kernel façade. This keeps every
+public change additive and independently reviewable.
+
 ## Profiles and trust boundary
 
 `Restricted` is the default and remains fail-closed for plugins, MCP, subagents, workflows, network tools, media tools, and workspace `.envrc` evaluation. Supplying their configuration does not enable them. `Desktop` restores the repository-native feature surface inside the embedded storage/process boundary; each media operation is still independently gated by `MediaServiceConfig`.
@@ -31,6 +72,37 @@ Agent commands, scheduler operations, workflows, subagents, MCP, hooks, permissi
 Screenshots, accessibility trees (AX/UIA/AT-SPI), OCR, and mouse/keyboard automation are not native Grok capabilities; a desktop host must provide those through an audited `HostDelegate`. Rich prompt blocks can be submitted independently of TUI support. The current sampling layer has no native audio part, so audio is preserved losslessly as a data-URI text attachment rather than silently discarded.
 
 The event receiver provides push delivery. `events_after` reads the same bounded per-session journal and reports `Error::EventGap` when a cursor was evicted.
+
+## Immutable harness and Turn binding
+
+`HarnessSnapshot` freezes the native system-prompt/rules inputs under a
+domain-separated SHA-256 content identity. Its fields are private, generic
+deserialization validates the declared digest, and the bounded
+`from_json_slice` entry point rejects oversized durable input before parsing.
+`MaterializedHarness::apply_to_session` preserves Session `cwd`, `model`, and
+`reasoning`, while replacing the complete native system-prompt override. Rules
+are folded into that override under `<human_rules>` rather than sent as a
+second native input, so the snapshot digest never covers content skipped by
+provider inference.
+
+`HarnessRefinementPatch` is a typed optimistic transform against one snapshot
+digest. It rejects a stale base and multiple changes to one target, then
+returns another uncommitted immutable snapshot. It has no revision number or
+activation operation: the Host remains the sole owner of revision CAS,
+evidence, activation, history, and rollback.
+
+Use `create_session_with_harness`, `load_session_with_harness`, or
+`resume_session_with_harness` to bind one Session incarnation to a snapshot.
+`prompt_with_harness` and `prompt_content_with_harness` issue a
+`TurnBindingReceipt` only after the native Turn settles and the SDK verifies a
+contiguous live event range ending at its matching terminal event. The receipt
+identity covers Session/Turn/prompt settlement, snapshot digest, selected
+model/reasoning, exact SDK source provenance, usage, and the complete cursor.
+Snapshot mismatch fails before dispatch; an event gap fails closed after the
+settled Turn and remains recoverable through the existing Session ledger.
+Reasoning in the receipt is the same effective value sent to native metadata
+and observed on the provider wire: an explicit Session value, otherwise the
+validated default from the Runtime's fixed catalog.
 
 ## Durable autonomous Runs: first vertical slice
 
@@ -61,7 +133,7 @@ This is not a remote-only Runtime mode. Startup still creates `grok_home` and `s
 
 ### This is not yet full Prime Agent parity
 
-The target SDK architecture still includes heartbeat/schedule runtime semantics, background worker claim/resume/wake residency, child Runs and A2A mailbox, context/artifact policy and compaction, skills, an independent mutable Harness aggregate with immutable `HarnessSnapshot` pinning/refinement/history/rollback, bounded Rhai workflow execution, and a `ProgramRuntime`/`PersistentKernelDriver` boundary for persistent programmable environments. Kernel/VM snapshots may be best effort; durable truth will remain explicit Run state, artifacts, handles, effects, and receipts. Rhai will be a bounded workflow driver, not a claim of RLM/IPython equivalence.
+The target SDK architecture still includes heartbeat/schedule runtime semantics, background worker claim/resume/wake residency, child Runs and A2A mailbox, context/artifact policy and compaction, skills, Host-owned mutable Harness revisions with SDK validation/materialization of immutable `HarnessSnapshot` values, bounded Rhai workflow execution, and a `ProgramRuntime`/`PersistentKernelDriver` boundary for persistent programmable environments. Kernel/VM snapshots may be best effort; durable truth will remain explicit Run state, artifacts, handles, effects, and receipts. Rhai will be a bounded workflow driver, not a claim of RLM/IPython equivalence.
 
 Some lifecycle support types reserve future driver, child, mailbox, and revision concepts, but they are not wired through the SDK façade and are not claimed as working parity. Run schema v2 rejects non-`AutonomousTurnLoop` creation. Schema v1 Run SQLite databases and envelopes are rejected rather than silently upgraded because v1 lacks durable reservations and usage-bound receipts; migration requires an explicit offline policy. `HarnessDescriptor` negotiation and provider credential rotation are also unimplemented additive follow-ups, not hidden behavior in this release.
 

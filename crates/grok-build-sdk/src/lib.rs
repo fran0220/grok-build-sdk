@@ -6,9 +6,17 @@
 //! private implementation details.
 
 mod autonomous;
+mod harness;
 mod private;
 
 pub use autonomous::{AutonomousActivation, AutonomousActivationResult, AutonomousTurnLoop};
+pub use harness::{
+    CompleteEventCursor, HARNESS_SNAPSHOT_SCHEMA_VERSION, HarnessContent, HarnessDigest,
+    HarnessError, HarnessRefinement, HarnessRefinementPatch, HarnessSnapshot,
+    MAX_HARNESS_SNAPSHOT_BYTES, MAX_TURN_BINDING_RECORD_BYTES, MaterializedHarness, SdkProvenance,
+    TURN_BINDING_RECORD_SCHEMA_VERSION, TurnBindingKey, TurnBindingReceipt, TurnBindingRecord,
+    TurnBindingStatus,
+};
 
 use std::{collections::BTreeMap, path::PathBuf, sync::Arc};
 use tokio::sync::mpsc;
@@ -183,11 +191,17 @@ pub struct HostCapabilities {
 }
 
 /// Explicit credentials and routing for an API-compatible model provider.
-/// Values are never read from environment variables by the runtime. API keys
-/// are intentionally omitted from both `Debug` and `Serialize`; hosts may
-/// deserialize configuration but cannot accidentally export the secret bag.
+/// Values are never read from environment variables by the runtime. The
+/// configured secret is sent as an HTTP Bearer token, so a desktop host can
+/// point the base URL at its loopback relay and supply a relay-scoped bearer
+/// instead of giving the SDK a provider's raw credential. The SDK does not
+/// persist this configuration. Secrets are intentionally omitted from both
+/// `Debug` and `Serialize`; hosts may deserialize configuration but cannot
+/// accidentally export the secret bag.
 #[derive(Clone, Default, PartialEq, serde::Deserialize)]
 pub struct ApiProviderConfig {
+    /// OpenAI-compatible API base URL, including any path prefix (usually
+    /// `/v1`). Loopback HTTP endpoints are supported.
     pub base_url: String,
     pub api_key: String,
     /// Optional model slug sent to this provider. Defaults to the catalog ID.
@@ -1986,6 +2000,8 @@ pub enum Error {
     },
     #[error(transparent)]
     DurableRun(#[from] run::RunError),
+    #[error(transparent)]
+    Harness(#[from] HarnessError),
 }
 
 fn run_reconcile_command_id(
@@ -3017,14 +3033,64 @@ impl Runtime {
     pub async fn create_session(&self, config: SessionConfig) -> Result<SessionId, Error> {
         self.inner.create_session(config).await
     }
+    /// Creates a native Session whose complete harness inputs are materialized
+    /// from one immutable snapshot. The Runtime retains only the digest needed
+    /// to issue Turn binding receipts; revision and activation remain Host state.
+    pub async fn create_session_with_harness(
+        &self,
+        config: SessionConfig,
+        snapshot: &HarnessSnapshot,
+    ) -> Result<SessionId, Error> {
+        let materialized = snapshot.materialize()?;
+        self.inner
+            .create_session_with_harness(
+                materialized.apply_to_session(config),
+                snapshot.digest().clone(),
+            )
+            .await
+    }
     pub async fn load_session(&self, id: SessionId, config: SessionConfig) -> Result<(), Error> {
         self.inner.load_session(id, config).await
+    }
+    /// Loads and replays a durable Session with the Host-selected immutable
+    /// snapshot materialized for this incarnation.
+    pub async fn load_session_with_harness(
+        &self,
+        id: SessionId,
+        config: SessionConfig,
+        snapshot: &HarnessSnapshot,
+    ) -> Result<(), Error> {
+        let materialized = snapshot.materialize()?;
+        self.inner
+            .load_session_with_harness(
+                id,
+                materialized.apply_to_session(config),
+                snapshot.digest().clone(),
+            )
+            .await
     }
     /// Resumes a durable session without replaying its historical updates.
     /// Use [`Self::load_session`] when the host needs history replay to rebuild
     /// a fresh event journal.
     pub async fn resume_session(&self, id: SessionId, config: SessionConfig) -> Result<(), Error> {
         self.inner.resume_session(id, config).await
+    }
+    /// Resumes without replay and binds this Session incarnation to the
+    /// Host-selected immutable snapshot.
+    pub async fn resume_session_with_harness(
+        &self,
+        id: SessionId,
+        config: SessionConfig,
+        snapshot: &HarnessSnapshot,
+    ) -> Result<(), Error> {
+        let materialized = snapshot.materialize()?;
+        self.inner
+            .resume_session_with_harness(
+                id,
+                materialized.apply_to_session(config),
+                snapshot.digest().clone(),
+            )
+            .await
     }
     pub async fn prompt(
         &self,
@@ -3033,6 +3099,50 @@ impl Runtime {
         text: impl Into<String>,
     ) -> Result<PromptReceipt, Error> {
         self.inner.prompt(id, turn_id.into(), text.into()).await
+    }
+    /// Executes a native text Turn and issues a receipt only after the complete
+    /// live event range through the terminal event has been retained and
+    /// verified. A journal gap fails closed after the settled Turn.
+    pub async fn prompt_with_harness(
+        &self,
+        id: &SessionId,
+        turn_id: impl Into<String>,
+        text: impl Into<String>,
+        snapshot: &HarnessSnapshot,
+    ) -> Result<TurnBindingReceipt, Error> {
+        self.prompt_content_with_harness(
+            id,
+            turn_id,
+            Prompt {
+                blocks: vec![PromptBlock::Text { text: text.into() }],
+                metadata: serde_json::Value::Null,
+            },
+            snapshot,
+        )
+        .await
+    }
+    /// Rich-content equivalent of [`Self::prompt_with_harness`].
+    pub async fn prompt_content_with_harness(
+        &self,
+        id: &SessionId,
+        turn_id: impl Into<String>,
+        prompt: Prompt,
+        snapshot: &HarnessSnapshot,
+    ) -> Result<TurnBindingReceipt, Error> {
+        snapshot.validate()?;
+        self.inner
+            .prompt_content_with_harness(id, turn_id.into(), prompt, snapshot.digest().clone())
+            .await
+    }
+    /// Recovers the immutable record for an exact harness-aware Turn. The
+    /// Session must be reattached with the same snapshot and effective route;
+    /// any conflicting ledger, snapshot, route, prompt, or index fails closed.
+    pub async fn turn_binding_status(
+        &self,
+        id: &SessionId,
+        key: TurnBindingKey,
+    ) -> Result<TurnBindingStatus, Error> {
+        self.inner.turn_binding_status(id, key).await
     }
     /// Returns retained events whose sequence is strictly greater than
     /// `after_sequence`. Unknown or currently unloaded sessions fail closed.
