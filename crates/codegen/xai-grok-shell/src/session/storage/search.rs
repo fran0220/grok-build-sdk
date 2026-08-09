@@ -188,7 +188,10 @@ impl SearchIndexManager {
 
 /// Trigger indexing for a session that was just saved or updated.
 pub fn notify_session_updated(session_id: &str, cwd: &str) {
-    let root = crate::util::grok_home::grok_home();
+    notify_session_updated_in_root(crate::util::grok_home::grok_home(), session_id, cwd);
+}
+
+pub(crate) fn notify_session_updated_in_root(root: PathBuf, session_id: &str, cwd: &str) {
     SEARCH_INDEX_MANAGER.enqueue(root, session_id.to_string(), cwd.to_string());
 }
 

@@ -61,3 +61,11 @@ fn runtime_builder_accepts_host_session_state_authority() {
     let store: Arc<dyn SessionStateStore> = Arc::new(ExternalStore);
     let _builder = Runtime::builder(config).session_state_store(store);
 }
+
+#[allow(dead_code)]
+async fn public_runtime_exposes_coordinated_session_deletion(runtime: &Runtime) {
+    let result: Result<(), grok_build_sdk::Error> = runtime
+        .delete_session(grok_build_sdk::SessionId::from_stored("session-id"))
+        .await;
+    let _ = result;
+}

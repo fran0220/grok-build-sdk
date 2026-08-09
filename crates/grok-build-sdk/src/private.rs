@@ -128,6 +128,7 @@ enum Command {
         Reply<xai_grok_shell::extensions::mcp::McpModernSubscription>,
     ),
     Close(SessionId, Reply<()>),
+    Delete(SessionId, Reply<()>),
     Unload(SessionId, Reply<()>),
     Shutdown(Reply<()>),
 }
@@ -737,6 +738,9 @@ impl Runtime {
     }
     pub async fn close_session(&self, id: SessionId) -> Result<(), Error> {
         self.call(|reply| Command::Close(id, reply)).await
+    }
+    pub async fn delete_session(&self, id: SessionId) -> Result<(), Error> {
+        self.call(|reply| Command::Delete(id, reply)).await
     }
     pub async fn events_after(&self, id: &SessionId, sequence: u64) -> Result<Vec<Event>, Error> {
         self.call(|r| Command::EventsAfter(id.clone(), sequence, r))
@@ -3297,6 +3301,9 @@ impl Core {
                 Command::Close(i, r) => {
                     let _ = r.send(self.close(i).await);
                 }
+                Command::Delete(i, r) => {
+                    let _ = r.send(self.delete(i).await);
+                }
                 Command::Unload(i, r) => {
                     let _ = r.send(self.unload(i).await);
                 }
@@ -4820,6 +4827,28 @@ impl Core {
             .map_err(|error| protocol("session/close", error))?;
         self.finish_close(&id);
         Ok(())
+    }
+    async fn delete(&self, id: SessionId) -> Result<(), Error> {
+        if self.resident.borrow().contains(&id.0) {
+            self.unload(id.clone()).await?;
+        }
+        #[derive(serde::Deserialize)]
+        struct DeleteWire {
+            success: bool,
+        }
+        let response: DeleteWire = self
+            .extension(
+                "x.ai/session/delete",
+                serde_json::json!({"sessionId": id.0}),
+            )
+            .await?;
+        if response.success {
+            Ok(())
+        } else {
+            Err(Error::Operation(
+                "native session deletion was not confirmed".into(),
+            ))
+        }
     }
     async fn unload(&self, id: SessionId) -> Result<(), Error> {
         self.require_resident(&id)?;

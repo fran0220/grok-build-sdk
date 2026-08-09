@@ -668,7 +668,14 @@ pub(crate) fn find_persisted_session_dir_by_id_in_root_result(
 }
 
 pub(crate) fn find_any_session_dir_by_id_result(session_id: &str) -> io::Result<Option<PathBuf>> {
-    storage_view(&grok_home().join("sessions"))
+    find_any_session_dir_by_id_in_root_result(session_id, &grok_home().join("sessions"))
+}
+
+pub(crate) fn find_any_session_dir_by_id_in_root_result(
+    session_id: &str,
+    sessions_root: &Path,
+) -> io::Result<Option<PathBuf>> {
+    storage_view(sessions_root)
         .and_then(|view| view.find_any_session_dir(session_id))
         .map_err(io::Error::other)
 }
@@ -3192,12 +3199,32 @@ pub async fn delete_session_history(
     needs_remote: bool,
     auth_manager: Arc<crate::auth::AuthManager>,
 ) -> Result<SessionDeletion, DeleteSessionError> {
+    delete_session_history_in_root(
+        session_id,
+        cwd,
+        needs_remote,
+        auth_manager,
+        crate::util::grok_home::grok_home(),
+    )
+    .await
+}
+
+pub(crate) async fn delete_session_history_in_root(
+    session_id: &str,
+    cwd: Option<&str>,
+    needs_remote: bool,
+    auth_manager: Arc<crate::auth::AuthManager>,
+    root: std::path::PathBuf,
+) -> Result<SessionDeletion, DeleteSessionError> {
     let sid = acp::SessionId::new(Arc::from(session_id));
+    let sessions_root = root.join("sessions");
 
     // Resolve the local session info, scoping to cwd if provided. A
     // remote-only session won't be found here — that's fine, the remote
     // delete (if applicable) still runs.
-    let summaries = list_summaries(cwd)
+    let storage = JsonlStorageAdapter::with_root(root.clone());
+    let summaries = storage
+        .list_sessions(cwd)
         .await
         .map_err(DeleteSessionError::List)?;
     let local_info = summaries
@@ -3219,24 +3246,34 @@ pub async fn delete_session_history(
         false
     };
 
-    let Some(info) = local_info else {
-        return Ok(SessionDeletion {
-            local_removed: false,
-            remote_removed,
-        });
+    let (local_removed, cwd) = if let Some(info) = local_info {
+        storage
+            .delete_session(&info)
+            .await
+            .map_err(DeleteSessionError::Local)?;
+        (true, Some(info.cwd))
+    } else if let Some(dir) = find_any_session_dir_by_id_in_root_result(session_id, &sessions_root)
+        .map_err(DeleteSessionError::Local)?
+    {
+        let cwd = dir
+            .parent()
+            .and_then(crate::util::grok_home::decode_cwd_from_dirname);
+        tokio::fs::remove_dir_all(&dir)
+            .await
+            .map_err(DeleteSessionError::Local)?;
+        (true, cwd)
+    } else {
+        (false, None)
     };
-
-    JsonlStorageAdapter::default()
-        .delete_session(&info)
-        .await
-        .map_err(DeleteSessionError::Local)?;
 
     // Evict from the search index: the indexer re-reads the (now
     // missing) summary and drops the document.
-    crate::session::storage::search::notify_session_updated(&info.id.to_string(), &info.cwd);
+    if let Some(cwd) = cwd {
+        crate::session::storage::search::notify_session_updated_in_root(root, session_id, &cwd);
+    }
 
     Ok(SessionDeletion {
-        local_removed: true,
+        local_removed,
         remote_removed,
     })
 }

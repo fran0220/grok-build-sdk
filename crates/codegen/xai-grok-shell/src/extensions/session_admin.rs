@@ -277,15 +277,32 @@ async fn handle_session_delete(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtR
     // Always drain: even a non-resident session can still have coordinator
     // children finishing after an earlier fire-and-forget TeardownSession
     // (e.g. idle unload). hard_stop / kill_all no-op when not resident.
-    agent.teardown_live_session_before_delete(&session_id).await;
+    agent
+        .teardown_live_session_before_delete(&session_id)
+        .await
+        .map_err(|message| acp::Error::internal_error().data(message))?;
+
+    // In Host-authority mode, publish the permanent tombstone after all live
+    // writers are stopped and before deleting any uncovered local sidecars.
+    // Standalone mode remains current-only and performs no additional write.
+    agent
+        .tombstone_session_state(&session_id)
+        .map_err(|error| {
+            acp::Error::internal_error()
+                .data(format!("failed to tombstone native session: {error}"))
+        })?;
 
     // Shared delete: remote-first, then local disk + FTS eviction.
     // Mirrored by the `grok sessions delete <id>` CLI path.
-    crate::session::persistence::delete_session_history(
+    crate::session::persistence::delete_session_history_in_root(
         &req.session_id,
         req.cwd.as_deref(),
         needs_remote,
         agent.auth_manager.clone(),
+        agent
+            .storage_root
+            .clone()
+            .unwrap_or_else(crate::util::grok_home::grok_home),
     )
     .await
     .map_err(|e| {

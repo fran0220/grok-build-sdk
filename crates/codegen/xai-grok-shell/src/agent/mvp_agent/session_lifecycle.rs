@@ -39,6 +39,32 @@ impl CloseOutcome {
     }
 }
 impl MvpAgent {
+    /// Permanently tombstone a native Session in the injected Host authority.
+    /// Standalone mode has no separate authority and retains its legacy
+    /// current-only deletion behavior.
+    pub(crate) fn tombstone_session_state(
+        &self,
+        id: &acp::SessionId,
+    ) -> Result<(), crate::session::state_authority::AuthorityError> {
+        use crate::session::state_authority::{SessionIdentity, SessionInspection};
+
+        let Some(authority) = &self.session_state_authority else {
+            return Ok(());
+        };
+        match authority.inspect(id.0.as_ref())? {
+            SessionInspection::Live { generation } => authority.tombstone(SessionIdentity {
+                identity: id.0.to_string(),
+                generation,
+            }),
+            // A tombstone is permanent for this identity. Replaying deletion
+            // after an acknowledged commit or a process restart is therefore
+            // already complete.
+            SessionInspection::Tombstoned { .. } => Ok(()),
+            SessionInspection::Vacant => Err(crate::session::state_authority::AuthorityError(
+                "native session does not exist in Host authority".into(),
+            )),
+        }
+    }
     /// Ask a live session actor to shut down.
     pub(crate) fn request_session_shutdown(&self, id: &acp::SessionId) {
         if let Some(handle) = self.resident_handle(id) {
@@ -134,21 +160,31 @@ impl MvpAgent {
     /// crash; awaiting subagent drain while resident races that sweep), and
     /// every wait spends from a shared [`DELETE_TOTAL_BUDGET`] so the two
     /// drains cannot stack into a toast twice as long as close's.
-    pub(crate) async fn teardown_live_session_before_delete(&self, id: &acp::SessionId) {
+    pub(crate) async fn teardown_live_session_before_delete(
+        &self,
+        id: &acp::SessionId,
+    ) -> Result<(), &'static str> {
         let deadline = tokio::time::Instant::now() + DELETE_TOTAL_BUDGET;
         let resident = self.hard_stop_resident(id, CancelTrigger::SessionDelete);
         if resident {
             self.remove_session_terminal(id, SessionLiveState::Completed);
         }
-        xai_grok_tools::implementations::grok_build::task::backend::ChannelBackend::new(
+        let subagents_drained =
+            xai_grok_tools::implementations::grok_build::task::backend::ChannelBackend::new(
             self.subagent_event_tx.clone(),
         )
         .teardown_session_and_drain(&id.0, stage_budget(deadline, DRAIN_SUBAGENTS_WAIT))
         .await;
-        if resident {
-            self.drain_old_session_thread_within(id, stage_budget(deadline, DRAIN_OLD_THREAD_WAIT))
-                .await;
+        let actor_drained = self
+            .drain_old_session_thread_within(id, stage_budget(deadline, DRAIN_OLD_THREAD_WAIT))
+            .await;
+        if !subagents_drained {
+            return Err("session subagents did not drain before deletion");
         }
+        if !actor_drained {
+            return Err("session actor did not drain before deletion");
+        }
+        Ok(())
     }
     /// Move the replica `active` -> `completed`. A hosting signal, not a
     /// conversation ending: only an explicit close sends it.

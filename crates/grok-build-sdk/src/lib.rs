@@ -3133,6 +3133,13 @@ impl Runtime {
     pub async fn close_session(&self, id: SessionId) -> Result<(), Error> {
         self.inner.close_session(id).await
     }
+    /// Permanently deletes a Session after stopping any live actor. With an
+    /// injected [`SessionStateStore`], the exact authoritative manifest is
+    /// tombstoned before uncovered local sidecars are removed; retries of an
+    /// already completed deletion succeed, and the identity cannot be reused.
+    pub async fn delete_session(&self, id: SessionId) -> Result<(), Error> {
+        self.inner.delete_session(id).await
+    }
     pub async fn create_session(&self, config: SessionConfig) -> Result<SessionId, Error> {
         self.inner.create_session(config).await
     }
@@ -7868,6 +7875,235 @@ done
             .await
             .expect("restarted runtime shuts down");
         assert_no_covered_files(&config.session_storage);
+    }
+
+    struct DeleteProbeStore {
+        inner: LocalSessionStateStore,
+        behavior: Mutex<DeleteProbeBehavior>,
+        sidecar: Mutex<Option<std::path::PathBuf>>,
+        observed_sidecar_before_delete: AtomicBool,
+    }
+
+    #[derive(Clone, Copy)]
+    enum DeleteProbeBehavior {
+        Normal,
+        CommitUnknown,
+        Conflict,
+    }
+
+    impl DeleteProbeStore {
+        fn new(root: impl Into<std::path::PathBuf>) -> Self {
+            Self {
+                inner: LocalSessionStateStore::new(root).expect("Host Session store"),
+                behavior: Mutex::new(DeleteProbeBehavior::Normal),
+                sidecar: Mutex::new(None),
+                observed_sidecar_before_delete: AtomicBool::new(false),
+            }
+        }
+
+        fn set_behavior(&self, behavior: DeleteProbeBehavior) {
+            *self.behavior.lock().unwrap() = behavior;
+        }
+
+        fn observe_sidecar(&self, path: std::path::PathBuf) {
+            *self.sidecar.lock().unwrap() = Some(path);
+        }
+    }
+
+    impl SessionStateStore for DeleteProbeStore {
+        fn inspect_slot(&self, key: &SessionKey) -> Result<SessionSlot, SessionStateStoreError> {
+            self.inner.inspect_slot(key)
+        }
+
+        fn load_object(
+            &self,
+            key: &SessionKey,
+            generation: &SessionGeneration,
+            id: &SessionObjectId,
+        ) -> Result<Option<SessionObject>, SessionStateStoreError> {
+            self.inner.load_object(key, generation, id)
+        }
+
+        fn put_object(&self, object: SessionObject) -> Result<ObjectPut, SessionStateStoreError> {
+            self.inner.put_object(object)
+        }
+
+        fn compare_and_swap_manifest(
+            &self,
+            request: PreparedManifestCas,
+        ) -> Result<ManifestCas, SessionStateStoreError> {
+            self.inner.compare_and_swap_manifest(request)
+        }
+
+        fn compare_and_delete(
+            &self,
+            request: PreparedSessionDelete,
+        ) -> Result<SessionDelete, SessionStateStoreError> {
+            if self
+                .sidecar
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|path| path.exists())
+            {
+                self.observed_sidecar_before_delete
+                    .store(true, Ordering::Release);
+            }
+            match *self.behavior.lock().unwrap() {
+                DeleteProbeBehavior::Normal => self.inner.compare_and_delete(request),
+                DeleteProbeBehavior::CommitUnknown => {
+                    let result = self.inner.compare_and_delete(request)?;
+                    assert!(matches!(result, SessionDelete::Deleted(_)));
+                    Ok(SessionDelete::CommitUnknown)
+                }
+                DeleteProbeBehavior::Conflict => Ok(SessionDelete::Conflict),
+            }
+        }
+    }
+
+    fn find_session_dir(root: &std::path::Path, session: &SessionId) -> std::path::PathBuf {
+        fn visit(root: &std::path::Path, name: &str) -> Option<std::path::PathBuf> {
+            for entry in std::fs::read_dir(root).ok()?.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    if path.file_name().and_then(|value| value.to_str()) == Some(name) {
+                        return Some(path);
+                    }
+                    if let Some(found) = visit(&path, name) {
+                        return Some(found);
+                    }
+                }
+            }
+            None
+        }
+        visit(root, session.as_str()).expect("native Session sidecar directory")
+    }
+
+    fn assert_no_covered_session_jsonl(root: &std::path::Path) {
+        let Ok(entries) = std::fs::read_dir(root) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                assert_no_covered_session_jsonl(&path);
+            } else {
+                assert!(!matches!(
+                    path.file_name().and_then(|name| name.to_str()),
+                    Some("updates.jsonl" | "chat_history.jsonl" | "rewind_points.jsonl")
+                ));
+            }
+        }
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn durable_delete_live_commit_unknown_retry() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let server = MockInferenceServer::start().await.expect("mock server");
+        let root = TempDir::new().expect("temp root");
+        let workspace = root.path().join("workspace");
+        std::fs::create_dir(&workspace).expect("workspace");
+        let config = runtime_config(&root, server.url());
+        let store = Arc::new(DeleteProbeStore::new(root.path().join("host-state")));
+        let (runtime, _) = Runtime::builder(config.clone())
+            .session_state_store(store.clone())
+            .start()
+            .await
+            .expect("runtime starts");
+        let id = SessionId::from_stored(uuid::Uuid::new_v4().to_string());
+        let session_config = session_config(workspace);
+        runtime
+            .create_session_with_id(id.clone(), session_config.clone())
+            .await
+            .expect("session is live");
+        let session_dir = find_session_dir(&config.session_storage, &id);
+        let sidecar = session_dir.join("uncovered-sidecar");
+        std::fs::write(&sidecar, b"sidecar").expect("sidecar");
+        store.observe_sidecar(sidecar.clone());
+        store.set_behavior(DeleteProbeBehavior::CommitUnknown);
+
+        runtime
+            .delete_session(id.clone())
+            .await
+            .expect("exact CommitUnknown tombstone reconciles");
+        assert!(store.observed_sidecar_before_delete.load(Ordering::Acquire));
+        assert!(!sidecar.exists(), "sidecars are removed after tombstoning");
+        assert!(matches!(
+            store
+                .inspect_slot(&SessionKey::new(id.as_str()).unwrap())
+                .unwrap(),
+            SessionSlot::Tombstoned { .. }
+        ));
+        assert!(runtime.unload_session(id.clone()).await.is_err());
+        assert!(
+            runtime
+                .create_session_with_id(id.clone(), session_config.clone())
+                .await
+                .is_err(),
+            "a tombstoned identity cannot be recreated"
+        );
+        runtime.shutdown().await.expect("runtime shuts down");
+
+        let (restarted, _) = Runtime::builder(config.clone())
+            .session_state_store(store)
+            .start()
+            .await
+            .expect("runtime restarts");
+        restarted
+            .delete_session(id)
+            .await
+            .expect("completed deletion retries idempotently after restart");
+        restarted.shutdown().await.expect("runtime shuts down");
+        assert_no_covered_session_jsonl(&config.session_storage);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn durable_delete_of_unloaded_session_fails_closed_before_sidecar_cleanup() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let server = MockInferenceServer::start().await.expect("mock server");
+        let root = TempDir::new().expect("temp root");
+        let workspace = root.path().join("workspace");
+        std::fs::create_dir(&workspace).expect("workspace");
+        let config = runtime_config(&root, server.url());
+        let store = Arc::new(DeleteProbeStore::new(root.path().join("host-state")));
+        let (runtime, _) = Runtime::builder(config.clone())
+            .session_state_store(store.clone())
+            .start()
+            .await
+            .expect("runtime starts");
+        let id = SessionId::from_stored(uuid::Uuid::new_v4().to_string());
+        runtime
+            .create_session_with_id(id.clone(), session_config(workspace))
+            .await
+            .expect("session is live");
+        let sidecar = find_session_dir(&config.session_storage, &id).join("uncovered-sidecar");
+        std::fs::write(&sidecar, b"sidecar").expect("sidecar");
+        store.observe_sidecar(sidecar.clone());
+        runtime
+            .unload_session(id.clone())
+            .await
+            .expect("session unloads");
+        store.set_behavior(DeleteProbeBehavior::Conflict);
+
+        assert!(runtime.delete_session(id.clone()).await.is_err());
+        assert!(sidecar.exists(), "authority conflict preserves sidecars");
+        assert!(matches!(
+            store
+                .inspect_slot(&SessionKey::new(id.as_str()).unwrap())
+                .unwrap(),
+            SessionSlot::Live(_)
+        ));
+        assert!(runtime.unload_session(id.clone()).await.is_err());
+
+        std::fs::remove_file(sidecar.parent().unwrap().join("summary.json"))
+            .expect("remove summary to exercise ID-based cleanup");
+        store.set_behavior(DeleteProbeBehavior::Normal);
+        runtime
+            .delete_session(id)
+            .await
+            .expect("unloaded Session deletes without a readable summary");
+        assert!(!sidecar.exists());
+        runtime.shutdown().await.expect("runtime shuts down");
+        assert_no_covered_session_jsonl(&config.session_storage);
     }
 
     async fn claim_test_session_turn(
