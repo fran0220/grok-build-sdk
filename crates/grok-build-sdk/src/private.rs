@@ -157,7 +157,7 @@ impl Runtime {
         options: RuntimeOptions,
         run_store: Option<Arc<dyn xai_agent_lifecycle::run::RunStore>>,
     ) -> Result<(Self, mpsc::UnboundedReceiver<Event>), Error> {
-        Self::start_with_stores(input, options, run_store, None).await
+        Self::start_with_stores(input, options, run_store, None, None).await
     }
 
     pub async fn start_with_stores(
@@ -165,6 +165,7 @@ impl Runtime {
         options: RuntimeOptions,
         run_store: Option<Arc<dyn xai_agent_lifecycle::run::RunStore>>,
         evidence_store: Option<Arc<dyn SessionEvidenceStore>>,
+        session_state_store: Option<Arc<dyn crate::SessionStateStore>>,
     ) -> Result<(Self, mpsc::UnboundedReceiver<Event>), Error> {
         validate(&input, &options)?;
         if options.event_journal_capacity == 0 {
@@ -215,7 +216,15 @@ impl Runtime {
                     Ok(rt) => {
                         let local = tokio::task::LocalSet::new();
                         local.block_on(&rt, async move {
-                            match Core::start(input, options, events, evidence_store).await {
+                            match Core::start(
+                                input,
+                                options,
+                                events,
+                                evidence_store,
+                                session_state_store,
+                            )
+                            .await
+                            {
                                 Ok((core, capabilities)) => {
                                     let _ = ready_tx.send(Ok(capabilities));
                                     Rc::new(core).run(command_rx).await;
@@ -2096,12 +2105,236 @@ struct Core {
     evidence_store: Arc<dyn SessionEvidenceStore>,
     evidence_versions: RefCell<HashMap<SessionEvidenceKey, SessionEvidenceVersion>>,
 }
+
+type ShellAuthority = dyn xai_grok_shell::session::state_authority::CanonicalSessionStateAuthority;
+
+struct SessionStateAuthorityBridge {
+    store: Arc<dyn crate::SessionStateStore>,
+}
+
+struct SessionStateSessionBridge {
+    store: Arc<dyn crate::SessionStateStore>,
+    key: crate::SessionKey,
+    generation: crate::SessionGeneration,
+    identity: String,
+    generation_text: String,
+}
+
+fn authority_error(
+    error: impl ToString,
+) -> xai_grok_shell::session::state_authority::AuthorityError {
+    xai_grok_shell::session::state_authority::AuthorityError(error.to_string())
+}
+
+fn shell_manifest(
+    document: &crate::LiveSessionDocument,
+) -> xai_grok_shell::session::state_authority::CanonicalManifest {
+    xai_grok_shell::session::state_authority::CanonicalManifest {
+        revision: document.version().revision(),
+        digest: document.version().digest().to_owned(),
+        bytes: document.manifest().canonical_bytes().to_vec(),
+    }
+}
+
+fn sdk_manifest(
+    document: xai_grok_shell::session::state_authority::CanonicalManifest,
+) -> Result<crate::LiveSessionDocument, xai_grok_shell::session::state_authority::AuthorityError> {
+    let version = crate::ManifestVersion::from_stored(document.revision, document.digest)
+        .map_err(authority_error)?;
+    let manifest = crate::SessionManifest::from_stored(document.bytes).map_err(authority_error)?;
+    crate::LiveSessionDocument::from_stored(version, manifest).map_err(authority_error)
+}
+
+fn sdk_object(
+    object: xai_grok_shell::session::state_authority::CanonicalObject,
+) -> Result<crate::SessionObject, xai_grok_shell::session::state_authority::AuthorityError> {
+    let id = crate::SessionObjectId::from_stored(object.id).map_err(authority_error)?;
+    crate::SessionObject::from_stored(id, object.declared_size, object.bytes)
+        .map_err(authority_error)
+}
+
+impl xai_grok_shell::session::state_authority::CanonicalSessionStateAuthority
+    for SessionStateAuthorityBridge
+{
+    fn inspect_slot(
+        &self,
+        session_identity: &str,
+    ) -> Result<
+        xai_grok_shell::session::state_authority::CanonicalSlot,
+        xai_grok_shell::session::state_authority::AuthorityError,
+    > {
+        use xai_grok_shell::session::state_authority::CanonicalSlot;
+        let key = crate::SessionKey::new(session_identity).map_err(authority_error)?;
+        Ok(
+            match self.store.inspect_slot(&key).map_err(authority_error)? {
+                crate::SessionSlot::Vacant => CanonicalSlot::Vacant,
+                crate::SessionSlot::Live(document) => {
+                    CanonicalSlot::Live(shell_manifest(&document))
+                }
+                crate::SessionSlot::Tombstoned { receipt } => CanonicalSlot::Tombstoned {
+                    generation: receipt.generation().as_str().to_owned(),
+                    revision: receipt.revision(),
+                    prior_digest: receipt.prior_digest().to_owned(),
+                },
+            },
+        )
+    }
+
+    fn open_session(
+        &self,
+        session_identity: &str,
+        generation: &str,
+    ) -> Result<
+        Arc<dyn xai_grok_shell::session::state_authority::CanonicalSession>,
+        xai_grok_shell::session::state_authority::AuthorityError,
+    > {
+        Ok(Arc::new(SessionStateSessionBridge {
+            store: self.store.clone(),
+            key: crate::SessionKey::new(session_identity).map_err(authority_error)?,
+            generation: crate::SessionGeneration::new(generation).map_err(authority_error)?,
+            identity: session_identity.to_owned(),
+            generation_text: generation.to_owned(),
+        }))
+    }
+}
+
+impl xai_grok_shell::session::state_authority::CanonicalSessionReplay
+    for SessionStateSessionBridge
+{
+    fn load_object(
+        &self,
+        id: &str,
+    ) -> Result<
+        Option<xai_grok_shell::session::state_authority::CanonicalObject>,
+        xai_grok_shell::session::state_authority::AuthorityError,
+    > {
+        let id = crate::SessionObjectId::from_stored(id).map_err(authority_error)?;
+        self.store
+            .load_object(&self.key, &self.generation, &id)
+            .map_err(authority_error)
+            .map(|object| {
+                object.map(
+                    |object| xai_grok_shell::session::state_authority::CanonicalObject {
+                        id: object.id().as_str().to_owned(),
+                        declared_size: object.declared_size(),
+                        bytes: object.canonical_bytes().to_vec(),
+                    },
+                )
+            })
+    }
+}
+
+impl xai_grok_shell::session::state_authority::CanonicalSession for SessionStateSessionBridge {
+    fn session_identity(&self) -> &str {
+        &self.identity
+    }
+
+    fn generation(&self) -> &str {
+        &self.generation_text
+    }
+
+    fn replay(&self) -> Arc<dyn xai_grok_shell::session::state_authority::CanonicalSessionReplay> {
+        Arc::new(Self {
+            store: self.store.clone(),
+            key: self.key.clone(),
+            generation: self.generation.clone(),
+            identity: self.identity.clone(),
+            generation_text: self.generation_text.clone(),
+        })
+    }
+
+    fn put_object(
+        &self,
+        object: xai_grok_shell::session::state_authority::CanonicalObject,
+    ) -> Result<
+        xai_grok_shell::session::state_authority::CanonicalObjectPut,
+        xai_grok_shell::session::state_authority::AuthorityError,
+    > {
+        use xai_grok_shell::session::state_authority::CanonicalObjectPut;
+        let object = sdk_object(object)?;
+        if object.session() != &self.key || object.generation() != &self.generation {
+            return Err(authority_error(
+                "object scope does not match opened session",
+            ));
+        }
+        Ok(
+            match self.store.put_object(object).map_err(authority_error)? {
+                crate::ObjectPut::Stored => CanonicalObjectPut::Stored,
+                crate::ObjectPut::AlreadyPresent => CanonicalObjectPut::AlreadyPresent,
+                crate::ObjectPut::CommitUnknown => CanonicalObjectPut::CommitUnknown,
+            },
+        )
+    }
+
+    fn compare_and_swap_manifest(
+        &self,
+        request: xai_grok_shell::session::state_authority::CanonicalManifestCasRequest,
+    ) -> Result<
+        xai_grok_shell::session::state_authority::CanonicalManifestCas,
+        xai_grok_shell::session::state_authority::AuthorityError,
+    > {
+        use xai_grok_shell::session::state_authority::CanonicalManifestCas;
+        let expected = request.expected.map(sdk_manifest).transpose()?;
+        let manifest = crate::SessionManifest::from_stored(request.successor_bytes)
+            .map_err(authority_error)?;
+        let suffix = request
+            .suffix
+            .into_iter()
+            .map(sdk_object)
+            .collect::<Result<Vec<_>, _>>()?;
+        let prepared =
+            crate::PreparedManifestCas::new(self.key.clone(), expected, manifest, &suffix)
+                .map_err(authority_error)?;
+        Ok(
+            match self
+                .store
+                .compare_and_swap_manifest(prepared)
+                .map_err(authority_error)?
+            {
+                crate::ManifestCas::Committed(document) => {
+                    CanonicalManifestCas::Committed(shell_manifest(&document))
+                }
+                crate::ManifestCas::Conflict => CanonicalManifestCas::Conflict,
+                crate::ManifestCas::CommitUnknown => CanonicalManifestCas::CommitUnknown,
+            },
+        )
+    }
+
+    fn compare_and_delete(
+        &self,
+        expected: xai_grok_shell::session::state_authority::CanonicalManifest,
+    ) -> Result<
+        xai_grok_shell::session::state_authority::CanonicalDelete,
+        xai_grok_shell::session::state_authority::AuthorityError,
+    > {
+        use xai_grok_shell::session::state_authority::CanonicalDelete;
+        let prepared = crate::PreparedSessionDelete::new(self.key.clone(), sdk_manifest(expected)?)
+            .map_err(authority_error)?;
+        Ok(
+            match self
+                .store
+                .compare_and_delete(prepared)
+                .map_err(authority_error)?
+            {
+                crate::SessionDelete::Deleted(receipt) => CanonicalDelete::Deleted {
+                    generation: receipt.generation().as_str().to_owned(),
+                    revision: receipt.revision(),
+                    prior_digest: receipt.prior_digest().to_owned(),
+                },
+                crate::SessionDelete::Conflict => CanonicalDelete::Conflict,
+                crate::SessionDelete::CommitUnknown => CanonicalDelete::CommitUnknown,
+            },
+        )
+    }
+}
+
 impl Core {
     async fn start(
         input: RuntimeConfig,
         options: RuntimeOptions,
         events: mpsc::UnboundedSender<Event>,
         evidence_store: Arc<dyn SessionEvidenceStore>,
+        session_state_store: Option<Arc<dyn crate::SessionStateStore>>,
     ) -> Result<(Self, RuntimeCapabilities), Error> {
         std::fs::create_dir_all(&input.grok_home).map_err(op)?;
         std::fs::create_dir_all(&input.session_storage).map_err(op)?;
@@ -2249,14 +2482,19 @@ impl Core {
                 xai_grok_shell::agent::config::OriginEmbeddedProfile::Desktop
             }
         };
-        let agent = Rc::new(MvpAgent::with_origin_embedded_profile_models(
-            AcpAgentGatewaySender::new(gw_tx),
-            &cfg,
-            auth,
-            models,
-            input.session_storage.clone(),
-            profile,
-        ));
+        let session_state_authority: Option<Arc<ShellAuthority>> = session_state_store
+            .map(|store| Arc::new(SessionStateAuthorityBridge { store }) as Arc<ShellAuthority>);
+        let agent = Rc::new(
+            MvpAgent::with_origin_embedded_profile_models_and_session_state(
+                AcpAgentGatewaySender::new(gw_tx),
+                &cfg,
+                auth,
+                models,
+                input.session_storage.clone(),
+                profile,
+                session_state_authority,
+            ),
+        );
         static NEXT_RUNTIME_INSTANCE: std::sync::atomic::AtomicU64 =
             std::sync::atomic::AtomicU64::new(1);
         let runtime_instance_id = NEXT_RUNTIME_INSTANCE.fetch_add(1, Ordering::Relaxed);
@@ -4583,6 +4821,68 @@ fn capabilities_for(options: &RuntimeOptions) -> RuntimeCapabilities {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_state_bridge_round_trips_chunked_authority_abi() {
+        use xai_grok_shell::session::state_authority::{
+            CanonicalDelete, CanonicalManifestCas, CanonicalManifestCasRequest, CanonicalObject,
+            CanonicalObjectPut, CanonicalSessionStateAuthority as _, CanonicalSlot,
+        };
+
+        let root = tempfile::TempDir::new().unwrap();
+        let store: Arc<dyn crate::SessionStateStore> =
+            Arc::new(crate::LocalSessionStateStore::new(root.path()).unwrap());
+        let authority = SessionStateAuthorityBridge { store };
+        let session = authority.open_session("session-1", "generation-1").unwrap();
+        let key = crate::SessionKey::new("session-1").unwrap();
+        let generation = crate::SessionGeneration::new("generation-1").unwrap();
+        let object = crate::SessionObject::transcript(
+            key.clone(),
+            generation.clone(),
+            None,
+            1,
+            b"one\n".to_vec(),
+        )
+        .unwrap();
+        let canonical_object = CanonicalObject {
+            id: object.id().as_str().to_owned(),
+            declared_size: object.declared_size(),
+            bytes: object.canonical_bytes().to_vec(),
+        };
+
+        assert_eq!(
+            session.put_object(canonical_object.clone()).unwrap(),
+            CanonicalObjectPut::Stored
+        );
+        let manifest =
+            crate::SessionManifest::new(key, generation, Some(object.id().clone()), 1, 4).unwrap();
+        let committed = session
+            .compare_and_swap_manifest(CanonicalManifestCasRequest {
+                expected: None,
+                successor_bytes: manifest.canonical_bytes().to_vec(),
+                suffix: vec![canonical_object.clone()],
+            })
+            .unwrap();
+        let CanonicalManifestCas::Committed(document) = committed else {
+            panic!("manifest was not committed");
+        };
+        assert_eq!(
+            authority.inspect_slot("session-1").unwrap(),
+            CanonicalSlot::Live(document.clone())
+        );
+        assert_eq!(
+            session.replay().load_object(&canonical_object.id).unwrap(),
+            Some(canonical_object)
+        );
+        assert!(matches!(
+            session.compare_and_delete(document).unwrap(),
+            CanonicalDelete::Deleted {
+                generation,
+                revision: 1,
+                ..
+            } if generation == "generation-1"
+        ));
+    }
 
     struct PermissionPolicy {
         decision: Result<crate::ToolPermissionDecision, crate::ToolPermissionError>,

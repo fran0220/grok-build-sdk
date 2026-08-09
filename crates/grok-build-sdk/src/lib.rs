@@ -2077,6 +2077,7 @@ impl Runtime {
             options: RuntimeOptions::default(),
             run_store: None,
             evidence_store: None,
+            session_state_store: None,
         }
     }
     pub async fn start(
@@ -2109,6 +2110,7 @@ impl Runtime {
             RuntimeOptions::default(),
             Some(run_store),
             Some(evidence_store),
+            None,
         )
         .await
         .map(|(inner, events)| (Self { inner }, events))
@@ -3362,6 +3364,7 @@ pub struct RuntimeBuilder {
     options: RuntimeOptions,
     run_store: Option<Arc<dyn run::RunStore>>,
     evidence_store: Option<Arc<dyn SessionEvidenceStore>>,
+    session_state_store: Option<Arc<dyn SessionStateStore>>,
 }
 impl RuntimeBuilder {
     pub fn profile(mut self, value: RuntimeProfile) -> Self {
@@ -3473,12 +3476,20 @@ impl RuntimeBuilder {
         self.evidence_store = Some(value);
         self
     }
+    /// Replaces native Session transcript, rewind, and compaction persistence
+    /// with the Host's single canonical authority. The store is shared by all
+    /// Sessions created or loaded by this Runtime.
+    pub fn session_state_store(mut self, value: Arc<dyn SessionStateStore>) -> Self {
+        self.session_state_store = Some(value);
+        self
+    }
     pub async fn start(self) -> Result<(Runtime, mpsc::UnboundedReceiver<Event>), Error> {
         private::Runtime::start_with_stores(
             self.config,
             self.options,
             self.run_store,
             self.evidence_store,
+            self.session_state_store,
         )
         .await
         .map(|(inner, events)| (Runtime { inner }, events))

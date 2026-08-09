@@ -8,6 +8,8 @@ pub mod merge;
 pub mod notifications;
 pub mod pending_interaction;
 pub mod prompt_queue;
+#[doc(hidden)]
+pub mod state_authority;
 pub mod two_pass;
 pub use self::acp_session::*;
 pub use self::acp_types::*;

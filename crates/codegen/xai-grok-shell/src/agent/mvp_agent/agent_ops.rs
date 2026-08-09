@@ -2426,6 +2426,7 @@ impl MvpAgent {
             models_manager,
             None,
             crate::agent::config::OriginEmbeddedProfile::Desktop,
+            None,
         )
     }
 
@@ -2456,7 +2457,38 @@ impl MvpAgent {
         storage_root: PathBuf,
         profile: crate::agent::config::OriginEmbeddedProfile,
     ) -> Self {
-        Self::with_models_mode(gateway, cfg, auth_manager, models_manager, Some(storage_root), profile)
+        Self::with_origin_embedded_profile_models_and_session_state(
+            gateway,
+            cfg,
+            auth_manager,
+            models_manager,
+            storage_root,
+            profile,
+            None,
+        )
+    }
+
+    #[doc(hidden)]
+    pub fn with_origin_embedded_profile_models_and_session_state(
+        gateway: GatewaySender,
+        cfg: &AgentConfig,
+        auth_manager: Arc<AuthManager>,
+        models_manager: crate::agent::models::ModelsManager,
+        storage_root: PathBuf,
+        profile: crate::agent::config::OriginEmbeddedProfile,
+        session_state_authority: Option<
+            Arc<dyn crate::session::state_authority::CanonicalSessionStateAuthority>,
+        >,
+    ) -> Self {
+        Self::with_models_mode(
+            gateway,
+            cfg,
+            auth_manager,
+            models_manager,
+            Some(storage_root),
+            profile,
+            session_state_authority,
+        )
     }
 
     fn with_models_mode(
@@ -2466,6 +2498,9 @@ impl MvpAgent {
         models_manager: crate::agent::models::ModelsManager,
         storage_root: Option<PathBuf>,
         origin_profile: crate::agent::config::OriginEmbeddedProfile,
+        session_state_authority: Option<
+            Arc<dyn crate::session::state_authority::CanonicalSessionStateAuthority>,
+        >,
     ) -> Self {
         let origin_embedded = storage_root.is_some();
         models_manager.set_gateway(gateway.clone());
@@ -2536,6 +2571,7 @@ impl MvpAgent {
             origin_embedded,
             origin_profile,
             storage_root,
+            session_state_authority,
             activity,
             session_registry: SessionRegistry::default(),
             resident_roster_titles: RefCell::new(HashMap::new()),
