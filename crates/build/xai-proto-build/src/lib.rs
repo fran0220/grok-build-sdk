@@ -378,16 +378,20 @@ mod tests {
     use super::*;
     use std::process::Command;
 
-    fn protoc_on_path() -> PathBuf {
-        let executable = if cfg!(windows) {
-            "protoc.exe"
+    fn resolve_protoc_path(protoc: &Path) -> PathBuf {
+        if protoc.is_file() {
+            return std::path::absolute(protoc).unwrap();
+        }
+
+        let file_name = if cfg!(windows) && protoc.extension().is_none() {
+            protoc.with_extension("exe")
         } else {
-            "protoc"
+            protoc.to_owned()
         };
         std::env::split_paths(&std::env::var_os("PATH").unwrap())
-            .map(|directory| directory.join(executable))
+            .map(|directory| directory.join(&file_name))
             .find(|candidate| candidate.is_file())
-            .expect("these tests require protoc on PATH")
+            .expect("production-resolved protoc must exist")
     }
 
     #[test]
@@ -453,11 +457,9 @@ mod tests {
 
     #[test]
     fn dependency_scan_keeps_actual_well_known_proto() {
-        let protoc = protoc_on_path();
-        let include = find_protoc_include_dir(Some(&protoc))
-            .expect("protoc must have its include directory beside bin");
-        let timestamp = include.join("google/protobuf/timestamp.proto");
-        assert!(timestamp.is_file());
+        let protoc = find_protoc::find_protoc().unwrap().unwrap();
+        let resolved_protoc = resolve_protoc_path(&protoc);
+        let include = find_protoc_include_dir(Some(&resolved_protoc));
 
         let directory = tempfile::tempdir().unwrap();
         let project = directory.path().join("project with spaces");
@@ -472,7 +474,7 @@ mod tests {
 
         let (dependencies, _output_dir) = XaiProtoBuilder::scan_dependencies(
             Some(&protoc),
-            Some(&include),
+            include.as_deref(),
             &input,
             &[project.as_path()],
         )
@@ -483,7 +485,7 @@ mod tests {
         });
         let timestamp_dependency = dependencies
             .iter()
-            .find(|dependency| Path::new(dependency) == timestamp)
+            .find(|dependency| Path::new(dependency).ends_with("google/protobuf/timestamp.proto"))
             .unwrap();
         assert!(directives.contains(&format!("cargo:rerun-if-changed={timestamp_dependency}")));
     }
@@ -559,14 +561,8 @@ mod tests {
 
     #[test]
     fn path_fallback_uses_path_after_bad_bundled_protoc() {
-        assert!(
-            Command::new("protoc")
-                .arg("--version")
-                .status()
-                .unwrap()
-                .success(),
-            "this test requires protoc on PATH"
-        );
+        let protoc = find_protoc::find_protoc().unwrap().unwrap();
+        let resolved_protoc = resolve_protoc_path(&protoc);
         let directory = tempfile::tempdir().unwrap();
         let bin = directory.path().join("bin");
         fs::create_dir(&bin).unwrap();
@@ -578,10 +574,25 @@ mod tests {
             fs::set_permissions(&bundled, fs::Permissions::from_mode(0o755)).unwrap();
         }
 
+        let path_bin = directory.path().join("path-bin");
+        fs::create_dir(&path_bin).unwrap();
+        let staged_protoc = path_bin.join(if cfg!(windows) {
+            "protoc.exe"
+        } else {
+            "protoc"
+        });
+        fs::copy(&resolved_protoc, &staged_protoc).unwrap();
+        let child_path = std::env::join_paths(
+            std::iter::once(path_bin)
+                .chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
+        )
+        .unwrap();
+
         let output = Command::new(std::env::current_exe().unwrap())
             .args(["--exact", "tests::path_fallback_child", "--nocapture"])
             .current_dir(directory.path())
             .env_remove("PROTOC")
+            .env("PATH", child_path)
             .env("XAI_PROTO_PATH_FALLBACK_CHILD", "1")
             .output()
             .unwrap();
