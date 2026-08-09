@@ -6,8 +6,8 @@
 published Grok Build source tree. Its `grok-build-sdk` crate gives trusted
 desktop main processes explicit control over model providers, subagents,
 auxiliary inference, image/video services, MCP transports, host filesystem and
-terminal delegation, sessions, replay, and extensions without requiring Grok
-account login or ambient credentials.
+terminal delegation, typed model-catalog discovery, sessions, replay, and
+extensions without requiring Grok account login or ambient credentials.
 
 This repository retains the upstream CLI/TUI source and provenance so SDK
 consumers can audit the implementation. It is an independent redistribution;
@@ -136,6 +136,11 @@ standalone crate: the runtime depends on the bundled workspace's local
 `xai-grok-*` crate closure and workspace patches. See the SDK
 [release-status documentation](crates/grok-build-sdk/README.md#public-release-status)
 before cutting a public version.
+
+```toml
+[dependencies]
+grok-build-sdk = { git = "https://github.com/fran0220/grok-build-sdk", tag = "v0.2.0" }
+```
 
 ## Contributing
 

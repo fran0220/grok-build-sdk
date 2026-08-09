@@ -7,6 +7,10 @@ The `grok-build-sdk` crate is a trusted, in-process Rust boundary around the bun
 An embedding application can supply every inference credential directly. It does not need Grok account authentication:
 
 - `RuntimeConfig.models` defines the fixed catalog and backend contract.
+- `Runtime::list_models` reads that live host-owned catalog through the typed
+  `x.ai/models/list` contract, including forward-compatible metadata for
+  context-window, agent-harness, and reasoning-effort discovery. It is
+  available in both profiles without enabling the generic extension bridge.
 - `RuntimeBuilder::model_provider` or `RuntimeServices::model_providers` selects a base URL, literal API key, provider wire-model slug, request headers, and query parameters independently for each catalog model. When every model has an explicit provider, the legacy `RuntimeConfig.endpoint` and `api_key` may be empty.
 - `AgentServiceConfig` routes built-in subagent names and the web-search, session-summary, image-description, and prompt-suggestion auxiliary calls to catalog models. Those catalog models can each use a different provider.
 - `MediaProviderConfig` and `MediaServiceConfig` independently enable image generation, image editing, image-to-video, and reference-to-video, including an explicit API URL, key, headers, query parameters, and four model slugs. Query parameters are preserved on image generation/edit and video start/poll requests. The static media credential cannot be replaced by the primary model's rotating credential.
@@ -18,11 +22,11 @@ Provider and MCP secret-bearing types deliberately omit both `Debug` and `Serial
 
 ## Profiles and trust boundary
 
-`Restricted` is the default and remains fail-closed for plugins, MCP, subagents, workflows, network tools, and media tools. Supplying their configuration does not enable them. `Desktop` restores the repository-native feature surface inside the embedded storage/process boundary; each media operation is still independently gated by `MediaServiceConfig`.
+`Restricted` is the default and remains fail-closed for plugins, MCP, subagents, workflows, network tools, media tools, and workspace `.envrc` evaluation. Supplying their configuration does not enable them. `Desktop` restores the repository-native feature surface inside the embedded storage/process boundary; each media operation is still independently gated by `MediaServiceConfig`.
 
 Restricted filesystem and terminal calls are explicitly rejected unless the host advertises and implements the matching `HostDelegate` capability; they never fall back to the runtime process's local machine. In Desktop, an advertised host capability still routes through `HostDelegate`, while an unadvertised filesystem or terminal capability deliberately retains Grok's native local desktop implementation.
 
-The SDK does not expose the shell's generic request/notification protocol. Agent commands, scheduler operations, workflows, subagents, MCP, hooks, permissions, rewind, and session operations are available through typed methods. `Runtime::capabilities` reports these SDK features rather than protocol method namespaces.
+Agent commands, scheduler operations, workflows, subagents, MCP, hooks, permissions, rewind, sessions, and model discovery have typed methods. `Runtime::capabilities` reports these SDK features rather than protocol method namespaces. For forward compatibility, the generic extension request/notification bridge also preserves JSON and protocol errors for current and future `x.ai/*` methods in `Desktop`; it is disabled wholesale in `Restricted`, so privileged filesystem, terminal, plugin, worktree, and process methods cannot bypass that profile. The typed, read-only `Runtime::list_models` wrapper remains available in Restricted because it only inspects the host-supplied fixed catalog. **Do not expose the Desktop bridge directly to a WebView or untrusted renderer.** Validate and authorize calls in the Rust main process.
 
 Screenshots, accessibility trees (AX/UIA/AT-SPI), OCR, and mouse/keyboard automation are not native Grok capabilities; a desktop host must provide those through an audited `HostDelegate`. Rich prompt blocks can be submitted independently of TUI support. The current sampling layer has no native audio part, so audio is preserved losslessly as a data-URI text attachment rather than silently discarded.
 
@@ -83,9 +87,10 @@ Capability descriptors describe public typed SDK features, not every internal sh
 
 This repository can be published as an Apache-2.0 source release or consumed from a pinned public Git tag, provided the bundled third-party notices and upstream provenance remain intact. The crate is intentionally `publish = false`: its current `xai-grok-*` dependency closure is workspace-local and cannot yet be resolved independently by crates.io. A crates.io release requires publishing or replacing that full dependency closure, removing workspace-only patches, and validating a packaged source archive first. Do not present a Git release as a crates.io-compatible standalone package until those gates pass.
 
-After the repository rename and a `v0.1.0` tag are published, a Rust host can pin the SDK without relying on a moving branch:
+For the current upstream-synchronized release, a Rust host can pin the SDK
+without relying on a moving branch:
 
 ```toml
 [dependencies]
-grok-build-sdk = { git = "https://github.com/fran0220/grok-build-sdk", tag = "v0.1.0" }
+grok-build-sdk = { git = "https://github.com/fran0220/grok-build-sdk", tag = "v0.2.0" }
 ```

@@ -2008,6 +2008,7 @@ impl Config {
         cfg.telemetry.trace_upload = Some(false);
         cfg.workflows.enabled = Some(false);
         cfg.cli.auto_update = Some(false);
+        cfg.session.load_envrc = Some(false);
         cfg.disable_web_search = true;
         cfg.cli_no_memory = true;
         cfg.memory_config = None;
@@ -2071,6 +2072,7 @@ mod origin_embedded_tests {
         assert_eq!(cfg.features.session_recap, Some(false));
         assert_eq!(cfg.features.turn_summary, Some(false));
         assert_eq!(cfg.telemetry.trace_upload, Some(false));
+        assert_eq!(cfg.session.load_envrc, Some(false));
         assert!(cfg.disable_web_search);
         assert!(!cfg.managed_mcps_enabled);
         assert!(!cfg.auto_wake_enabled);
