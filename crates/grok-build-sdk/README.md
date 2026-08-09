@@ -20,6 +20,42 @@ Explicit model providers use the repository's real Chat Completions or Responses
 
 Provider and MCP secret-bearing types deliberately omit both `Debug` and `Serialize`; they support `Deserialize` for host-owned configuration input without offering an accidental secret-export path. An explicit provider never resolves its key from an environment variable, Grok login, or ambient Grok config. Unoverridden catalog models retain the legacy endpoint/key fallback for compatibility. Optional auxiliary roles are disabled when omitted rather than falling through to an ambient first-party credential.
 
+For a desktop credential boundary, set `ApiProviderConfig.base_url` to the
+Host's loopback OpenAI-compatible relay and set `api_key` to the relay-scoped
+bearer. The SDK sends that value as `Authorization: Bearer …` and does not
+persist the provider configuration. Raw provider credentials can therefore
+remain in the Host's OS-keychain/relay boundary. Catalog or credential changes
+are admitted by draining the current Runtime and starting its replacement with
+the new fixed configuration; the SDK intentionally has no runtime registry or
+mutable provider-credential store.
+
+## Native desktop M1–M3 public-contract map
+
+This table records the minimum embedding contract and prevents product hosts
+from replacing runtime-native behavior with a second harness, registry, or
+executable.
+
+| Milestone concern | Current public contract | Gap / decision |
+|---|---|---|
+| Application model catalog | `RuntimeConfig::models`, `ModelSpec`, `Runtime::list_models` | Complete for a Host-owned fixed catalog. Refresh revisions and connection health remain Host state; restart the drained Runtime to admit a new catalog. |
+| Provider endpoint + relay bearer | `ApiProviderConfig`, `RuntimeBuilder::model_provider` | Complete. `api_key` is the Bearer value and may be a loopback-relay token. Provider raw credentials need not enter the SDK. |
+| One Runtime, one Session per Host Thread | `Runtime`, `create_session`, `load_session`, `resume_session`, `unload_session` | Complete; no registry or external executable is required. The Host owns the Thread↔Session mapping. |
+| Session cwd/model/reasoning | `SessionConfig::{cwd, model, reasoning}`, `Runtime::set_route` | Complete. Route changes preserve the native conversation and harness. |
+| Restart, recovery, receipt, cursor | `PromptReceipt`, `SessionLedger`, rewind receipts, `events_after`, Run reconciliation/attach APIs | Complete for M1. A cursor gap is typed and fails closed. |
+| Immutable harness materialization | — | M2 façade gap: add a content-addressed `HarnessSnapshot` validated and materialized into native `SessionConfig`; do not add a mutable SDK harness store. |
+| Turn binding | `PromptReceipt` binds prompt index, settlement and usage only | M2 façade gap: bind the immutable snapshot digest, selected model/reasoning, owned SDK provenance and a verified complete event-cursor range. |
+| Optimistic refinement | Internal Run strategy/workflow revision support is not a harness façade | M2 façade gap: add a typed patch against a snapshot digest. The Host commits revisions, evidence, activation, history and rollback. |
+| Child agent / A2A | Live subagent inspection/cancellation exists; lifecycle internals reserve child/mailbox concepts | M3 audit only. There is no durable façade handle or Project-scoped A2A contract to expose safely yet. |
+| Persistent kernel | Native terminal/process tools | M3 audit only. A PTY is not a checkpointable programmatic kernel; no suitable internal implementation exists to publish. |
+| Continuation / gates | MCP request continuations and Run gate providers are narrow, existing contracts | M3 audit only. Neither is a durable Host continuation/gate aggregate; do not generalize them in the first batch. |
+
+The dependency order is M1 baseline → immutable snapshot/refinement façade →
+runtime-generated Turn binding receipt → Host revision/evidence/activation
+integration → narrow M3 schemas and receipts. Within M3, define durable child
+identity and callback receipts before A2A, then continuation/gate ownership,
+and only then a kernel driver if a real internal checkpoint/cancel boundary
+exists. This keeps every public change additive and independently reviewable.
+
 ## Profiles and trust boundary
 
 `Restricted` is the default and remains fail-closed for plugins, MCP, subagents, workflows, network tools, media tools, and workspace `.envrc` evaluation. Supplying their configuration does not enable them. `Desktop` restores the repository-native feature surface inside the embedded storage/process boundary; each media operation is still independently gated by `MediaServiceConfig`.

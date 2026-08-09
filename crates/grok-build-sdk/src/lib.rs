@@ -183,11 +183,17 @@ pub struct HostCapabilities {
 }
 
 /// Explicit credentials and routing for an API-compatible model provider.
-/// Values are never read from environment variables by the runtime. API keys
-/// are intentionally omitted from both `Debug` and `Serialize`; hosts may
-/// deserialize configuration but cannot accidentally export the secret bag.
+/// Values are never read from environment variables by the runtime. The
+/// configured secret is sent as an HTTP Bearer token, so a desktop host can
+/// point the base URL at its loopback relay and supply a relay-scoped bearer
+/// instead of giving the SDK a provider's raw credential. The SDK does not
+/// persist this configuration. Secrets are intentionally omitted from both
+/// `Debug` and `Serialize`; hosts may deserialize configuration but cannot
+/// accidentally export the secret bag.
 #[derive(Clone, Default, PartialEq, serde::Deserialize)]
 pub struct ApiProviderConfig {
+    /// OpenAI-compatible API base URL, including any path prefix (usually
+    /// `/v1`). Loopback HTTP endpoints are supported.
     pub base_url: String,
     pub api_key: String,
     /// Optional model slug sent to this provider. Defaults to the catalog ID.
