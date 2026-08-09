@@ -39,10 +39,10 @@ executable.
 |---|---|---|
 | Application model catalog | `RuntimeConfig::models`, `ModelSpec`, `Runtime::list_models` | Complete for a Host-owned fixed catalog. Refresh revisions and connection health remain Host state; restart the drained Runtime to admit a new catalog. |
 | Provider endpoint + relay bearer | `ApiProviderConfig`, `RuntimeBuilder::model_provider` | Complete. `api_key` is the Bearer value and may be a loopback-relay token. Provider raw credentials need not enter the SDK. |
-| One Runtime, one Session per Host Thread | `Runtime`, `create_session`, `load_session`, `resume_session`, `unload_session` | Complete; no registry or external executable is required. The Host owns the Thread↔Session mapping. |
+| One Runtime, one Session per Host Thread | `Runtime`, `create_session`, `create_session_with_id`, `load_session`, `resume_session`, `unload_session` | Complete; no registry or external executable is required. `create_session_with_id` gives the Host a crash-safe, idempotently retryable Thread↔Session identity when `SessionStateStore` is installed. |
 | Session cwd/model/reasoning | `SessionConfig::{cwd, model, reasoning}`, `Runtime::set_route` | Complete for M1. Explicit reasoning wins; omission resolves to the validated fixed-catalog default on create/load/resume and route changes. |
 | Restart, recovery, receipt, cursor | `PromptReceipt`, `SessionLedger`, rewind receipts, `events_after`, Run reconciliation/attach APIs | Complete for M1. A cursor gap is typed and fails closed. |
-| Host-owned native Session state | `SessionStateStore`, chunked `SessionObject`s, CAS `SessionManifest`, `LocalSessionStateStore` | The preparatory neutral contract is current-only. Native shell replay/rewind still requires the backend-neutral adapter wiring described below before a Host store becomes required or can replace JSONL without creating a second mutable authority. |
+| Host-owned native Session state | `RuntimeBuilder::session_state_store`, `SessionStateStore`, chunked `SessionObject`s, CAS `SessionManifest`, `LocalSessionStateStore` | Complete. With a Host store installed it is the sole authority for transcript/history, rewind state, and compaction checkpoints; covered JSONL files are neither read nor projected. Without injection the legacy JSONL backend remains available. |
 | Immutable harness materialization | `HarnessSnapshot`, `HarnessContent`, `MaterializedHarness` | First-batch contract on this branch. A snapshot requires the complete system prompt; rules are deterministically folded into that authoritative override for native create/load/resume. There is no mutable SDK harness store. |
 | Turn binding | `TurnBindingReceipt`, `CompleteEventCursor`, `SdkProvenance`, harness-aware Session/prompt methods | First-batch contract on this branch. Provider-wire tests cover exact prompt replacement, rules update/removal, effective routes, load/resume and Runtime restart before a receipt is issued. |
 | Optimistic refinement | `HarnessRefinementPatch`, `HarnessRefinement` | First-batch contract on this branch. Patch application rejects stale content identity and duplicate typed targets. The Host commits revisions, evidence, activation, history and rollback. |
@@ -125,8 +125,8 @@ The default `LocalRunStore` is a standalone/reference SQLite authority with tran
 
 `SessionEvidenceStore` is the separate, host-agnostic single authority for SDK-origin `SessionLedger`, rewind intent/receipt, and immutable harness Turn-binding documents. Payload schemas, bounded parsing, identity, settlement digests and transition decisions remain SDK-owned; the Host implementation owns connections/paths, transactions, migrations, encryption, backup and lifecycle. The current marker/version is `grok-build-sdk.session-evidence`/1. CAS compares revision and digest: absence advances to revision 1, otherwise checked `current + 1`; the digest is `sha256:` plus lowercase SHA-256 of the exact payload bytes. Implementations must return the exact value produced by `SessionEvidenceVersion::successor`. `Conflict`, a malformed successor, or `CommitUnknown` always fails closed. Pending is acknowledged before native prompt dispatch, rewind intent before native rewind, intent-to-receipt is one CAS replacement, and binding evidence is acknowledged before ledger settlement. `RuntimeBuilder::session_evidence_store` replaces the local reference store without mirroring. `Runtime::start_with_stores` avoids startup API combinations when both production authorities are injected. Current-only schemas require an explicit offline migration or deliberate discard before startup.
 
-`SessionStateStore` is a preparatory chunked native persistence boundary without
-shell protocol types. Its current-only `grok-build-sdk.session-log`/1 contract
+`SessionStateStore` is the chunked native persistence boundary without shell
+protocol types. Its current-only `grok-build-sdk.session-log`/1 contract
 stores immutable SHA-256-addressed Session objects scoped by validated
 `SessionKey` + `SessionGeneration`: chain transcript segments and publication
 records, and separately referenced checkpoint/rewind payloads. Publication records
@@ -148,23 +148,34 @@ Production backends can run `run_session_state_conformance` and
 restart/tombstone behavior, compound publication, missing/corrupt/oversized
 objects, bounded payload reads, and exact acknowledgement-loss reconciliation.
 
-This revision deliberately does not connect that contract to native shell
-storage yet. The native replay and rewind paths still expose filesystem paths
-outside `StorageAdapter`; merely copying Host snapshots into those files would
-retain a second mutable authority. Completion requires one backend-neutral
-shell adapter, atomic checkpoint/rewind mutations, and fail-closed poisoning on
-unresolved conflict or commit uncertainty. Until that lands, do not advertise
-`SessionStateStore` as a required Host trait, production authority, or Runtime
-injection point.
+`RuntimeBuilder::session_state_store` installs one shared authority for every
+Session in the Runtime. A neutral shell semantic port supplies stable replay
+cursors and typed transcript, checkpoint, rewind, fork, and tombstone
+operations; the SDK-owned adapter alone owns chunking, bounded chain traversal,
+immutable object staging, CAS publication, and exact `CommitUnknown`
+reconciliation. Conflict, corruption, missing/oversized objects, replay gaps,
+or unresolved acknowledgement uncertainty fail closed. Checkpoint markers and
+payloads, and rewind markers and operations, publish atomically. Full and
+partial forks receive fresh generations. `Runtime::create_session_with_id`
+derives a generation from the exact `SessionConfig`, so retrying the same UUID
+and config after an unknown acknowledgement reopens idempotently, while config
+drift and tombstones are rejected.
 
-Startup still creates `grok_home` and `session_storage`. Even with both stores injected, native Grok necessarily keeps its session transcript/history, rewind implementation state, shell storage, native tool/process/terminal state and other bundled-agent files there; those are not SDK-origin evidence and are not copied into either store. Hosts must place, protect and back up that native filesystem as appropriate. The `Event` receiver and `events_after` journal are bounded in-memory delivery only and are not durable evidence.
+Startup still creates `grok_home` and `session_storage` for uncovered shell
+sidecars and native tool/process/terminal state. In Host Session-state mode it
+does not read, write, create, import, or fork-copy `updates.jsonl`,
+`chat_history.jsonl`, `rewind_points.jsonl`, or
+`compaction_checkpoints/**`; chat history and rewind replay are rebuilt in
+memory from the authority. Without injection, the legacy JSONL implementation
+is unchanged. The `Event` receiver and `events_after` journal remain bounded
+in-memory delivery only and are not durable evidence.
 
 `AutonomousTurnLoop` currently has enforceable exact upper bounds only for iteration count, agent calls, and concurrency. Until a model/runtime capability contract supplies enforceable per-Turn maxima, finite `tokens`, `cost_micros`, `active_ms`, `wall_ms`, or `artifact_bytes` budgets are rejected before an iteration or prompt is dispatched. Use `u64::MAX` to mark those dimensions explicitly unbounded. Actual typed usage is still settled and recorded; an overrun or unknown value against a finite reservation durably enters recovery rather than being treated as free work.
 
 | SDK owns | Embedding Host owns |
 |---|---|
 | Run reducer and lifecycle invariants, bounded loop, budgets, gates, verifier policy, intent/outbox, command de-duplication, epoch/token fencing, receipts, recovery decisions and attach contract | Worker/process placement, OS daemon/service residency, durable timer implementation and invoking bounded activations |
-| SessionLedger/rewind/binding schemas, validation, identity, CAS transition intent and fail-closed reconciliation; artifact identity/integrity and provider contracts | Physical Run and session-evidence persistence, transactions/migrations/encryption/backup/lifecycle; native session filesystem placement; credentials, providers, workspace, queues, policy and UI |
+| SessionLedger/rewind/binding schemas; native Session object/chunk schemas, validation, replay and publication semantics; CAS transition intent and fail-closed reconciliation; artifact identity/integrity and provider contracts | Physical Run, session-evidence, and native Session-state persistence; transactions/migrations/encryption/backup/lifecycle; uncovered shell-sidecar placement; credentials, providers, workspace, queues, policy and UI |
 
 `ProviderSet` supplies typed artifact, gate, verifier, approval, and telemetry contracts. Local defaults store content-addressed artifacts and fail gates, verification, and approval closed until the Host installs explicit providers.
 
