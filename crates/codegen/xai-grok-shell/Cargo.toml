@@ -171,7 +171,8 @@ url = { workspace = true }
 walkdir = { workspace = true }
 tdigests = "1.0"
 semver = { workspace = true }
-process-wrap = { version = "9.0.0", features = ["tokio1", "job-object", "creation-flags"] }
+# Keep process-wrap's PROCESS_CREATION_FLAGS type aligned with workspace windows 0.61.
+process-wrap = { version = "=9.0.0", features = ["tokio1", "job-object", "creation-flags"] }
 portable-pty = "0.9"
 parking_lot.workspace = true
 dashmap.workspace = true

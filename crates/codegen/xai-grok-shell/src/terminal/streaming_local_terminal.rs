@@ -1191,6 +1191,17 @@ mod tests {
     use crate::terminal::DEFAULT_OUTPUT_BYTE_LIMIT;
     use xai_grok_paths::AbsPathBuf;
 
+    #[cfg(windows)]
+    #[test]
+    fn windows_terminal_creation_flags_match_process_wrap() {
+        use process_wrap::tokio::CreationFlags;
+        use windows::Win32::System::Threading::{CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW};
+
+        let flags = CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW;
+        let wrapped = CreationFlags(flags);
+        assert_eq!(wrapped.0, flags);
+    }
+
     struct TestNotifier {
         notifications: Mutex<Vec<acp::SessionNotification>>,
     }
