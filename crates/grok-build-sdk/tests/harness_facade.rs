@@ -1,7 +1,8 @@
 use grok_build_sdk::{
     ApiBackend, Error, HarnessContent, HarnessError, HarnessRefinement, HarnessRefinementPatch,
-    HarnessSnapshot, LedgerTurnState, ModelSpec, Runtime, RuntimeConfig, SessionConfig,
-    TurnOutcome,
+    HarnessSnapshot, LedgerTurnState, ModelSpec, Prompt, PromptBlock, Runtime, RuntimeConfig,
+    SessionConfig, TurnBindingKey, TurnBindingStatus, TurnOutcome, prompt_digest,
+    prompt_digest_content,
 };
 use std::path::PathBuf;
 use tempfile::TempDir;
@@ -181,6 +182,20 @@ fn assert_provider_binding(
     assert_eq!(receipt.model(), expected_model);
     assert_eq!(receipt.reasoning(), Some(expected_reasoning));
     request
+}
+
+async fn wait_for_provider_marker(server: &MockInferenceServer, marker: &str) {
+    for _ in 0..100 {
+        if server
+            .request_bodies()
+            .iter()
+            .any(|body| body.to_string().contains(marker))
+        {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("provider did not receive marker {marker}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -440,4 +455,230 @@ async fn binding_rejects_snapshot_mismatch_before_dispatch_and_cursor_gap_after_
         LedgerTurnState::Completed { .. }
     ));
     runtime.shutdown().await.expect("runtime shuts down");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn lost_prompt_result_recovers_the_exact_durable_binding_after_restart() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let server = MockInferenceServer::start().await.expect("mock provider");
+    let root = TempDir::new().expect("temp root");
+    let workspace = root.path().join("workspace");
+    std::fs::create_dir(&workspace).expect("workspace");
+    let config = runtime_config(&root, server.url());
+    let snapshot = HarnessSnapshot::new(
+        HarnessContent::new()
+            .system_prompt("durable crash-window system")
+            .rules("durable crash-window rules"),
+    )
+    .unwrap();
+    let turn_id = "lost-binding-turn";
+    let prompt_text = "provider-marker-lost-binding";
+    let prompt = Prompt {
+        blocks: vec![PromptBlock::Text {
+            text: prompt_text.into(),
+        }],
+        metadata: serde_json::Value::Null,
+    };
+    let expected_prompt_digest = prompt_digest_content(&prompt).unwrap();
+    let key = TurnBindingKey::new(
+        turn_id,
+        expected_prompt_digest.clone(),
+        0,
+        snapshot.digest().clone(),
+        "fast",
+        Some("low".into()),
+    )
+    .unwrap();
+
+    let (runtime, _) = Runtime::start(config.clone()).await.unwrap();
+    let session = runtime
+        .create_session_with_harness(
+            session_config(workspace.clone(), "fast", Some("low")),
+            &snapshot,
+        )
+        .await
+        .unwrap();
+    server.hold_agent_completions();
+    let caller = tokio::spawn({
+        let runtime = runtime.clone();
+        let session = session.clone();
+        let snapshot = snapshot.clone();
+        async move {
+            runtime
+                .prompt_with_harness(&session, turn_id, prompt_text, &snapshot)
+                .await
+        }
+    });
+    wait_for_provider_marker(&server, prompt_text).await;
+    caller.abort();
+    assert!(caller.await.unwrap_err().is_cancelled());
+    server.release_agent_completions();
+
+    let ledger = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let ledger = runtime.session_ledger(&session).await.unwrap();
+            if matches!(
+                ledger.entries.first().map(|entry| &entry.state),
+                Some(LedgerTurnState::Completed { .. })
+            ) {
+                break ledger;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("native Turn settles after its caller disappears");
+    assert_eq!(ledger.entries[0].prompt_digest, expected_prompt_digest);
+    let before_restart = match runtime
+        .turn_binding_status(&session, key.clone())
+        .await
+        .unwrap()
+    {
+        TurnBindingStatus::Complete { record } => record,
+        _ => panic!("durable binding record must exist before terminal success is exposed"),
+    };
+    assert_eq!(
+        runtime
+            .turn_binding_status(&session, key.clone())
+            .await
+            .unwrap(),
+        TurnBindingStatus::Complete {
+            record: before_restart.clone()
+        },
+        "status lookup is idempotent"
+    );
+    let receipt_bytes = serde_json::to_vec(before_restart.receipt()).unwrap();
+    let record_bytes = before_restart.to_json_vec().unwrap();
+    assert_eq!(
+        grok_build_sdk::TurnBindingRecord::from_json_slice(&record_bytes).unwrap(),
+        before_restart
+    );
+    runtime.shutdown().await.unwrap();
+
+    let (restarted, _) = Runtime::start(config).await.unwrap();
+    restarted
+        .resume_session_with_harness(
+            session.clone(),
+            session_config(workspace, "fast", Some("low")),
+            &snapshot,
+        )
+        .await
+        .unwrap();
+    let recovered = match restarted
+        .turn_binding_status(&session, key.clone())
+        .await
+        .unwrap()
+    {
+        TurnBindingStatus::Complete { record } => record,
+        _ => panic!("durable binding record must survive Runtime restart"),
+    };
+    assert_eq!(recovered, before_restart);
+    assert_eq!(
+        serde_json::to_vec(recovered.receipt()).unwrap(),
+        receipt_bytes
+    );
+    assert_eq!(
+        recovered.receipt().binding_id(),
+        before_restart.receipt().binding_id()
+    );
+    assert!(
+        restarted
+            .events_after(
+                &session,
+                recovered.receipt().complete_cursor().after_sequence()
+            )
+            .await
+            .is_err(),
+        "a recovered historical cursor is evidence, not a claim that the old live journal survived"
+    );
+
+    let conflicting_snapshot =
+        HarnessSnapshot::new(HarnessContent::new().system_prompt("conflicting recovery snapshot"))
+            .unwrap();
+    for conflict in [
+        TurnBindingKey::new(
+            turn_id,
+            expected_prompt_digest.clone(),
+            0,
+            conflicting_snapshot.digest().clone(),
+            "fast",
+            Some("low".into()),
+        )
+        .unwrap(),
+        TurnBindingKey::new(
+            turn_id,
+            expected_prompt_digest.clone(),
+            0,
+            snapshot.digest().clone(),
+            "deep",
+            Some("xhigh".into()),
+        )
+        .unwrap(),
+        TurnBindingKey::new(
+            turn_id,
+            prompt_digest("conflicting prompt"),
+            0,
+            snapshot.digest().clone(),
+            "fast",
+            Some("low".into()),
+        )
+        .unwrap(),
+    ] {
+        assert!(matches!(
+            restarted.turn_binding_status(&session, conflict).await,
+            Err(Error::Harness(HarnessError::BindingRecordConflict(_)))
+        ));
+    }
+    restarted.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ledger_without_a_binding_record_remains_compatible_and_reports_absent() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let server = MockInferenceServer::start().await.expect("mock provider");
+    let root = TempDir::new().expect("temp root");
+    let workspace = root.path().join("workspace");
+    std::fs::create_dir(&workspace).expect("workspace");
+    let snapshot =
+        HarnessSnapshot::new(HarnessContent::new().system_prompt("legacy ledger compatibility"))
+            .unwrap();
+    let (runtime, _) = Runtime::start(runtime_config(&root, server.url()))
+        .await
+        .unwrap();
+    let session = runtime
+        .create_session_with_harness(session_config(workspace, "fast", Some("high")), &snapshot)
+        .await
+        .unwrap();
+    runtime
+        .prompt(&session, "ordinary-turn", "ordinary prompt without binding")
+        .await
+        .unwrap();
+    let ledger = runtime.session_ledger(&session).await.unwrap();
+    assert!(matches!(
+        ledger.entries[0].state,
+        LedgerTurnState::Completed { .. }
+    ));
+    assert_eq!(
+        runtime
+            .turn_binding_status(
+                &session,
+                TurnBindingKey::new(
+                    "ordinary-turn",
+                    prompt_digest("ordinary prompt without binding"),
+                    0,
+                    snapshot.digest().clone(),
+                    "fast",
+                    Some("high".into()),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap(),
+        TurnBindingStatus::Absent
+    );
+    assert!(
+        !serde_json::to_string(&ledger).unwrap().contains("binding"),
+        "the existing Session ledger schema remains unchanged"
+    );
+    runtime.shutdown().await.unwrap();
 }

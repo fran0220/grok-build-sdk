@@ -7,6 +7,8 @@ use std::{collections::BTreeSet, fmt, str::FromStr};
 
 pub const HARNESS_SNAPSHOT_SCHEMA_VERSION: u32 = 1;
 pub const MAX_HARNESS_SNAPSHOT_BYTES: usize = 2 * 1024 * 1024;
+pub const TURN_BINDING_RECORD_SCHEMA_VERSION: u32 = 1;
+pub const MAX_TURN_BINDING_RECORD_BYTES: usize = 1024 * 1024;
 const MAX_HARNESS_FIELD_BYTES: usize = 1024 * 1024;
 const HARNESS_DIGEST_PREFIX: &str = "sha256:";
 
@@ -774,6 +776,283 @@ impl<'de> Deserialize<'de> for TurnBindingReceipt {
     }
 }
 
+/// Exact immutable identity a Host must present when recovering a durable
+/// harness-aware Turn after losing the original method result.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TurnBindingKey {
+    turn_id: String,
+    prompt_digest: String,
+    runtime_prompt_index: u64,
+    snapshot_digest: HarnessDigest,
+    model: String,
+    reasoning: Option<String>,
+}
+
+impl TurnBindingKey {
+    pub fn new(
+        turn_id: impl Into<String>,
+        prompt_digest: impl Into<String>,
+        runtime_prompt_index: u64,
+        snapshot_digest: HarnessDigest,
+        model: impl Into<String>,
+        reasoning: Option<String>,
+    ) -> Result<Self, HarnessError> {
+        let key = Self {
+            turn_id: turn_id.into(),
+            prompt_digest: prompt_digest.into(),
+            runtime_prompt_index,
+            snapshot_digest,
+            model: model.into(),
+            reasoning,
+        };
+        key.validate()?;
+        Ok(key)
+    }
+
+    pub fn turn_id(&self) -> &str {
+        &self.turn_id
+    }
+
+    pub fn prompt_digest(&self) -> &str {
+        &self.prompt_digest
+    }
+
+    pub fn runtime_prompt_index(&self) -> u64 {
+        self.runtime_prompt_index
+    }
+
+    pub fn snapshot_digest(&self) -> &HarnessDigest {
+        &self.snapshot_digest
+    }
+
+    pub fn model(&self) -> &str {
+        &self.model
+    }
+
+    pub fn reasoning(&self) -> Option<&str> {
+        self.reasoning.as_deref()
+    }
+
+    fn validate(&self) -> Result<(), HarnessError> {
+        validate_text(&self.turn_id, 512, "Turn ID")?;
+        validate_prompt_digest(&self.prompt_digest)?;
+        validate_text(&self.model, 512, "model")?;
+        if let Some(reasoning) = &self.reasoning {
+            validate_text(reasoning, 128, "reasoning effort")?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn matches_receipt(&self, receipt: &TurnBindingReceipt) -> bool {
+        self.turn_id == receipt.turn_id
+            && self.prompt_digest == receipt.prompt_digest
+            && self.runtime_prompt_index == receipt.runtime_prompt_index
+            && self.snapshot_digest == receipt.snapshot_digest
+            && self.model == receipt.model
+            && self.reasoning == receipt.reasoning
+    }
+}
+
+/// Versioned, content-addressed durable evidence for one verified event range
+/// and its exact harness-aware Turn receipt.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct TurnBindingRecord {
+    schema_version: u32,
+    record_id: String,
+    receipt: TurnBindingReceipt,
+    event_range_digest: String,
+    terminal_event_digest: String,
+}
+
+impl TurnBindingRecord {
+    pub(crate) fn complete(
+        receipt: TurnBindingReceipt,
+        events: &[Event],
+    ) -> Result<Self, HarnessError> {
+        if events.len() as u64 != receipt.complete_cursor.event_count
+            || events.last().is_none_or(|terminal| {
+                terminal.session_id != receipt.session_id
+                    || terminal.turn_id.as_deref() != Some(receipt.turn_id.as_str())
+                    || terminal.sequence != receipt.complete_cursor.final_sequence
+                    || !matches!(terminal.update, EventUpdate::TurnFinished(value) if value == receipt.outcome)
+            })
+        {
+            return Err(HarnessError::IncompleteTurn(
+                "durable binding record does not contain its exact terminal event range".into(),
+            ));
+        }
+        let event_range_digest =
+            digest_json(b"grok-build-sdk.turn-binding-event-range.v1\0", events)?;
+        let terminal_event_digest = digest_json(
+            b"grok-build-sdk.turn-binding-terminal-event.v1\0",
+            events.last().expect("validated non-empty event range"),
+        )?;
+        let mut record = Self {
+            schema_version: TURN_BINDING_RECORD_SCHEMA_VERSION,
+            record_id: String::new(),
+            receipt,
+            event_range_digest,
+            terminal_event_digest,
+        };
+        record.record_id = record.compute_record_id()?;
+        record.validate()?;
+        Ok(record)
+    }
+
+    pub fn schema_version(&self) -> u32 {
+        self.schema_version
+    }
+
+    pub fn record_id(&self) -> &str {
+        &self.record_id
+    }
+
+    pub fn receipt(&self) -> &TurnBindingReceipt {
+        &self.receipt
+    }
+
+    pub fn into_receipt(self) -> TurnBindingReceipt {
+        self.receipt
+    }
+
+    pub fn event_range_digest(&self) -> &str {
+        &self.event_range_digest
+    }
+
+    pub fn terminal_event_digest(&self) -> &str {
+        &self.terminal_event_digest
+    }
+
+    pub fn to_json_vec(&self) -> Result<Vec<u8>, HarnessError> {
+        self.validate()?;
+        let bytes = serde_json::to_vec(self)
+            .map_err(|error| HarnessError::Serialization(error.to_string()))?;
+        if bytes.len() > MAX_TURN_BINDING_RECORD_BYTES {
+            return Err(HarnessError::BindingRecordTooLarge {
+                actual: bytes.len(),
+                maximum: MAX_TURN_BINDING_RECORD_BYTES,
+            });
+        }
+        Ok(bytes)
+    }
+
+    pub fn from_json_slice(bytes: &[u8]) -> Result<Self, HarnessError> {
+        if bytes.len() > MAX_TURN_BINDING_RECORD_BYTES {
+            return Err(HarnessError::BindingRecordTooLarge {
+                actual: bytes.len(),
+                maximum: MAX_TURN_BINDING_RECORD_BYTES,
+            });
+        }
+        let wire: TurnBindingRecordWire = serde_json::from_slice(bytes)
+            .map_err(|error| HarnessError::Serialization(error.to_string()))?;
+        Self::from_wire(wire)
+    }
+
+    fn from_wire(wire: TurnBindingRecordWire) -> Result<Self, HarnessError> {
+        let record = Self {
+            schema_version: wire.schema_version,
+            record_id: wire.record_id,
+            receipt: wire.receipt,
+            event_range_digest: wire.event_range_digest,
+            terminal_event_digest: wire.terminal_event_digest,
+        };
+        record.validate()?;
+        Ok(record)
+    }
+
+    fn validate(&self) -> Result<(), HarnessError> {
+        if self.schema_version != TURN_BINDING_RECORD_SCHEMA_VERSION {
+            return Err(HarnessError::Invalid(format!(
+                "unsupported Turn binding record schema {}",
+                self.schema_version
+            )));
+        }
+        self.receipt.validate()?;
+        validate_sha256_id(&self.record_id, "Turn binding record ID")?;
+        validate_sha256_id(&self.event_range_digest, "Turn event range digest")?;
+        validate_sha256_id(&self.terminal_event_digest, "Turn terminal event digest")?;
+        if self.record_id != self.compute_record_id()? {
+            return Err(HarnessError::Invalid(
+                "Turn binding record identity does not match its contents".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn compute_record_id(&self) -> Result<String, HarnessError> {
+        digest_json(
+            b"grok-build-sdk.turn-binding-record.v1\0",
+            &TurnBindingRecordPayload {
+                schema_version: self.schema_version,
+                receipt: &self.receipt,
+                event_range_digest: &self.event_range_digest,
+                terminal_event_digest: &self.terminal_event_digest,
+            },
+        )
+    }
+}
+
+#[derive(Serialize)]
+struct TurnBindingRecordPayload<'a> {
+    schema_version: u32,
+    receipt: &'a TurnBindingReceipt,
+    event_range_digest: &'a str,
+    terminal_event_digest: &'a str,
+}
+
+#[derive(Deserialize)]
+struct TurnBindingRecordWire {
+    schema_version: u32,
+    record_id: String,
+    receipt: TurnBindingReceipt,
+    event_range_digest: String,
+    terminal_event_digest: String,
+}
+
+impl<'de> Deserialize<'de> for TurnBindingRecord {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = TurnBindingRecordWire::deserialize(deserializer)?;
+        Self::from_wire(wire).map_err(D::Error::custom)
+    }
+}
+
+fn digest_json<T: Serialize + ?Sized>(domain: &[u8], value: &T) -> Result<String, HarnessError> {
+    let mut value = serde_json::to_value(value)
+        .map_err(|error| HarnessError::Serialization(error.to_string()))?;
+    crate::canonicalize_json(&mut value);
+    let bytes = serde_json::to_vec(&value)
+        .map_err(|error| HarnessError::Serialization(error.to_string()))?;
+    let mut digest = Sha256::new();
+    digest.update(domain);
+    digest.update(bytes);
+    Ok(format!("sha256:{:x}", digest.finalize()))
+}
+
+fn validate_sha256_id(value: &str, name: &str) -> Result<(), HarnessError> {
+    let Some(hex) = value.strip_prefix(HARNESS_DIGEST_PREFIX) else {
+        return Err(HarnessError::Invalid(format!(
+            "{name} must use the sha256 prefix"
+        )));
+    };
+    if hex.len() != 64 || !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(HarnessError::Invalid(format!(
+            "{name} must contain exactly 32 SHA-256 bytes"
+        )));
+    }
+    Ok(())
+}
+
+#[non_exhaustive]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum TurnBindingStatus {
+    Absent,
+    Complete { record: TurnBindingRecord },
+}
+
 /// One typed change proposed against an immutable snapshot.
 #[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -900,6 +1179,8 @@ pub enum HarnessError {
     Invalid(String),
     #[error("harness snapshot is {actual} bytes; maximum is {maximum}")]
     SnapshotTooLarge { actual: usize, maximum: usize },
+    #[error("Turn binding record is {actual} bytes; maximum is {maximum}")]
+    BindingRecordTooLarge { actual: usize, maximum: usize },
     #[error("harness snapshot digest mismatch: declared {declared}, computed {computed}")]
     DigestMismatch {
         declared: HarnessDigest,
@@ -919,6 +1200,8 @@ pub enum HarnessError {
     UnboundSession,
     #[error("incomplete Turn binding: {0}")]
     IncompleteTurn(String),
+    #[error("durable Turn binding conflict: {0}")]
+    BindingRecordConflict(String),
     #[error("harness serialization failed: {0}")]
     Serialization(String),
 }

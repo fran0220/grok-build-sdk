@@ -3,7 +3,8 @@ use crate::{
     ExtensionNotification, ExtensionRequest, ExtensionResponse, HarnessDigest, HarnessError,
     LedgerTurnState, ModelCatalog, Prompt, PromptBlock, PromptReceipt, RewindPoint,
     RuntimeCapabilities, RuntimeConfig, RuntimeOptions, SessionConfig, SessionId, SessionLedger,
-    SessionLedgerEntry, TurnBindingReceipt, TurnOutcome,
+    SessionLedgerEntry, TurnBindingKey, TurnBindingReceipt, TurnBindingRecord, TurnBindingStatus,
+    TurnOutcome,
 };
 use agent_client_protocol as acp;
 use agent_client_protocol::Agent as _;
@@ -96,6 +97,7 @@ enum Command {
     EventsAfter(SessionId, u64, Reply<Vec<Event>>),
     Cancel(SessionId, Reply<()>),
     SessionLedger(SessionId, Reply<SessionLedger>),
+    TurnBindingStatus(SessionId, TurnBindingKey, Reply<crate::TurnBindingStatus>),
     MarkTurnDiscarded(SessionId, String, String, u64, Reply<()>),
     SetRoute(SessionId, String, Option<String>, Reply<()>),
     RewindPoints(SessionId, Reply<Vec<RewindPoint>>),
@@ -535,6 +537,14 @@ impl Runtime {
     }
     pub async fn session_ledger(&self, id: &SessionId) -> Result<SessionLedger, Error> {
         self.call(|reply| Command::SessionLedger(id.clone(), reply))
+            .await
+    }
+    pub async fn turn_binding_status(
+        &self,
+        id: &SessionId,
+        key: TurnBindingKey,
+    ) -> Result<TurnBindingStatus, Error> {
+        self.call(|reply| Command::TurnBindingStatus(id.clone(), key, reply))
             .await
     }
     pub async fn mark_turn_discarded(
@@ -1184,6 +1194,18 @@ fn validate_session_ledger(id: &SessionId, ledger: &SessionLedger) -> Result<(),
         }
     }
     Ok(())
+}
+
+fn settle_latest_ledger_entry(ledger: &mut SessionLedger, receipt: &PromptReceipt) {
+    ledger
+        .entries
+        .last_mut()
+        .expect("the pending ledger entry was just appended")
+        .state = LedgerTurnState::Completed {
+        outcome: receipt.outcome,
+        settlement_id: receipt.settlement_id.clone(),
+        usage: Some(receipt.usage.clone()),
+    };
 }
 
 pub(crate) fn ledger_settlement_id(
@@ -1872,6 +1894,7 @@ struct Core {
     prompt_tasks: RefCell<HashMap<String, tokio::task::AbortHandle>>,
     replay: Rc<RefCell<HashMap<String, ReplayMode>>>,
     ledger_root: std::path::PathBuf,
+    turn_binding_root: std::path::PathBuf,
     rewind_root: std::path::PathBuf,
 }
 impl Core {
@@ -2150,6 +2173,7 @@ impl Core {
                 prompt_tasks: RefCell::new(HashMap::new()),
                 replay,
                 ledger_root: input.session_storage.join("origin-turn-ledger"),
+                turn_binding_root: input.session_storage.join("origin-harness-turn-bindings"),
                 rewind_root: input.session_storage.join("origin-rewind-receipts"),
             },
             capabilities,
@@ -2358,6 +2382,9 @@ impl Core {
                 }
                 Command::SessionLedger(i, r) => {
                     let _ = r.send(self.session_ledger(&i));
+                }
+                Command::TurnBindingStatus(i, key, r) => {
+                    let _ = r.send(self.turn_binding_status(&i, &key));
                 }
                 Command::MarkTurnDiscarded(i, turn, digest, prompt_index, r) => {
                     let _ = r.send(self.mark_turn_discarded(&i, turn, digest, prompt_index));
@@ -2587,6 +2614,11 @@ impl Core {
             .collect()
     }
     fn emit(&self, id: &SessionId, u: EventUpdate, t: Option<String>) {
+        let event = self.retain_event(id, u, t);
+        self.publish_event(event);
+    }
+
+    fn retain_event(&self, id: &SessionId, u: EventUpdate, t: Option<String>) -> Event {
         let mut s = self.sequences.borrow_mut();
         let n = s.entry(id.0.clone()).or_default();
         *n += 1;
@@ -2604,6 +2636,10 @@ impl Core {
         while retained.len() > self.capacity {
             retained.pop_front();
         }
+        event
+    }
+
+    fn publish_event(&self, event: Event) {
         let _ = self.events.send(event);
     }
 
@@ -2782,8 +2818,10 @@ impl Core {
             vec![acp::ContentBlock::Text(acp::TextContent::new(x))],
             digest,
             serde_json::Value::Null,
+            None,
         )
         .await
+        .map(|(receipt, _)| receipt)
     }
     async fn prompt_content(
         &self,
@@ -2802,8 +2840,9 @@ impl Core {
             blocks.push(serde_json::from_value(value).map_err(op)?);
         }
         let digest = crate::prompt_digest_content(&prompt)?;
-        self.prompt_wire(id, t, blocks, digest, prompt.metadata)
+        self.prompt_wire(id, t, blocks, digest, prompt.metadata, None)
             .await
+            .map(|(receipt, _)| receipt)
     }
     async fn prompt_content_with_harness(
         &self,
@@ -2812,22 +2851,35 @@ impl Core {
         prompt: Prompt,
         prepared: PreparedHarnessTurn,
     ) -> Result<TurnBindingReceipt, Error> {
-        let receipt = self
-            .prompt_content(id.clone(), turn_id.clone(), prompt)
+        if prompt.blocks.is_empty() {
+            return Err(Error::InvalidConfig(
+                "prompt blocks must not be empty".into(),
+            ));
+        }
+        let mut blocks = Vec::new();
+        for block in &prompt.blocks {
+            let value = prompt_block_wire(block)?;
+            blocks.push(serde_json::from_value(value).map_err(op)?);
+        }
+        let prompt_digest = crate::prompt_digest_content(&prompt)?;
+        if prompt_digest != prepared.prompt_digest {
+            return Err(Error::Operation(
+                "prepared harness Turn prompt identity changed before dispatch".into(),
+            ));
+        }
+        let (_, record) = self
+            .prompt_wire(
+                id,
+                turn_id,
+                blocks,
+                prompt_digest,
+                prompt.metadata,
+                Some(prepared),
+            )
             .await?;
-        let events = self.events_after(&id, prepared.after_sequence)?;
-        TurnBindingReceipt::complete(
-            id,
-            turn_id,
-            prepared.prompt_digest,
-            prepared.snapshot_digest,
-            prepared.model,
-            prepared.reasoning,
-            prepared.after_sequence,
-            receipt,
-            &events,
-        )
-        .map_err(Error::Harness)
+        record
+            .map(TurnBindingRecord::into_receipt)
+            .ok_or_else(|| Error::Operation("durable Turn binding record was not issued".into()))
     }
 
     fn prepare_harness_turn(
@@ -2874,7 +2926,8 @@ impl Core {
         blocks: Vec<acp::ContentBlock>,
         prompt_digest: String,
         metadata: serde_json::Value,
-    ) -> Result<PromptReceipt, Error> {
+        prepared: Option<PreparedHarnessTurn>,
+    ) -> Result<(PromptReceipt, Option<TurnBindingRecord>), Error> {
         self.require_resident(&id)?;
         let mut ledger = self.load_ledger(&id)?;
         if ledger
@@ -2964,29 +3017,55 @@ impl Core {
             outcome,
             &usage,
         )?;
-        ledger
-            .entries
-            .last_mut()
-            .expect("the pending ledger entry was just appended")
-            .state = LedgerTurnState::Completed {
+        let terminal = self.retain_event(&id, EventUpdate::TurnFinished(outcome), Some(t.clone()));
+        let receipt = PromptReceipt {
             outcome,
-            settlement_id: settlement_id.clone(),
-            usage: Some(usage.clone()),
-        };
-        self.save_ledger(&id, &ledger)?;
-        self.emit(&id, EventUpdate::TurnFinished(outcome), Some(t));
-        let final_sequence = *self
-            .sequences
-            .borrow()
-            .get(&id.0)
-            .ok_or_else(|| Error::Operation("session event sequence is unavailable".into()))?;
-        Ok(PromptReceipt {
-            outcome,
-            final_sequence,
+            final_sequence: terminal.sequence,
             runtime_prompt_index,
             settlement_id,
             usage,
-        })
+        };
+        let Some(prepared) = prepared else {
+            settle_latest_ledger_entry(&mut ledger, &receipt);
+            self.save_ledger(&id, &ledger)?;
+            self.publish_event(terminal);
+            return Ok((receipt, None));
+        };
+
+        let record = self
+            .events_after(&id, prepared.after_sequence)
+            .and_then(|events| {
+                let binding = TurnBindingReceipt::complete(
+                    id.clone(),
+                    t,
+                    prepared.prompt_digest,
+                    prepared.snapshot_digest,
+                    prepared.model,
+                    prepared.reasoning,
+                    prepared.after_sequence,
+                    receipt.clone(),
+                    &events,
+                )
+                .map_err(Error::Harness)?;
+                TurnBindingRecord::complete(binding, &events).map_err(Error::Harness)
+            });
+        let record = match record {
+            Ok(record) => record,
+            Err(error) => {
+                settle_latest_ledger_entry(&mut ledger, &receipt);
+                self.save_ledger(&id, &ledger)?;
+                self.publish_event(terminal);
+                return Err(error);
+            }
+        };
+        if let Err(error) = self.save_turn_binding_record(&record) {
+            self.publish_event(terminal);
+            return Err(error);
+        }
+        settle_latest_ledger_entry(&mut ledger, &receipt);
+        self.save_ledger(&id, &ledger)?;
+        self.publish_event(terminal);
+        Ok((receipt, Some(record)))
     }
 
     fn session_ledger(&self, id: &SessionId) -> Result<SessionLedger, Error> {
@@ -3092,6 +3171,178 @@ impl Core {
             .map_err(op)?;
         Ok(())
     }
+
+    fn turn_binding_path(&self, id: &SessionId, turn_id: &str) -> std::path::PathBuf {
+        use sha2::Digest as _;
+        let session = format!("{:x}", sha2::Sha256::digest(id.as_str().as_bytes()));
+        let turn = format!("{:x}", sha2::Sha256::digest(turn_id.as_bytes()));
+        self.turn_binding_root
+            .join(session)
+            .join(format!("{turn}.json"))
+    }
+
+    fn load_turn_binding_record(
+        &self,
+        id: &SessionId,
+        turn_id: &str,
+    ) -> Result<Option<TurnBindingRecord>, Error> {
+        match std::fs::read(self.turn_binding_path(id, turn_id)) {
+            Ok(bytes) => TurnBindingRecord::from_json_slice(&bytes)
+                .map(Some)
+                .map_err(Error::Harness),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(op(error)),
+        }
+    }
+
+    fn save_turn_binding_record(&self, record: &TurnBindingRecord) -> Result<(), Error> {
+        use std::io::Write as _;
+        let receipt = record.receipt();
+        let path = self.turn_binding_path(receipt.session_id(), receipt.turn_id());
+        if let Some(existing) =
+            self.load_turn_binding_record(receipt.session_id(), receipt.turn_id())?
+        {
+            return if existing == *record {
+                Ok(())
+            } else {
+                Err(Error::Harness(HarnessError::BindingRecordConflict(
+                    "an immutable record already exists for this Session and Turn ID".into(),
+                )))
+            };
+        }
+        let directory = path
+            .parent()
+            .ok_or_else(|| Error::Operation("Turn binding record path has no parent".into()))?;
+        std::fs::create_dir_all(directory).map_err(op)?;
+        let temporary = path.with_extension("json.tmp");
+        let bytes = record.to_json_vec().map_err(Error::Harness)?;
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&temporary)
+            .map_err(op)?;
+        file.write_all(&bytes).map_err(op)?;
+        file.sync_all().map_err(op)?;
+        drop(file);
+        if let Some(existing) =
+            self.load_turn_binding_record(receipt.session_id(), receipt.turn_id())?
+        {
+            let _ = std::fs::remove_file(&temporary);
+            return if existing == *record {
+                Ok(())
+            } else {
+                Err(Error::Harness(HarnessError::BindingRecordConflict(
+                    "a conflicting immutable record appeared during persistence".into(),
+                )))
+            };
+        }
+        match std::fs::hard_link(&temporary, &path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                let existing = self
+                    .load_turn_binding_record(receipt.session_id(), receipt.turn_id())?
+                    .ok_or_else(|| {
+                        Error::Operation(
+                            "Turn binding record appeared but could not be loaded".into(),
+                        )
+                    })?;
+                let _ = std::fs::remove_file(&temporary);
+                return if existing == *record {
+                    Ok(())
+                } else {
+                    Err(Error::Harness(HarnessError::BindingRecordConflict(
+                        "a conflicting immutable record won persistence".into(),
+                    )))
+                };
+            }
+            Err(error) => return Err(op(error)),
+        }
+        std::fs::remove_file(&temporary).map_err(op)?;
+        #[cfg(unix)]
+        std::fs::File::open(directory)
+            .and_then(|directory| directory.sync_all())
+            .map_err(op)?;
+        Ok(())
+    }
+
+    fn turn_binding_status(
+        &self,
+        id: &SessionId,
+        key: &TurnBindingKey,
+    ) -> Result<TurnBindingStatus, Error> {
+        self.require_resident(id)?;
+        let binding = self
+            .session_bindings
+            .borrow()
+            .get(id.as_str())
+            .cloned()
+            .ok_or_else(|| Error::Operation("session binding is unavailable".into()))?;
+        if binding.harness_digest.as_ref() != Some(key.snapshot_digest())
+            || binding.model != key.model()
+            || binding.reasoning.as_deref() != key.reasoning()
+        {
+            return Err(Error::Harness(HarnessError::BindingRecordConflict(
+                "the resident Session snapshot or effective route differs from the recovery key"
+                    .into(),
+            )));
+        }
+        let mut ledger = self.load_ledger(id)?;
+        let entry_position = ledger
+            .entries
+            .iter()
+            .position(|entry| entry.turn_id == key.turn_id());
+        if let Some(entry) = entry_position.map(|position| &ledger.entries[position])
+            && (entry.prompt_digest != key.prompt_digest()
+                || entry.runtime_prompt_index != key.runtime_prompt_index())
+        {
+            return Err(Error::Harness(HarnessError::BindingRecordConflict(
+                "the recovery key conflicts with the durable Turn ledger identity".into(),
+            )));
+        }
+        let Some(record) = self.load_turn_binding_record(id, key.turn_id())? else {
+            return Ok(TurnBindingStatus::Absent);
+        };
+        let receipt = record.receipt();
+        if entry_position.is_none() || receipt.session_id() != id || !key.matches_receipt(receipt) {
+            return Err(Error::Harness(HarnessError::BindingRecordConflict(
+                "the durable record does not match the requested Turn binding identity".into(),
+            )));
+        }
+        let position = entry_position.expect("checked present");
+        match &ledger.entries[position].state {
+            LedgerTurnState::Completed {
+                outcome,
+                settlement_id,
+                usage,
+            } => {
+                if *outcome != receipt.outcome()
+                    || settlement_id != receipt.settlement_id()
+                    || usage.as_ref() != Some(receipt.usage())
+                {
+                    return Err(Error::Harness(HarnessError::BindingRecordConflict(
+                        "the durable record conflicts with the completed Turn ledger evidence"
+                            .into(),
+                    )));
+                }
+            }
+            LedgerTurnState::Pending => {
+                ledger.entries[position].state = LedgerTurnState::Completed {
+                    outcome: receipt.outcome(),
+                    settlement_id: receipt.settlement_id().to_owned(),
+                    usage: Some(receipt.usage().clone()),
+                };
+                self.save_ledger(id, &ledger)?;
+            }
+            LedgerTurnState::Discarded => {
+                return Err(Error::Harness(HarnessError::BindingRecordConflict(
+                    "the durable Turn binding belongs to discarded conversation history".into(),
+                )));
+            }
+        }
+        Ok(TurnBindingStatus::Complete { record })
+    }
+
     async fn cancel(&self, id: SessionId) -> Result<(), Error> {
         let session_id = id.0.clone();
         let result = self

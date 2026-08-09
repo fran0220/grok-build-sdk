@@ -13,7 +13,9 @@ pub use autonomous::{AutonomousActivation, AutonomousActivationResult, Autonomou
 pub use harness::{
     CompleteEventCursor, HARNESS_SNAPSHOT_SCHEMA_VERSION, HarnessContent, HarnessDigest,
     HarnessError, HarnessRefinement, HarnessRefinementPatch, HarnessSnapshot,
-    MAX_HARNESS_SNAPSHOT_BYTES, MaterializedHarness, SdkProvenance, TurnBindingReceipt,
+    MAX_HARNESS_SNAPSHOT_BYTES, MAX_TURN_BINDING_RECORD_BYTES, MaterializedHarness, SdkProvenance,
+    TURN_BINDING_RECORD_SCHEMA_VERSION, TurnBindingKey, TurnBindingReceipt, TurnBindingRecord,
+    TurnBindingStatus,
 };
 
 use std::{collections::BTreeMap, path::PathBuf, sync::Arc};
@@ -3131,6 +3133,16 @@ impl Runtime {
         self.inner
             .prompt_content_with_harness(id, turn_id.into(), prompt, snapshot.digest().clone())
             .await
+    }
+    /// Recovers the immutable record for an exact harness-aware Turn. The
+    /// Session must be reattached with the same snapshot and effective route;
+    /// any conflicting ledger, snapshot, route, prompt, or index fails closed.
+    pub async fn turn_binding_status(
+        &self,
+        id: &SessionId,
+        key: TurnBindingKey,
+    ) -> Result<TurnBindingStatus, Error> {
+        self.inner.turn_binding_status(id, key).await
     }
     /// Returns retained events whose sequence is strictly greater than
     /// `after_sequence`. Unknown or currently unloaded sessions fail closed.
