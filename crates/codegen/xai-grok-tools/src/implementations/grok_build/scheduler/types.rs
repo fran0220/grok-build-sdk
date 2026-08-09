@@ -169,6 +169,9 @@ pub enum SchedulerError {
     #[error("failed to persist scheduler resources: {0}")]
     Persistence(#[source] std::io::Error),
 
+    #[error("scheduler durability outcome is unknown: {0}")]
+    DurabilityOutcomeUnknown(String),
+
     #[error("failed to publish scheduler tombstone: {0}")]
     Notification(#[source] crate::notification::NotificationAcknowledgementError),
 
@@ -191,6 +194,7 @@ pub fn scheduler_tool_error(error: SchedulerError) -> xai_tool_runtime::ToolErro
         | SchedulerError::TaskLimitReached(_)
         | SchedulerError::TaskNotFound(_) => "scheduler_invalid_request",
         SchedulerError::Persistence(_) => "scheduler_persistence",
+        SchedulerError::DurabilityOutcomeUnknown(_) => "scheduler_durability_unknown",
         SchedulerError::Notification(_) => "scheduler_notification",
         SchedulerError::NoDurableNotificationConsumer => "scheduler_durability_unavailable",
         SchedulerError::RemovalPending(_) => "scheduler_removal_pending",

@@ -216,6 +216,7 @@ pub(crate) async fn spawn_session_actor(
     mcp_meta_config_map: McpMetaConfigMap,
     parent_mcp_pool: Option<crate::session::mcp_servers::SharedMcpPool>,
     acp_mcp_servers: Vec<crate::session::mcp_servers::AcpServerEntry>,
+    embedded_mcp_invoker: Option<Arc<dyn xai_grok_mcp::acp_transport::EmbeddedMcpInvoker>>,
     support_permission: bool,
     telemetry_enabled: bool,
     auto_update: Option<bool>,
@@ -932,6 +933,12 @@ pub(crate) async fn spawn_session_actor(
     });
     let mcp_state = {
         let mut state = McpState::new_with_meta(mcp_servers.clone(), mcp_meta_config_map);
+        if let Some(services) = embedded_mcp_invoker
+            .as_ref()
+            .and_then(|invoker| invoker.host_services())
+        {
+            state.set_host_services(session_info.id.0.to_string(), services);
+        }
         if let Some(ref pool) = parent_mcp_pool {
             state.import_shared_clients(pool);
             tracing::info!(
@@ -941,9 +948,16 @@ pub(crate) async fn spawn_session_actor(
             );
         }
         if !acp_mcp_servers.is_empty() {
-            let invoker = std::sync::Arc::new(crate::session::acp_mcp::GatewayAcpInvoker::new(
-                gateway.clone(),
-            ));
+            let invoker = match embedded_mcp_invoker {
+                Some(invoker) => xai_grok_mcp::acp_transport::bind_embedded_invoker(
+                    session_info.id.0.to_string(),
+                    invoker,
+                ),
+                None => std::sync::Arc::new(crate::session::acp_mcp::GatewayAcpInvoker::new(
+                    gateway.clone(),
+                    session_info.id.clone(),
+                )),
+            };
             let acp_server_count = acp_mcp_servers.len();
             state.set_acp_servers(acp_mcp_servers, invoker);
             tracing::info!(
@@ -2202,6 +2216,7 @@ pub(crate) async fn spawn_session_on_thread(
     mcp_meta_config_map: McpMetaConfigMap,
     parent_mcp_pool: Option<crate::session::mcp_servers::SharedMcpPool>,
     acp_mcp_servers: Vec<crate::session::mcp_servers::AcpServerEntry>,
+    embedded_mcp_invoker: Option<Arc<dyn xai_grok_mcp::acp_transport::EmbeddedMcpInvoker>>,
     support_permission: bool,
     telemetry_enabled: bool,
     auto_update: Option<bool>,
@@ -2376,6 +2391,7 @@ pub(crate) async fn spawn_session_on_thread(
                         mcp_meta_config_map,
                         parent_mcp_pool,
                         acp_mcp_servers,
+                        embedded_mcp_invoker,
                         support_permission,
                         telemetry_enabled,
                         auto_update,

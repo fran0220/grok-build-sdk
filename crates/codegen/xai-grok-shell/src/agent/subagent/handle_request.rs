@@ -1105,6 +1105,7 @@ pub(crate) async fn run_shell_child(
         Default::default(),
         parent_mcp_pool,
         Vec::new(),
+        None,
         true,
         false,
         None,

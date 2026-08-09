@@ -22,9 +22,9 @@ serde_json = { workspace = true }
 sha2 = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["rt", "sync", "time"] }
-tokio-util = { workspace = true, features = ["compat"] }
 xai-acp-lib = { workspace = true }
 xai-file-utils = { path = "../codegen/xai-file-utils" }
+xai-grok-mcp = { workspace = true }
 xai-grok-shell = { workspace = true }
 xai-grok-tools = { workspace = true }
 

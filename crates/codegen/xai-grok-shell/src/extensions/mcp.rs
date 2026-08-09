@@ -36,6 +36,10 @@ pub mod mcp_methods {
 
     pub const LIST: &str = "x.ai/mcp/list";
     pub const READ_RESOURCE: &str = "x.ai/mcp/read_resource";
+    pub const LIST_RESOURCES: &str = "x.ai/mcp/resources/list";
+    pub const LIST_PROMPTS: &str = "x.ai/mcp/prompts/list";
+    pub const GET_PROMPT: &str = "x.ai/mcp/prompts/get";
+    pub const COMPLETE: &str = "x.ai/mcp/complete";
     pub const AUTH_STATUS: &str = "x.ai/mcp/auth_status";
     pub const AUTH_TRIGGER: &str = "x.ai/mcp/auth_trigger";
     pub const SETUP: &str = "x.ai/mcp/setup";
@@ -59,6 +63,10 @@ use crate::session::mcp_servers::{MCP_TOOL_NAME_DELIMITER, McpClient, McpServerN
 pub struct McpListRequest {
     #[serde(default)]
     pub session_id: Option<String>,
+    /// Fail rather than silently returning the agent-level catalog when the
+    /// caller requires a specific live session (used by the embedded SDK).
+    #[serde(default)]
+    pub require_session: bool,
     /// When false, bypass cache and refetch from cli-chat-proxy, then sync
     /// into live sessions so `search_tool` sees new tools. Use after OAuth
     /// enrollment or disconnect.
@@ -131,6 +139,30 @@ pub struct McpEnvVar {
     pub value: String,
 }
 
+fn redact_sdk_catalog_entry(entry: &mut McpServerEntry) {
+    entry.setup = None;
+    entry.setup_values = None;
+    match &mut entry.config {
+        McpServerConfig::Http {
+            url,
+            scope,
+            scope_id,
+            scope_name,
+        } => {
+            url.clear();
+            *scope = None;
+            *scope_id = None;
+            *scope_name = None;
+        }
+        McpServerConfig::Stdio { command, args, env } => {
+            *command = std::path::PathBuf::new();
+            args.clear();
+            env.clear();
+        }
+        McpServerConfig::ManagedGateway => {}
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum McpServerSource {
@@ -150,6 +182,8 @@ pub struct McpServerSessionState {
     pub auth_required: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub setup_required: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub negotiated: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -195,17 +229,15 @@ pub(crate) struct McpCallRequest {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct McpCallResponse {
-    pub content: Vec<McpContentBlock>,
+    /// Raw MCP content blocks. Keeping the protocol JSON intact prevents new
+    /// rmcp content variants from being silently flattened or discarded.
+    pub content: Vec<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub structured_content: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub is_error: Option<bool>,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct McpContentBlock {
-    #[serde(rename = "type")]
-    pub kind: String,
-    pub text: String,
+    #[serde(rename = "_meta", skip_serializing_if = "Option::is_none")]
+    pub meta: Option<serde_json::Value>,
 }
 
 // ── Internal types (not serialized to wire) ─────────────────────────
@@ -222,6 +254,7 @@ pub struct McpClientStatus {
     pub name: String,
     pub status: McpSessionStatus,
     pub tools: Vec<McpToolEntry>,
+    pub negotiated: Option<serde_json::Value>,
 }
 
 // ── Notification: mcp/servers_updated ────────────────────────────────
@@ -297,22 +330,9 @@ pub(crate) struct McpReadResourceRequest {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct McpReadResourceResponse {
-    pub contents: Vec<McpReadResourceContent>,
-}
-
-/// A single resource content block from `resources/read`.
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct McpReadResourceContent {
-    pub uri: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub mime_type: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub text: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub blob: Option<String>,
-    #[serde(rename = "_meta", skip_serializing_if = "Option::is_none")]
-    pub meta: Option<serde_json::Value>,
+    /// Raw MCP resource blocks. Unknown future variants remain available to
+    /// typed SDK consumers instead of being discarded by this control plane.
+    pub contents: Vec<serde_json::Value>,
 }
 
 /// Push the full MCP catalog to the client. Called in the background after
@@ -346,6 +366,10 @@ enum McpRoute {
     List,
     Call,
     ReadResource,
+    ListResources,
+    ListPrompts,
+    GetPrompt,
+    Complete,
     AuthStatus,
     AuthTrigger,
     Setup,
@@ -360,6 +384,10 @@ fn route_mcp_method(method: &str) -> Option<McpRoute> {
         mcp_methods::LIST => McpRoute::List,
         wire::MCP_CALL => McpRoute::Call,
         mcp_methods::READ_RESOURCE => McpRoute::ReadResource,
+        mcp_methods::LIST_RESOURCES => McpRoute::ListResources,
+        mcp_methods::LIST_PROMPTS => McpRoute::ListPrompts,
+        mcp_methods::GET_PROMPT => McpRoute::GetPrompt,
+        mcp_methods::COMPLETE => McpRoute::Complete,
         mcp_methods::AUTH_STATUS => McpRoute::AuthStatus,
         mcp_methods::AUTH_TRIGGER => McpRoute::AuthTrigger,
         mcp_methods::SETUP => McpRoute::Setup,
@@ -377,6 +405,12 @@ pub async fn handle(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult {
         Some(McpRoute::List) => handle_list(agent, args).await,
         Some(McpRoute::Call) => handle_call(agent, args).await,
         Some(McpRoute::ReadResource) => handle_read_resource(agent, args).await,
+        Some(McpRoute::ListResources) => {
+            handle_primitive(agent, args, PrimitiveRoute::Resources).await
+        }
+        Some(McpRoute::ListPrompts) => handle_primitive(agent, args, PrimitiveRoute::Prompts).await,
+        Some(McpRoute::GetPrompt) => handle_primitive(agent, args, PrimitiveRoute::GetPrompt).await,
+        Some(McpRoute::Complete) => handle_primitive(agent, args, PrimitiveRoute::Complete).await,
         Some(McpRoute::AuthStatus) => handle_auth_status(agent, args).await,
         Some(McpRoute::AuthTrigger) => handle_auth_trigger(agent, args).await,
         Some(McpRoute::Setup) => handle_setup(agent, args).await,
@@ -493,6 +527,7 @@ pub(crate) fn build_mcp_catalog_with_gateway_tools(
                         .collect(),
                     auth_required,
                     setup_required: false,
+                    negotiated: None,
                 }),
             });
         }
@@ -589,6 +624,7 @@ fn disabled_server_placeholder_entry(name: &str) -> McpServerEntry {
             tools: vec![],
             auth_required: false,
             setup_required: false,
+            negotiated: None,
         }),
     }
 }
@@ -708,6 +744,7 @@ pub(crate) async fn build_mcp_status(
             name,
             status,
             tools,
+            negotiated: client.negotiated_info_json().await,
         });
     }
 
@@ -722,6 +759,7 @@ pub(crate) async fn build_mcp_status(
                 name: cname.to_string(),
                 status: McpSessionStatus::Initializing,
                 tools: vec![],
+                negotiated: None,
             });
         }
     }
@@ -857,27 +895,15 @@ pub async fn call_mcp_tool(
         .map_err(|_| format!("tool '{}' timed out after {}s", tool_name, tool_timeout_sec))?
         .map_err(|e| format!("tool call failed: {}", e))?;
 
-    let content = result
-        .content
-        .iter()
-        .filter_map(|c| match c {
-            rmcp::model::ContentBlock::Text(t) => Some(McpContentBlock {
-                kind: "text".to_string(),
-                text: t.text.clone(),
-            }),
-            rmcp::model::ContentBlock::Resource(r) => {
-                serde_json::to_string(r).ok().map(|json| McpContentBlock {
-                    kind: "resource".to_string(),
-                    text: json,
-                })
-            }
-            _ => None,
-        })
-        .collect();
+    let raw = serde_json::to_value(&result)
+        .map_err(|e| format!("failed to serialize MCP tool result: {e}"))?;
+    let content = raw["content"].as_array().cloned().unwrap_or_default();
 
     Ok(McpCallResponse {
         content,
+        structured_content: raw.get("structuredContent").cloned(),
         is_error: result.is_error,
+        meta: raw.get("_meta").cloned(),
     })
 }
 
@@ -917,6 +943,9 @@ async fn handle_list(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult {
         agent.get_session_handle(&acp_id)
     });
     if let (Some(sid), None) = (req.session_id.as_ref(), session_handle.as_ref()) {
+        if req.require_session {
+            return Err(acp::Error::invalid_params().data("session not found"));
+        }
         tracing::debug!(
             session_id = %sid,
             "mcp/list: session not found, returning agent-level catalog only"
@@ -1038,6 +1067,7 @@ async fn handle_list(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult {
                 tools: vec![],
                 auth_required: false,
                 setup_required,
+                negotiated: None,
             }),
         });
     }
@@ -1135,6 +1165,11 @@ async fn handle_list(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult {
                 tools,
                 auth_required: snapshot.auth_required.contains(&entry.name),
                 setup_required: false,
+                negotiated: snapshot
+                    .clients
+                    .iter()
+                    .find(|client| client.name == entry.name)
+                    .and_then(|client| client.negotiated.clone()),
             });
         }
 
@@ -1159,6 +1194,7 @@ async fn handle_list(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult {
                         tools: client_status.tools.clone(),
                         auth_required: snapshot.auth_required.contains(&client_status.name),
                         setup_required: false,
+                        negotiated: client_status.negotiated.clone(),
                     }),
                 });
             }
@@ -1174,6 +1210,11 @@ async fn handle_list(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult {
             {
                 entry.source_label = Some(format!("plugin: {plugin_name}"));
             }
+        }
+    }
+    if req.require_session {
+        for entry in &mut servers {
+            redact_sdk_catalog_entry(entry);
         }
     }
     to_ext_response(Ok(McpListResponse { servers }))
@@ -1240,6 +1281,412 @@ async fn handle_read_resource(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtRe
     to_ext_response(Ok(result))
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct McpPrimitiveRequest {
+    session_id: String,
+    server: String,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    arguments: Option<serde_json::Map<String, serde_json::Value>>,
+    #[serde(default)]
+    reference: Option<String>,
+    #[serde(default)]
+    target: Option<String>,
+    #[serde(default)]
+    argument: Option<String>,
+    #[serde(default)]
+    value: Option<String>,
+    #[serde(default)]
+    context: Option<HashMap<String, String>>,
+}
+
+#[derive(Debug)]
+enum PrimitiveRoute {
+    Resources,
+    Prompts,
+    GetPrompt,
+    Complete,
+}
+
+#[derive(Debug)]
+pub enum McpPrimitiveOperation {
+    ListResources,
+    ListPrompts,
+    GetPrompt {
+        name: String,
+        arguments: Option<serde_json::Map<String, serde_json::Value>>,
+    },
+    Complete {
+        reference: String,
+        target: String,
+        argument: String,
+        value: String,
+        context: Option<HashMap<String, String>>,
+    },
+}
+
+/// Headless MCP 2026 operations used by the in-process SDK boundary. These
+/// are deliberately separate from ACP extension request DTOs so MRTR state
+/// and generation-bound Tasks cannot be lost in the compatibility routes.
+#[derive(Debug)]
+pub enum McpModernOperation {
+    Ping,
+    NotifyRootsListChanged,
+    CallToolOnce {
+        tool_name: String,
+        arguments: serde_json::Value,
+        input_responses: Option<std::collections::BTreeMap<String, serde_json::Value>>,
+        request_state: Option<String>,
+        expected_client_id: Option<u64>,
+    },
+    GetPromptOnce {
+        name: String,
+        arguments: Option<serde_json::Map<String, serde_json::Value>>,
+        input_responses: Option<std::collections::BTreeMap<String, serde_json::Value>>,
+        request_state: Option<String>,
+        expected_client_id: Option<u64>,
+    },
+    ReadResourceOnce {
+        uri: String,
+        input_responses: Option<std::collections::BTreeMap<String, serde_json::Value>>,
+        request_state: Option<String>,
+        expected_client_id: Option<u64>,
+    },
+    GetTask {
+        client_id: u64,
+        task_id: String,
+    },
+    UpdateTask {
+        client_id: u64,
+        task_id: String,
+        input_responses: std::collections::BTreeMap<String, serde_json::Value>,
+    },
+    CancelTask {
+        client_id: u64,
+        task_id: String,
+    },
+}
+
+#[doc(hidden)]
+#[derive(Clone, Debug, Default)]
+pub struct McpModernSubscriptionFilter {
+    pub tools_list_changed: bool,
+    pub prompts_list_changed: bool,
+    pub resources_list_changed: bool,
+    pub resource_subscriptions: Vec<String>,
+}
+
+#[doc(hidden)]
+pub struct McpModernSubscription {
+    pub client_id: u64,
+    pub acknowledged: serde_json::Value,
+    pub events: tokio::sync::mpsc::Receiver<serde_json::Value>,
+    pub terminal: tokio::sync::oneshot::Receiver<serde_json::Value>,
+    pub cancel: tokio::sync::oneshot::Sender<()>,
+}
+
+async fn handle_primitive(
+    agent: &MvpAgent,
+    args: &acp::ExtRequest,
+    route: PrimitiveRoute,
+) -> ExtResult {
+    let req = parse_params::<McpPrimitiveRequest>(args)?;
+    let required = |value: Option<String>, field: &str| {
+        value.ok_or_else(|| acp::Error::invalid_params().data(format!("missing {field}")))
+    };
+    let operation = match route {
+        PrimitiveRoute::Resources => McpPrimitiveOperation::ListResources,
+        PrimitiveRoute::Prompts => McpPrimitiveOperation::ListPrompts,
+        PrimitiveRoute::GetPrompt => McpPrimitiveOperation::GetPrompt {
+            name: required(req.name, "name")?,
+            arguments: req.arguments,
+        },
+        PrimitiveRoute::Complete => McpPrimitiveOperation::Complete {
+            reference: required(req.reference, "reference")?,
+            target: required(req.target, "target")?,
+            argument: required(req.argument, "argument")?,
+            value: req.value.unwrap_or_default(),
+            context: req.context,
+        },
+    };
+    let handle = agent
+        .session_handle_waiting_for_load(&acp::SessionId::new(req.session_id))
+        .await
+        .ok_or_else(|| acp::Error::invalid_params().data("session not found"))?;
+    let result = handle
+        .mcp_primitive(req.server, operation)
+        .await
+        .map_err(|e| acp::Error::internal_error().data(e))?;
+    to_ext_response(Ok(result))
+}
+
+pub(crate) async fn run_mcp_primitive(
+    mcp_state: &Arc<TokioMutex<McpState>>,
+    server_name: &str,
+    operation: McpPrimitiveOperation,
+) -> Result<serde_json::Value, String> {
+    let client = {
+        let state = mcp_state.lock().await;
+        Arc::clone(
+            state
+                .get_client(server_name)
+                .ok_or_else(|| format!("server '{server_name}' not found"))?,
+        )
+    };
+    match operation {
+        McpPrimitiveOperation::ListResources => {
+            let (resources, resource_templates) = tokio::try_join!(
+                client.list_resources_json(),
+                client.list_resource_templates_json()
+            )
+            .map_err(|e| e.to_string())?;
+            Ok(serde_json::json!({"resources": resources, "resourceTemplates": resource_templates}))
+        }
+        McpPrimitiveOperation::ListPrompts => client
+            .list_prompts_json()
+            .await
+            .map(|prompts| serde_json::json!({"prompts": prompts}))
+            .map_err(|e| e.to_string()),
+        McpPrimitiveOperation::GetPrompt { name, arguments } => client
+            .get_prompt_json(name, arguments)
+            .await
+            .map_err(|e| e.to_string()),
+        McpPrimitiveOperation::Complete {
+            reference,
+            target,
+            argument,
+            value,
+            context,
+        } => client
+            .complete_argument_json(&reference, target, argument, value, context)
+            .await
+            .map_err(|e| e.to_string()),
+    }
+}
+
+pub(crate) async fn run_mcp_modern_operation(
+    mcp_state: &Arc<TokioMutex<McpState>>,
+    server_name: &str,
+    operation: McpModernOperation,
+) -> Result<serde_json::Value, String> {
+    let client = {
+        let state = mcp_state.lock().await;
+        Arc::clone(
+            state
+                .get_client(server_name)
+                .ok_or_else(|| format!("server '{server_name}' not found"))?,
+        )
+    };
+    match operation {
+        McpModernOperation::Ping => client
+            .ping()
+            .await
+            .map(|client_id| serde_json::json!({"clientId": client_id})),
+        McpModernOperation::NotifyRootsListChanged => client
+            .notify_roots_list_changed()
+            .await
+            .map(|client_id| serde_json::json!({"clientId": client_id})),
+        McpModernOperation::CallToolOnce {
+            tool_name,
+            arguments,
+            input_responses,
+            request_state,
+            expected_client_id,
+        } => {
+            client
+                .call_tool_once_json(
+                    tool_name,
+                    arguments,
+                    input_responses,
+                    request_state,
+                    expected_client_id,
+                )
+                .await
+        }
+        McpModernOperation::GetPromptOnce {
+            name,
+            arguments,
+            input_responses,
+            request_state,
+            expected_client_id,
+        } => {
+            client
+                .get_prompt_once_json(
+                    name,
+                    arguments,
+                    input_responses,
+                    request_state,
+                    expected_client_id,
+                )
+                .await
+        }
+        McpModernOperation::ReadResourceOnce {
+            uri,
+            input_responses,
+            request_state,
+            expected_client_id,
+        } => {
+            client
+                .read_resource_once_json(uri, input_responses, request_state, expected_client_id)
+                .await
+        }
+        McpModernOperation::GetTask { client_id, task_id } => {
+            client.get_task_json(client_id, task_id).await
+        }
+        McpModernOperation::UpdateTask {
+            client_id,
+            task_id,
+            input_responses,
+        } => client
+            .update_task(client_id, task_id, input_responses)
+            .await
+            .map(|()| serde_json::json!({"clientId": client_id})),
+        McpModernOperation::CancelTask { client_id, task_id } => client
+            .cancel_task(client_id, task_id)
+            .await
+            .map(|()| serde_json::json!({"clientId": client_id})),
+    }
+    .map_err(|error| error.to_string())
+}
+
+pub(crate) async fn start_mcp_modern_subscription(
+    mcp_state: &Arc<TokioMutex<McpState>>,
+    server_name: &str,
+    filter: McpModernSubscriptionFilter,
+    capacity: std::num::NonZeroUsize,
+) -> Result<McpModernSubscription, String> {
+    let client = {
+        let state = mcp_state.lock().await;
+        Arc::clone(
+            state
+                .get_client(server_name)
+                .ok_or_else(|| format!("server '{server_name}' not found"))?,
+        )
+    };
+    let service = client
+        .ensure_initialized()
+        .await
+        .map_err(|error| error.to_string())?;
+    let client_id = service.connection_generation();
+    let mut requested = rmcp::model::SubscriptionFilter::new();
+    requested.tools_list_changed = filter.tools_list_changed.then_some(true);
+    requested.prompts_list_changed = filter.prompts_list_changed.then_some(true);
+    requested.resources_list_changed = filter.resources_list_changed.then_some(true);
+    requested.resource_subscriptions =
+        (!filter.resource_subscriptions.is_empty()).then_some(filter.resource_subscriptions);
+    let mut subscription = service
+        .peer()
+        .listen_with_capacity(requested, capacity)
+        .await
+        .map_err(|error| error.to_string())?;
+    let acknowledged =
+        serde_json::to_value(subscription.acknowledged()).map_err(|error| error.to_string())?;
+    let (events_tx, events) = tokio::sync::mpsc::channel(capacity.get());
+    let (terminal_tx, terminal) = tokio::sync::oneshot::channel();
+    let (cancel, mut cancel_rx) = tokio::sync::oneshot::channel();
+    tokio::task::spawn_local(async move {
+        let mut terminal_tx = Some(terminal_tx);
+        loop {
+            let next = tokio::select! {
+                biased;
+                _ = &mut cancel_rx => {
+                    if let Some(terminal_tx) = terminal_tx.take() {
+                        let _ = terminal_tx.send(serde_json::json!({
+                            "reason": "cancelled",
+                        }));
+                    }
+                    let _ = subscription.cancel_with_reason(
+                        Some("SDK subscription cancelled".to_owned()),
+                    ).await;
+                    break;
+                }
+                next = subscription.next() => next,
+            };
+            match next {
+                Ok(Some(notification)) => {
+                    let Ok(notification) = serde_json::to_value(notification) else {
+                        continue;
+                    };
+                    let event = serde_json::json!({
+                        "type": "notification",
+                        "notification": notification,
+                    });
+                    match events_tx.try_send(event) {
+                        Ok(()) => {}
+                        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                            if let Some(terminal_tx) = terminal_tx.take() {
+                                let _ = terminal_tx.send(serde_json::json!({
+                                    "reason": "lagged",
+                                    "capacity": capacity.get(),
+                                }));
+                            }
+                            let _ = subscription
+                                .cancel_with_reason(Some(
+                                    "SDK subscription notification queue is full".to_owned(),
+                                ))
+                                .await;
+                            break;
+                        }
+                        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                            let _ = subscription
+                                .cancel_with_reason(Some(
+                                    "SDK subscription receiver dropped".to_owned(),
+                                ))
+                                .await;
+                            break;
+                        }
+                    }
+                }
+                Ok(None) => {
+                    let end = match subscription.end() {
+                        Some(rmcp::service::SubscriptionEnd::Graceful(result)) => {
+                            serde_json::json!({
+                                "reason": "graceful",
+                                "result": result,
+                            })
+                        }
+                        Some(rmcp::service::SubscriptionEnd::Cancelled) => {
+                            serde_json::json!({"reason": "cancelled"})
+                        }
+                        Some(rmcp::service::SubscriptionEnd::Lagged { capacity }) => {
+                            serde_json::json!({
+                                "reason": "lagged",
+                                "capacity": capacity,
+                            })
+                        }
+                        Some(rmcp::service::SubscriptionEnd::Abrupt) | None => {
+                            serde_json::json!({"reason": "abrupt"})
+                        }
+                        Some(_) => serde_json::json!({"reason": "abrupt"}),
+                    };
+                    if let Some(terminal_tx) = terminal_tx.take() {
+                        let _ = terminal_tx.send(end);
+                    }
+                    break;
+                }
+                Err(error) => {
+                    if let Some(terminal_tx) = terminal_tx.take() {
+                        let _ = terminal_tx.send(serde_json::json!({
+                            "reason": "error",
+                            "message": error.to_string(),
+                        }));
+                    }
+                    break;
+                }
+            }
+        }
+    });
+    Ok(McpModernSubscription {
+        client_id,
+        acknowledged,
+        events,
+        terminal,
+        cancel,
+    })
+}
+
 pub(crate) async fn read_mcp_resource(
     mcp_state: &Arc<TokioMutex<McpState>>,
     server_name: &str,
@@ -1268,49 +1715,9 @@ pub(crate) async fn read_mcp_resource(
         return Err("empty resource".to_string());
     }
 
-    let contents: Vec<McpReadResourceContent> = result
-        .contents
-        .into_iter()
-        .filter_map(|c| match c {
-            rmcp::model::ResourceContents::TextResourceContents {
-                uri,
-                mime_type,
-                text,
-                meta,
-                ..
-            } => Some(McpReadResourceContent {
-                uri,
-                mime_type,
-                text: Some(text),
-                blob: None,
-                meta: meta.and_then(|m| serde_json::to_value(m).ok()),
-            }),
-            rmcp::model::ResourceContents::BlobResourceContents {
-                uri,
-                mime_type,
-                blob,
-                meta,
-                ..
-            } => Some(McpReadResourceContent {
-                uri,
-                mime_type,
-                text: None,
-                blob: Some(blob),
-                meta: meta.and_then(|m| serde_json::to_value(m).ok()),
-            }),
-            // `ResourceContents` is non_exhaustive; skip unknown variants so
-            // the rest of the resource still renders, but log the drop so the
-            // missing content is diagnosable.
-            _ => {
-                tracing::warn!(
-                    server = server_name,
-                    uri,
-                    "skipping unknown MCP resource content variant"
-                );
-                None
-            }
-        })
-        .collect();
+    let raw = serde_json::to_value(&result)
+        .map_err(|e| format!("failed to serialize MCP resource result: {e}"))?;
+    let contents = raw["contents"].as_array().cloned().unwrap_or_default();
 
     if contents.is_empty() {
         return Err("resource contained only unsupported content variants".to_string());
@@ -1768,6 +2175,9 @@ struct McpToggleRequest {
     session_id: String,
     server_name: String,
     enabled: bool,
+    /// Do not persist preferences; intended for embedded session control planes.
+    #[serde(default)]
+    session_local: bool,
 }
 
 #[derive(serde::Serialize)]
@@ -1793,8 +2203,10 @@ async fn handle_toggle(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult {
             .get_session_cwd(&acp_id)
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
         if let Some(connector_id) = gateway_connector_id {
-            if let Err(e) =
-                crate::util::config::save_mcp_server_enabled_in(&req.server_name, true, &cwd).await
+            if !req.session_local
+                && let Err(e) =
+                    crate::util::config::save_mcp_server_enabled_in(&req.server_name, true, &cwd)
+                        .await
             {
                 tracing::warn!(
                     server = req.server_name.as_str(),
@@ -1802,10 +2214,20 @@ async fn handle_toggle(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult {
                     "Failed to clear disabled MCP server entry for managed gateway connector"
                 );
             }
-            handle
-                .toggle_managed_gateway_tool(connector_id.to_string(), String::new(), true)
-                .await
-                .map_err(|e| acp::Error::internal_error().data(e.to_string()))?;
+            if req.session_local {
+                handle
+                    .toggle_managed_gateway_tool_session_local(
+                        connector_id.to_string(),
+                        String::new(),
+                        true,
+                    )
+                    .await
+            } else {
+                handle
+                    .toggle_managed_gateway_tool(connector_id.to_string(), String::new(), true)
+                    .await
+            }
+            .map_err(|e| acp::Error::internal_error().data(e.to_string()))?;
             return to_ext_response(Ok(McpToggleResponse { ok: true }));
         }
         if req
@@ -1815,8 +2237,9 @@ async fn handle_toggle(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult {
             crate::session::managed_mcp::invalidate_cache(agent.managed_mcp_cache()).await;
         }
         let managed_configs = agent.get_managed_mcp_configs().await;
-        if let Err(e) =
-            crate::util::config::save_mcp_server_enabled_in(&req.server_name, true, &cwd).await
+        if !req.session_local
+            && let Err(e) =
+                crate::util::config::save_mcp_server_enabled_in(&req.server_name, true, &cwd).await
         {
             tracing::warn!(
                 server = req.server_name.as_str(),
@@ -1825,9 +2248,16 @@ async fn handle_toggle(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult {
             );
         }
 
+        // Include the session's admitted client set. Without this seed a
+        // session-local disable followed by enable could only resolve servers
+        // from ambient config, not servers supplied by an embedded SDK host.
+        let client_servers = agent
+            .resident_handle(&acp_id)
+            .map(|handle| handle.initial_client_mcp_servers)
+            .unwrap_or_default();
         let all_servers_with_policy =
             crate::session::managed_mcp::merge_managed_mcp_servers_with_policy(
-                vec![],
+                client_servers,
                 &cwd,
                 &managed_configs,
                 agent.plugin_registry_snapshot().as_deref(),
@@ -1867,19 +2297,35 @@ async fn handle_toggle(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult {
         }
         found.map(|s| s.server)
     } else if let Some(connector_id) = gateway_connector_id {
-        handle
-            .toggle_managed_gateway_tool(connector_id.to_string(), String::new(), false)
-            .await
-            .map_err(|e| acp::Error::internal_error().data(e.to_string()))?;
+        if req.session_local {
+            handle
+                .toggle_managed_gateway_tool_session_local(
+                    connector_id.to_string(),
+                    String::new(),
+                    false,
+                )
+                .await
+        } else {
+            handle
+                .toggle_managed_gateway_tool(connector_id.to_string(), String::new(), false)
+                .await
+        }
+        .map_err(|e| acp::Error::internal_error().data(e.to_string()))?;
         return to_ext_response(Ok(McpToggleResponse { ok: true }));
     } else {
         None
     };
 
-    handle
-        .toggle_mcp_server(req.server_name, req.enabled, server_config)
-        .await
-        .map_err(|e| acp::Error::internal_error().data(e.to_string()))?;
+    if req.session_local {
+        handle
+            .toggle_mcp_server_session_local(req.server_name, req.enabled, server_config)
+            .await
+    } else {
+        handle
+            .toggle_mcp_server(req.server_name, req.enabled, server_config)
+            .await
+    }
+    .map_err(|e| acp::Error::internal_error().data(e.to_string()))?;
 
     to_ext_response(Ok(McpToggleResponse { ok: true }))
 }
@@ -1892,6 +2338,9 @@ struct McpToggleToolRequest {
     server_name: String,
     tool_name: String,
     enabled: bool,
+    /// Do not persist preferences; intended for embedded session control planes.
+    #[serde(default)]
+    session_local: bool,
 }
 
 async fn handle_toggle_tool(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult {
@@ -1908,12 +2357,26 @@ async fn handle_toggle_tool(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResu
     let is_managed_gateway = gateway_connector_id.is_some();
 
     if is_managed_gateway {
+        if req.session_local {
+            handle
+                .toggle_managed_gateway_tool_session_local(
+                    gateway_connector_id.unwrap_or(&req.server_name).to_string(),
+                    req.tool_name,
+                    req.enabled,
+                )
+                .await
+        } else {
+            handle
+                .toggle_managed_gateway_tool(
+                    gateway_connector_id.unwrap_or(&req.server_name).to_string(),
+                    req.tool_name,
+                    req.enabled,
+                )
+                .await
+        }
+    } else if req.session_local {
         handle
-            .toggle_managed_gateway_tool(
-                gateway_connector_id.unwrap_or(&req.server_name).to_string(),
-                req.tool_name,
-                req.enabled,
-            )
+            .toggle_mcp_tool_session_local(req.server_name, req.tool_name, req.enabled)
             .await
     } else {
         handle
@@ -2194,6 +2657,7 @@ mod tests {
                         status: Some(McpSessionStatus::Ready),
                         auth_required: false,
                         setup_required: false,
+                        negotiated: None,
                         tools: vec![McpToolEntry {
                             name: "read_file".to_string(),
                             display_name: None,
@@ -2229,6 +2693,7 @@ mod tests {
                 tools: vec![],
                 auth_required: false,
                 setup_required: false,
+                negotiated: None,
             }),
         })
         .unwrap();
@@ -2252,6 +2717,40 @@ mod tests {
             json["servers"][1]["session"]["tools"][0]["name"],
             "read_file"
         );
+    }
+
+    #[test]
+    fn sdk_catalog_redaction_removes_transport_and_setup_secrets() {
+        let mut entry = McpServerEntry {
+            name: "secret".to_owned(),
+            display_name: None,
+            source: McpServerSource::Local,
+            source_label: None,
+            setup: None,
+            setup_values: Some(HashMap::from([(
+                "token".to_owned(),
+                "setup-secret".to_owned(),
+            )])),
+            config: McpServerConfig::Stdio {
+                command: "/secret/command".into(),
+                args: vec!["--token=argument-secret".to_owned()],
+                env: vec![McpEnvVar {
+                    name: "TOKEN".to_owned(),
+                    value: "environment-secret".to_owned(),
+                }],
+            },
+            session: None,
+        };
+        redact_sdk_catalog_entry(&mut entry);
+        let serialized = serde_json::to_string(&entry).unwrap();
+        for secret in [
+            "/secret/command",
+            "argument-secret",
+            "environment-secret",
+            "setup-secret",
+        ] {
+            assert!(!serialized.contains(secret), "catalog leaked {secret}");
+        }
     }
 
     #[test]
@@ -2417,16 +2916,20 @@ mod tests {
     #[test]
     fn test_mcp_call_response_serialization() {
         let resp = McpCallResponse {
-            content: vec![McpContentBlock {
-                kind: "text".to_string(),
-                text: "Created issue LIN-123".to_string(),
-            }],
+            content: vec![serde_json::json!({
+                "type": "text",
+                "text": "Created issue LIN-123"
+            })],
+            structured_content: Some(serde_json::json!({"issue": "LIN-123"})),
             is_error: Some(false),
+            meta: Some(serde_json::json!({"trace": 1})),
         };
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(json["content"][0]["type"], "text");
         assert_eq!(json["content"][0]["text"], "Created issue LIN-123");
         assert_eq!(json["isError"], false);
+        assert_eq!(json["structuredContent"]["issue"], "LIN-123");
+        assert_eq!(json["_meta"]["trace"], 1);
     }
 
     #[test]
@@ -2463,6 +2966,7 @@ mod tests {
                 tools: vec![],
                 auth_required: false,
                 setup_required: true,
+                negotiated: None,
             }),
         };
         let json = serde_json::to_value(&entry).unwrap();
@@ -2535,6 +3039,7 @@ mod tests {
                 tools: vec![],
                 auth_required: false,
                 setup_required: false,
+                negotiated: None,
             }),
         };
         let json = serde_json::to_value(&entry).unwrap();

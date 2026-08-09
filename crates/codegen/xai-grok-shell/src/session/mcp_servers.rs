@@ -95,6 +95,12 @@ pub(crate) async fn build_pending_clients(
         ctx,
     )
     .await;
+    {
+        let state = mcp_state.lock().await;
+        for client in results.iter_mut().filter_map(|result| result.as_mut().ok()) {
+            state.configure_host_services(client);
+        }
+    }
     // Re-resolve SDK (ACP) config.toml overrides for THIS init, matching HTTP/stdio, so a
     // mid-session config change applies on the next init (resolved outside the lock — it
     // reads config.toml — then handed to the pure, under-lock builder).

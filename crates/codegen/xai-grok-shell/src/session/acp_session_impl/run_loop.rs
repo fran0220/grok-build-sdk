@@ -779,6 +779,15 @@ pub(super) async fn run_session(
                                 .map_err(|e| e.to_string());
                             let _ = respond_to.send(result);
                         }
+                        SessionCommand::UpsertScheduledTask { request, respond_to } => {
+                            let result = session.agent.borrow().tool_bridge()
+                                .upsert_scheduled_task(request).await.map_err(|e| e.to_string());
+                            let _ = respond_to.send(result);
+                        }
+                        SessionCommand::ListScheduledTasks { respond_to } => {
+                            let result = session.agent.borrow().tool_bridge().list_scheduled_tasks().await;
+                            let _ = respond_to.send(result);
+                        }
                         SessionCommand::ListTasks { respond_to } => {
                             let result = session.agent.borrow().tool_bridge()
                                 .list_tasks()
@@ -1313,11 +1322,12 @@ pub(super) async fn run_session(
                             // immediately after the in-memory swap
                             // completes — without holding the
                             // `mcp_state` lock across the emit.
-                            let (diff, dispatch_event_tx) = {
+                            let (diff, dispatch_event_tx, generation) = {
                                 let mut mcp_state = session.mcp_state.lock().await;
                                 let diff = mcp_state.update_configs_diff(mcp_servers);
                                 let tx = mcp_state.client_event_tx();
-                                (diff, tx)
+                                let generation = mcp_state.generation();
+                                (diff, tx, generation)
                             };
 
                             let Some(diff) = diff else {
@@ -1369,11 +1379,15 @@ pub(super) async fn run_session(
 
                             let session_for_mcp = session.clone();
                             tokio::task::spawn_local(async move {
-                                session_for_mcp.ensure_mcp_tools_initialized().await;
-                                let _ = respond_to.send(Ok(()));
+                                // The update response is scoped to this exact
+                                // generation. A later replacement cannot satisfy it.
+                                let result = session_for_mcp
+                                    .initialize_mcp_generation(generation)
+                                    .await;
+                                let _ = respond_to.send(result);
                             });
                         }
-                        SessionCommand::ToggleMcpServer { server_name, enabled, server_config, respond_to } => {
+                        SessionCommand::ToggleMcpServer { server_name, enabled, server_config, persist, respond_to } => {
                             session.events.emit(xai_file_utils::events::Event::McpServerToggled {
                                 server_name: server_name.clone(),
                                 enabled,
@@ -1410,6 +1424,7 @@ pub(super) async fn run_session(
                             }
 
                             let diff = mcp_state.update_configs_diff(configs);
+                            let generation = mcp_state.generation();
                             // Snapshot the dispatcher
                             // sender BEFORE dropping the lock so the
                             // emit below survives any later mutation.
@@ -1459,13 +1474,20 @@ pub(super) async fn run_session(
                             let sname = server_name.clone();
                             let session_cwd = session.session_info.cwd.clone();
                             tokio::task::spawn_local(async move {
-                                session_for_mcp.ensure_mcp_tools_initialized().await;
-                                if let Err(e) = crate::util::config::save_mcp_server_enabled_in(
-                                    &sname,
-                                    enabled,
-                                    std::path::Path::new(&session_cwd),
-                                )
-                                .await
+                                let init_result = session_for_mcp
+                                    .initialize_mcp_generation(generation)
+                                    .await;
+                                if let Err(error) = init_result {
+                                    let _ = respond_to.send(Err(error));
+                                    return;
+                                }
+                                if persist
+                                    && let Err(e) = crate::util::config::save_mcp_server_enabled_in(
+                                        &sname,
+                                        enabled,
+                                        std::path::Path::new(&session_cwd),
+                                    )
+                                    .await
                                 {
                                     tracing::warn!(
                                         server = sname.as_str(),
@@ -1476,7 +1498,7 @@ pub(super) async fn run_session(
                                 let _ = respond_to.send(Ok(()));
                             });
                         }
-                        SessionCommand::ToggleMcpTool { server_name, tool_name, enabled, is_managed_gateway, respond_to } => {
+                        SessionCommand::ToggleMcpTool { server_name, tool_name, enabled, is_managed_gateway, persist, respond_to } => {
                             if is_managed_gateway {
                                 let mut disabled_tools = crate::util::config::get_all_mcp_disabled_tools(std::path::Path::new(&session.session_info.cwd));
                                 if tool_name.is_empty() {
@@ -1531,10 +1553,11 @@ pub(super) async fn run_session(
                                     server_name.clone()
                                 };
                                 tokio::task::spawn_local(async move {
-                                    if let Err(e) = crate::util::config::save_mcp_disabled_tools(
-                                        &server_for_persist,
-                                        &disabled_vec,
-                                    ).await {
+                                    if persist
+                                        && let Err(e) = crate::util::config::save_mcp_disabled_tools(
+                                            &server_for_persist,
+                                            &disabled_vec,
+                                        ).await {
                                         tracing::warn!(
                                             server = server_for_persist.as_str(),
                                             error = %e,
@@ -1634,10 +1657,11 @@ pub(super) async fn run_session(
                             let session_id = session.session_info.id.0.clone();
                             let server_for_persist = server_name.clone();
                             tokio::task::spawn_local(async move {
-                                if let Err(e) = crate::util::config::save_mcp_disabled_tools(
-                                    &server_for_persist,
-                                    &disabled_vec,
-                                ).await {
+                                if persist
+                                    && let Err(e) = crate::util::config::save_mcp_disabled_tools(
+                                        &server_for_persist,
+                                        &disabled_vec,
+                                    ).await {
                                     tracing::warn!(
                                         server = server_for_persist.as_str(),
                                         error = %e,
@@ -1727,6 +1751,33 @@ pub(super) async fn run_session(
                                     &mcp_state,
                                     &server_name,
                                     &uri,
+                                ).await;
+                                let _ = respond_to.send(result);
+                            });
+                        }
+                        SessionCommand::McpPrimitive { server_name, operation, respond_to } => {
+                            let mcp_state = session.mcp_state.clone();
+                            tokio::task::spawn_local(async move {
+                                let result = crate::extensions::mcp::run_mcp_primitive(
+                                    &mcp_state, &server_name, operation,
+                                ).await;
+                                let _ = respond_to.send(result);
+                            });
+                        }
+                        SessionCommand::McpModernOperation { server_name, operation, respond_to } => {
+                            let mcp_state = session.mcp_state.clone();
+                            tokio::task::spawn_local(async move {
+                                let result = crate::extensions::mcp::run_mcp_modern_operation(
+                                    &mcp_state, &server_name, operation,
+                                ).await;
+                                let _ = respond_to.send(result);
+                            });
+                        }
+                        SessionCommand::McpModernSubscribe { server_name, filter, capacity, respond_to } => {
+                            let mcp_state = session.mcp_state.clone();
+                            tokio::task::spawn_local(async move {
+                                let result = crate::extensions::mcp::start_mcp_modern_subscription(
+                                    &mcp_state, &server_name, filter, capacity,
                                 ).await;
                                 let _ = respond_to.send(result);
                             });

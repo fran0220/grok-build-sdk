@@ -2,12 +2,138 @@
 // Licensed under the Apache License, Version 2.0.
 
 //! Send/Sync, fail-closed in-process façade for the bundled Grok Build fork.
-//! ACP, Grok, and JSON implementation types are confined to the private module.
+//! The public API is a typed SDK; protocol adapters used by the shell remain
+//! private implementation details.
 
 mod private;
 
 use std::{collections::BTreeMap, path::PathBuf, sync::Arc};
 use tokio::sync::mpsc;
+
+/// Typed MCP 2026 client-role services. SDK users implement these traits
+/// directly; no ACP service or raw shell protocol is exposed.
+pub use xai_grok_mcp::servers::{
+    McpElicitationService, McpHostContext, McpHostServiceError, McpHostServices, McpRootsService,
+    McpSamplingService,
+};
+
+/// Authoritative data models used by the typed MCP host-service traits.
+/// Transport and service-loop internals intentionally remain private.
+pub mod mcp_model {
+    #[allow(deprecated)]
+    pub use xai_grok_mcp::rmcp::model::{
+        CreateMessageRequestParams, CreateMessageResult, ElicitRequestParams, ElicitResult,
+        ElicitationAction, ListRootsResult, Root,
+    };
+}
+
+/// Hook events supported by the bundled agent. This SDK type deliberately does
+/// not expose the shell's hook implementation types.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentHookEvent {
+    SessionStart,
+    SessionEnd,
+    Stop,
+    StopFailure,
+    PreToolUse,
+    PostToolUse,
+    PostToolUseFailure,
+    PermissionDenied,
+    UserPromptSubmit,
+    Notification,
+    SubagentStart,
+    SubagentStop,
+    SubagentEnd,
+    PreCompact,
+    PostCompact,
+}
+impl AgentHookEvent {
+    fn registration_name(self) -> &'static str {
+        match self {
+            Self::SessionStart => "SessionStart",
+            Self::SessionEnd => "SessionEnd",
+            Self::Stop => "Stop",
+            Self::StopFailure => "StopFailure",
+            Self::PreToolUse => "PreToolUse",
+            Self::PostToolUse => "PostToolUse",
+            Self::PostToolUseFailure => "PostToolUseFailure",
+            Self::PermissionDenied => "PermissionDenied",
+            Self::UserPromptSubmit => "UserPromptSubmit",
+            Self::Notification => "Notification",
+            Self::SubagentStart => "SubagentStart",
+            Self::SubagentStop => "SubagentStop",
+            Self::SubagentEnd => "SubagentEnd",
+            Self::PreCompact => "PreCompact",
+            Self::PostCompact => "PostCompact",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct AgentHookInvocation {
+    pub event: AgentHookEvent,
+    pub callback_id: String,
+    pub session_id: String,
+    pub cwd: Option<PathBuf>,
+    pub workspace_root: Option<PathBuf>,
+    pub timestamp: Option<String>,
+    pub prompt_id: Option<String>,
+    pub permission_mode: Option<String>,
+    /// Present for tool events.
+    pub tool_name: Option<String>,
+    pub tool_use_id: Option<String>,
+    pub tool_input: Option<serde_json::Value>,
+    pub tool_result: Option<serde_json::Value>,
+    /// Complete reverse-channel payload, including fields added by newer agents.
+    pub raw: serde_json::Value,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentHookDecision {
+    #[default]
+    Continue,
+    Deny,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentHookResponse {
+    pub decision: AgentHookDecision,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub system_message: Option<String>,
+    #[serde(rename = "continue", skip_serializing_if = "Option::is_none")]
+    pub continue_: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stop_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub additional_context: Option<String>,
+}
+
+#[derive(Clone, Debug, thiserror::Error)]
+#[error("agent hook failed: {message}")]
+pub struct AgentHookError {
+    pub message: String,
+}
+
+#[async_trait::async_trait]
+pub trait AgentHookHandler: Send + Sync + 'static {
+    async fn handle(
+        &self,
+        invocation: AgentHookInvocation,
+    ) -> Result<AgentHookResponse, AgentHookError>;
+}
+
+#[derive(Clone)]
+pub struct AgentHookRegistration {
+    pub callback_id: String,
+    pub event: AgentHookEvent,
+    pub matcher: Option<String>,
+    /// Shell wire timeout in seconds. Must be finite, positive, and at most 600.
+    pub timeout: Option<f64>,
+    pub handler: Arc<dyn AgentHookHandler>,
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -114,6 +240,947 @@ pub enum McpServerConfig {
     },
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum McpTransportKind {
+    Stdio,
+    Http,
+    Sse,
+    ManagedGateway,
+    Unknown,
+}
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum McpServerSource {
+    Local,
+    Managed,
+    Unknown,
+}
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum McpServerStatus {
+    Ready,
+    Initializing,
+    SetupRequired,
+    Unavailable,
+    NeedsAuth,
+    Unknown,
+}
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct McpToolInfo {
+    pub server: String,
+    pub name: String,
+    pub display_name: Option<String>,
+    pub description: Option<String>,
+    pub enabled: bool,
+    #[serde(default)]
+    pub meta: serde_json::Value,
+}
+/// Redacted MCP catalog entry. Transport credentials, URLs, commands and
+/// arguments are deliberately absent.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct McpServerSummary {
+    pub name: String,
+    pub display_name: Option<String>,
+    pub source: McpServerSource,
+    pub transport: McpTransportKind,
+    pub enabled: bool,
+    pub status: Option<McpServerStatus>,
+    pub auth_required: bool,
+    pub setup_required: bool,
+    pub tools: Vec<McpToolInfo>,
+    pub negotiated: Option<McpNegotiatedCapabilities>,
+}
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct McpNegotiatedCapabilities {
+    /// Capabilities advertised by the server for the selected protocol
+    /// version. A `true` value does not imply that the SDK exposes or
+    /// authorizes the corresponding server-to-client role.
+    pub protocol_version: String,
+    pub tools: bool,
+    pub resources: bool,
+    pub prompts: bool,
+    pub completions: bool,
+    pub logging: bool,
+    pub tool_list_changed: bool,
+    pub resource_list_changed: bool,
+    /// The server exposes at least one notification category usable through
+    /// MCP 2026 `subscriptions/listen`.
+    pub subscriptions: bool,
+    /// Legacy wire metadata only. The SDK does not call
+    /// `resources/subscribe`; use [`Runtime::listen_mcp`].
+    pub legacy_resource_subscribe: bool,
+    pub prompt_list_changed: bool,
+    pub tasks: bool,
+    #[serde(default)]
+    pub extensions: BTreeMap<String, serde_json::Value>,
+    /// Lossless negotiated capability object for extension-specific settings.
+    pub raw: serde_json::Value,
+}
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "type", rename_all = "camelCase")]
+pub enum McpContent {
+    Text {
+        text: String,
+        /// Lossless original protocol block, including annotations and metadata.
+        raw: serde_json::Value,
+    },
+    Image {
+        data: String,
+        mime_type: String,
+        /// Lossless original protocol block, including annotations and metadata.
+        raw: serde_json::Value,
+    },
+    Audio {
+        data: String,
+        mime_type: String,
+        /// Lossless original protocol block, including annotations and metadata.
+        raw: serde_json::Value,
+    },
+    EmbeddedResource {
+        resource: serde_json::Value,
+        /// Lossless original protocol block, including annotations and metadata.
+        raw: serde_json::Value,
+    },
+    ResourceLink {
+        uri: String,
+        name: String,
+        #[serde(default)]
+        mime_type: Option<String>,
+        /// Lossless original protocol block, including annotations and metadata.
+        raw: serde_json::Value,
+    },
+    Unknown {
+        raw: serde_json::Value,
+    },
+}
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct McpToolResult {
+    pub content: Vec<McpContent>,
+    pub structured_content: Option<serde_json::Value>,
+    pub is_error: Option<bool>,
+    pub meta: Option<serde_json::Value>,
+}
+
+/// Responses for one MCP multi-round-trip (MRTR) retry, keyed by the
+/// server-assigned request ID. Values must be valid results for the matching
+/// roots, sampling, or elicitation request.
+pub type McpInputResponses = BTreeMap<String, serde_json::Value>;
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum McpInputRequestKind {
+    Sampling,
+    Elicitation,
+    Roots,
+}
+
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct McpInputRequest {
+    pub id: String,
+    pub kind: McpInputRequestKind,
+    /// Lossless MCP request envelope. Unknown request methods are rejected
+    /// before this value reaches the SDK.
+    pub raw: serde_json::Value,
+}
+
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct McpInputRequired {
+    pub requests: Vec<McpInputRequest>,
+    /// Opaque server state. Return it unchanged in [`McpContinuation`].
+    pub request_state: Option<String>,
+    pub raw: serde_json::Value,
+    #[serde(skip)]
+    continuation_identity: Option<McpContinuationIdentity>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct McpContinuation {
+    input_responses: McpInputResponses,
+    request_state: Option<String>,
+    identity: McpContinuationIdentity,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct McpContinuationIdentity {
+    session_id: SessionId,
+    server: String,
+    client_id: u64,
+    operation: McpOperationIdentity,
+    request_ids: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum McpOperationIdentity {
+    Tool {
+        name: String,
+        arguments: serde_json::Value,
+    },
+    Prompt {
+        name: String,
+        arguments: Option<serde_json::Map<String, serde_json::Value>>,
+    },
+    Resource {
+        uri: String,
+    },
+}
+
+impl McpInputRequired {
+    /// Builds the only continuation accepted by the SDK for this exact MRTR
+    /// round. Every advertised request ID must be answered exactly once.
+    pub fn respond(&self, input_responses: McpInputResponses) -> Result<McpContinuation, Error> {
+        let identity = self.continuation_identity.clone().ok_or_else(|| {
+            Error::Operation(
+                "this MCP input requirement belongs to a Task; use update_mcp_task".into(),
+            )
+        })?;
+        let supplied: Vec<_> = input_responses.keys().cloned().collect();
+        let mut requested = identity.request_ids.clone();
+        requested.sort();
+        if supplied != requested {
+            return Err(Error::InvalidConfig(
+                "MCP continuation responses must exactly match the requested input IDs".into(),
+            ));
+        }
+        Ok(McpContinuation {
+            input_responses,
+            request_state: self.request_state.clone(),
+            identity,
+        })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum McpTaskStatus {
+    Working,
+    InputRequired,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+/// A Task handle is valid only for the exact session, server and MCP client
+/// generation that created it. Reconnect or server replacement makes it stale.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct McpTaskHandle {
+    pub session_id: SessionId,
+    pub server: String,
+    pub client_id: u64,
+    pub task_id: String,
+}
+
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct McpTask {
+    pub handle: McpTaskHandle,
+    pub status: McpTaskStatus,
+    pub status_message: Option<String>,
+    pub created_at: String,
+    pub last_updated_at: String,
+    pub ttl_ms: Option<u64>,
+    pub poll_interval_ms: Option<u64>,
+    pub input_required: Option<McpInputRequired>,
+    pub result: Option<serde_json::Value>,
+    pub error: Option<serde_json::Value>,
+    pub raw: serde_json::Value,
+}
+
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum McpOperationOutcome<T> {
+    Complete {
+        client_id: u64,
+        result: T,
+    },
+    InputRequired {
+        client_id: u64,
+        input: McpInputRequired,
+    },
+    Task {
+        handle: McpTaskHandle,
+        task: McpTask,
+    },
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McpSubscriptionFilter {
+    #[serde(default)]
+    pub tools_list_changed: bool,
+    #[serde(default)]
+    pub prompts_list_changed: bool,
+    #[serde(default)]
+    pub resources_list_changed: bool,
+    #[serde(default)]
+    pub resource_subscriptions: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub enum McpSubscriptionEvent {
+    ToolsListChanged,
+    PromptsListChanged,
+    ResourcesListChanged,
+    ResourceUpdated { uri: String },
+    Ended(McpSubscriptionEnd),
+}
+
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "reason", rename_all = "snake_case")]
+pub enum McpSubscriptionEnd {
+    Graceful,
+    Abrupt,
+    Cancelled,
+    Lagged { capacity: usize },
+    Error { message: String },
+}
+
+/// Bounded MCP 2026 `subscriptions/listen` stream. Streams are bound to one
+/// concrete client generation and are not resumed across reconnects.
+pub struct McpSubscription {
+    pub session_id: SessionId,
+    pub server: String,
+    pub client_id: u64,
+    pub acknowledged: McpSubscriptionFilter,
+    events: tokio::sync::mpsc::Receiver<serde_json::Value>,
+    terminal: tokio::sync::oneshot::Receiver<serde_json::Value>,
+    cancel: Option<tokio::sync::oneshot::Sender<()>>,
+    pending_end: Option<McpSubscriptionEnd>,
+    ended: bool,
+}
+
+impl McpSubscription {
+    pub async fn next(&mut self) -> Result<Option<McpSubscriptionEvent>, Error> {
+        if let Some(end) = self.pending_end.take() {
+            self.ended = true;
+            return Ok(Some(McpSubscriptionEvent::Ended(end)));
+        }
+        if self.ended {
+            return Ok(None);
+        }
+        match self.terminal.try_recv() {
+            Ok(terminal) => {
+                self.ended = true;
+                self.cancel.take();
+                return parse_mcp_subscription_end(Some(terminal));
+            }
+            Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                self.ended = true;
+                self.cancel.take();
+                return parse_mcp_subscription_end(None);
+            }
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {}
+        }
+        let value = match self.events.try_recv() {
+            Ok(value) => value,
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                self.ended = true;
+                self.cancel.take();
+                return parse_mcp_subscription_end((&mut self.terminal).await.ok());
+            }
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
+                tokio::select! {
+                    biased;
+                    terminal = &mut self.terminal => {
+                        self.ended = true;
+                        self.cancel.take();
+                        return parse_mcp_subscription_end(terminal.ok());
+                    }
+                    event = self.events.recv() => {
+                        let Some(event) = event else {
+                            self.ended = true;
+                            return Ok(Some(McpSubscriptionEvent::Ended(
+                                McpSubscriptionEnd::Abrupt,
+                            )));
+                        };
+                        event
+                    }
+                }
+            }
+        };
+        match value["type"].as_str() {
+            Some("notification") => {
+                let notification = value.get("notification").ok_or_else(|| {
+                    Error::Operation("MCP subscription event omitted payload".into())
+                })?;
+                match notification["method"].as_str() {
+                    Some("notifications/tools/list_changed") => {
+                        Ok(Some(McpSubscriptionEvent::ToolsListChanged))
+                    }
+                    Some("notifications/prompts/list_changed") => {
+                        Ok(Some(McpSubscriptionEvent::PromptsListChanged))
+                    }
+                    Some("notifications/resources/list_changed") => {
+                        Ok(Some(McpSubscriptionEvent::ResourcesListChanged))
+                    }
+                    Some("notifications/resources/updated") => {
+                        let uri = notification["params"]["uri"]
+                            .as_str()
+                            .ok_or_else(|| {
+                                Error::Operation(
+                                    "MCP resource update omitted its resource URI".into(),
+                                )
+                            })?
+                            .to_owned();
+                        Ok(Some(McpSubscriptionEvent::ResourceUpdated { uri }))
+                    }
+                    Some(method) => Err(Error::Operation(format!(
+                        "unsupported MCP subscription notification '{method}'"
+                    ))),
+                    None => Err(Error::Operation(
+                        "MCP subscription notification omitted its method".into(),
+                    )),
+                }
+            }
+            _ => Err(Error::Operation("invalid MCP subscription event".into())),
+        }
+    }
+
+    pub fn cancel(&mut self) {
+        if let Some(cancel) = self.cancel.take() {
+            let _ = cancel.send(());
+            self.pending_end = Some(McpSubscriptionEnd::Cancelled);
+        }
+    }
+}
+
+fn parse_mcp_subscription_end(
+    value: Option<serde_json::Value>,
+) -> Result<Option<McpSubscriptionEvent>, Error> {
+    let Some(value) = value else {
+        return Ok(Some(McpSubscriptionEvent::Ended(
+            McpSubscriptionEnd::Abrupt,
+        )));
+    };
+    let end = match value["reason"].as_str() {
+        Some("graceful") => McpSubscriptionEnd::Graceful,
+        Some("abrupt") => McpSubscriptionEnd::Abrupt,
+        Some("cancelled") => McpSubscriptionEnd::Cancelled,
+        Some("lagged") => McpSubscriptionEnd::Lagged {
+            capacity: value["capacity"]
+                .as_u64()
+                .and_then(|capacity| usize::try_from(capacity).ok())
+                .ok_or_else(|| Error::Operation("invalid MCP subscription capacity".into()))?,
+        },
+        Some("error") => McpSubscriptionEnd::Error {
+            message: value["message"]
+                .as_str()
+                .ok_or_else(|| Error::Operation("invalid MCP subscription error".into()))?
+                .to_owned(),
+        },
+        _ => {
+            return Err(Error::Operation(
+                "invalid MCP subscription terminal event".into(),
+            ));
+        }
+    };
+    Ok(Some(McpSubscriptionEvent::Ended(end)))
+}
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct McpReadResourceContent {
+    pub uri: Option<String>,
+    pub mime_type: Option<String>,
+    pub text: Option<String>,
+    pub blob: Option<String>,
+    pub meta: Option<serde_json::Value>,
+    /// Lossless original protocol block for future fields and content variants.
+    pub raw: serde_json::Value,
+}
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct McpReadResourceResult {
+    pub contents: Vec<McpReadResourceContent>,
+}
+/// A server primitive with stable identity fields and its lossless MCP payload.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct McpResourceInfo {
+    pub server: String,
+    pub uri: Option<String>,
+    pub name: Option<String>,
+    pub raw: serde_json::Value,
+}
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct McpResourceTemplateInfo {
+    pub server: String,
+    pub uri_template: Option<String>,
+    pub name: Option<String>,
+    pub raw: serde_json::Value,
+}
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct McpResources {
+    pub resources: Vec<McpResourceInfo>,
+    pub templates: Vec<McpResourceTemplateInfo>,
+}
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct McpPromptInfo {
+    pub server: String,
+    pub name: String,
+    pub description: Option<String>,
+    pub raw: serde_json::Value,
+}
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct McpPromptResult {
+    pub raw: serde_json::Value,
+}
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct McpCompletionResult {
+    pub values: Vec<String>,
+    pub total: Option<u64>,
+    pub has_more: Option<bool>,
+    pub raw: serde_json::Value,
+}
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct McpAuthStatus {
+    pub server_name: String,
+    pub status: McpAuthenticationState,
+    pub error: Option<String>,
+}
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "state", content = "value", rename_all = "snake_case")]
+pub enum McpAuthenticationState {
+    Authenticated,
+    NeedsAuth,
+    SetupRequired,
+    Failed,
+    Unknown(String),
+}
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct McpServerReplacementReceipt {
+    pub names: Vec<String>,
+    pub count: usize,
+}
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct McpServerStatusEvent {
+    pub name: String,
+    pub source: McpServerSource,
+    pub status: McpServerStatus,
+    pub reason: McpServerStatusReason,
+}
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct McpTaskStatusEvent {
+    pub handle: McpTaskHandle,
+    pub status: McpTaskStatus,
+    pub status_message: Option<String>,
+    pub last_updated_at: String,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum McpServerStatusReason {
+    TransportClosed,
+    HandshakeFailed,
+    ConfigAdded,
+    ConfigRemoved,
+    ConfigChanged,
+    Disabled,
+    AuthExpired,
+    Initialized,
+    RestartSucceeded,
+    RestartFailed,
+    ManagedTokenRefreshed,
+    Unknown,
+}
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct McpToolsChangedEvent {
+    pub server_name: Option<String>,
+    pub tools: Vec<McpToolInfo>,
+}
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct McpInitializationProgress {
+    pub connected: u32,
+    pub total: u32,
+}
+
+fn parse_mcp_authentication_state(status: &str) -> McpAuthenticationState {
+    match status {
+        "authenticated" => McpAuthenticationState::Authenticated,
+        "needs_auth" => McpAuthenticationState::NeedsAuth,
+        "setup_required" => McpAuthenticationState::SetupRequired,
+        "failed" => McpAuthenticationState::Failed,
+        other => McpAuthenticationState::Unknown(other.to_owned()),
+    }
+}
+
+fn parse_mcp_servers(value: &serde_json::Value) -> Result<Vec<McpServerSummary>, Error> {
+    let entries = value
+        .get("servers")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| Error::Operation("invalid MCP catalog response".into()))?;
+    Ok(entries
+        .iter()
+        .map(|v| {
+            let name = v["name"].as_str().unwrap_or_default().to_owned();
+            let session = &v["session"];
+            let tools = session["tools"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|t| McpToolInfo {
+                    server: name.clone(),
+                    name: t["name"].as_str().unwrap_or_default().into(),
+                    display_name: t["displayName"].as_str().map(Into::into),
+                    description: t["description"].as_str().map(Into::into),
+                    enabled: t["enabled"].as_bool().unwrap_or(true),
+                    meta: t.get("_meta").cloned().unwrap_or(serde_json::Value::Null),
+                })
+                .collect();
+            McpServerSummary {
+                name,
+                display_name: v["displayName"].as_str().map(Into::into),
+                source: match v["source"].as_str() {
+                    Some("local") => McpServerSource::Local,
+                    Some("managed") => McpServerSource::Managed,
+                    _ => McpServerSource::Unknown,
+                },
+                transport: match v["type"].as_str() {
+                    Some("stdio") => McpTransportKind::Stdio,
+                    Some("http") => McpTransportKind::Http,
+                    Some("sse") => McpTransportKind::Sse,
+                    Some("managedGateway") => McpTransportKind::ManagedGateway,
+                    _ => McpTransportKind::Unknown,
+                },
+                enabled: session["enabled"].as_bool().unwrap_or(false),
+                status: session["status"].as_str().map(|s| match s {
+                    "ready" => McpServerStatus::Ready,
+                    "initializing" => McpServerStatus::Initializing,
+                    "setuprequired" | "setup_required" => McpServerStatus::SetupRequired,
+                    "unavailable" => McpServerStatus::Unavailable,
+                    "needsauth" | "needs_auth" => McpServerStatus::NeedsAuth,
+                    _ => McpServerStatus::Unknown,
+                }),
+                auth_required: session["authRequired"].as_bool().unwrap_or(false),
+                setup_required: session["setupRequired"].as_bool().unwrap_or(false),
+                tools,
+                negotiated: session.get("negotiated").and_then(|negotiated| {
+                    let protocol_version = negotiated["protocolVersion"].as_str()?.to_owned();
+                    let capabilities = negotiated.get("capabilities")?.clone();
+                    let extensions: BTreeMap<String, serde_json::Value> =
+                        capabilities["extensions"]
+                            .as_object()
+                            .map(|values| {
+                                values
+                                    .iter()
+                                    .map(|(name, value)| (name.clone(), value.clone()))
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                    Some(McpNegotiatedCapabilities {
+                        protocol_version,
+                        tools: capabilities.get("tools").is_some_and(|v| !v.is_null()),
+                        resources: capabilities.get("resources").is_some_and(|v| !v.is_null()),
+                        prompts: capabilities.get("prompts").is_some_and(|v| !v.is_null()),
+                        completions: capabilities
+                            .get("completions")
+                            .is_some_and(|v| !v.is_null()),
+                        logging: capabilities.get("logging").is_some_and(|v| !v.is_null()),
+                        tool_list_changed: capabilities["tools"]["listChanged"]
+                            .as_bool()
+                            .unwrap_or(false),
+                        resource_list_changed: capabilities["resources"]["listChanged"]
+                            .as_bool()
+                            .unwrap_or(false),
+                        subscriptions: capabilities["tools"]["listChanged"]
+                            .as_bool()
+                            .unwrap_or(false)
+                            || capabilities["prompts"]["listChanged"]
+                                .as_bool()
+                                .unwrap_or(false)
+                            || capabilities["resources"]["listChanged"]
+                                .as_bool()
+                                .unwrap_or(false)
+                            || capabilities["resources"]["subscribe"]
+                                .as_bool()
+                                .unwrap_or(false),
+                        legacy_resource_subscribe: capabilities["resources"]["subscribe"]
+                            .as_bool()
+                            .unwrap_or(false),
+                        prompt_list_changed: capabilities["prompts"]["listChanged"]
+                            .as_bool()
+                            .unwrap_or(false),
+                        tasks: extensions.contains_key("io.modelcontextprotocol/tasks"),
+                        extensions,
+                        raw: capabilities,
+                    })
+                }),
+            }
+        })
+        .collect())
+}
+fn parse_tool_result(v: serde_json::Value) -> Result<McpToolResult, Error> {
+    let blocks = v["content"]
+        .as_array()
+        .ok_or_else(|| Error::Operation("invalid MCP call response".into()))?;
+    let content = blocks
+        .iter()
+        .cloned()
+        .map(|raw| match raw["type"].as_str() {
+            Some("text") => McpContent::Text {
+                text: raw["text"].as_str().unwrap_or_default().into(),
+                raw,
+            },
+            Some("image") => McpContent::Image {
+                data: raw["data"].as_str().unwrap_or_default().into(),
+                mime_type: raw["mimeType"].as_str().unwrap_or_default().into(),
+                raw,
+            },
+            Some("audio") => McpContent::Audio {
+                data: raw["data"].as_str().unwrap_or_default().into(),
+                mime_type: raw["mimeType"].as_str().unwrap_or_default().into(),
+                raw,
+            },
+            Some("resource") => McpContent::EmbeddedResource {
+                resource: raw["resource"].clone(),
+                raw,
+            },
+            Some("resource_link") | Some("resourceLink") => McpContent::ResourceLink {
+                uri: raw["uri"].as_str().unwrap_or_default().into(),
+                name: raw["name"].as_str().unwrap_or_default().into(),
+                mime_type: raw["mimeType"].as_str().map(Into::into),
+                raw,
+            },
+            _ => McpContent::Unknown { raw },
+        })
+        .collect();
+    Ok(McpToolResult {
+        content,
+        structured_content: v.get("structuredContent").cloned(),
+        is_error: v["isError"].as_bool(),
+        meta: v.get("_meta").cloned(),
+    })
+}
+fn parse_resource_result(v: serde_json::Value) -> Result<McpReadResourceResult, Error> {
+    let blocks = v["contents"]
+        .as_array()
+        .ok_or_else(|| Error::Operation("invalid MCP resource response".into()))?;
+    Ok(McpReadResourceResult {
+        contents: blocks
+            .iter()
+            .map(|x| McpReadResourceContent {
+                uri: x["uri"].as_str().map(Into::into),
+                mime_type: x["mimeType"].as_str().map(Into::into),
+                text: x["text"].as_str().map(Into::into),
+                blob: x["blob"].as_str().map(Into::into),
+                meta: x.get("_meta").cloned(),
+                raw: x.clone(),
+            })
+            .collect(),
+    })
+}
+
+fn parse_input_required(v: serde_json::Value) -> Result<McpInputRequired, Error> {
+    let requests = v
+        .get("inputRequests")
+        .and_then(serde_json::Value::as_object)
+        .map(|requests| {
+            requests
+                .iter()
+                .map(|(id, request)| {
+                    let kind = match request.get("method").and_then(serde_json::Value::as_str) {
+                        Some("sampling/createMessage") => McpInputRequestKind::Sampling,
+                        Some("elicitation/create") => McpInputRequestKind::Elicitation,
+                        Some("roots/list") => McpInputRequestKind::Roots,
+                        Some(method) => {
+                            return Err(Error::Operation(format!(
+                                "unsupported MCP input request method '{method}'"
+                            )));
+                        }
+                        None => {
+                            return Err(Error::Operation(
+                                "MCP input request omitted its method".into(),
+                            ));
+                        }
+                    };
+                    Ok(McpInputRequest {
+                        id: id.clone(),
+                        kind,
+                        raw: request.clone(),
+                    })
+                })
+                .collect::<Result<Vec<_>, Error>>()
+        })
+        .transpose()?
+        .unwrap_or_default();
+    let request_state = v
+        .get("requestState")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned);
+    if requests.is_empty() && request_state.is_none() {
+        return Err(Error::Operation(
+            "invalid MCP input_required response: no requests or request state".into(),
+        ));
+    }
+    Ok(McpInputRequired {
+        requests,
+        request_state,
+        raw: v,
+        continuation_identity: None,
+    })
+}
+
+fn parse_task_status(value: &serde_json::Value) -> Result<McpTaskStatus, Error> {
+    match value.as_str() {
+        Some("working") => Ok(McpTaskStatus::Working),
+        Some("input_required") => Ok(McpTaskStatus::InputRequired),
+        Some("completed") => Ok(McpTaskStatus::Completed),
+        Some("failed") => Ok(McpTaskStatus::Failed),
+        Some("cancelled") => Ok(McpTaskStatus::Cancelled),
+        _ => Err(Error::Operation("invalid MCP Task status".into())),
+    }
+}
+
+fn parse_task(
+    session_id: &SessionId,
+    server: &str,
+    client_id: u64,
+    raw: serde_json::Value,
+) -> Result<McpTask, Error> {
+    let task_id = raw
+        .get("taskId")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| Error::Operation("MCP Task omitted taskId".into()))?
+        .to_owned();
+    let status = parse_task_status(&raw["status"])?;
+    let input_required = if status == McpTaskStatus::InputRequired {
+        Some(parse_input_required(serde_json::json!({
+            "resultType": "input_required",
+            "inputRequests": raw.get("inputRequests").cloned().unwrap_or_default(),
+        }))?)
+    } else {
+        None
+    };
+    Ok(McpTask {
+        handle: McpTaskHandle {
+            session_id: session_id.clone(),
+            server: server.to_owned(),
+            client_id,
+            task_id,
+        },
+        status,
+        status_message: raw["statusMessage"].as_str().map(str::to_owned),
+        created_at: raw["createdAt"].as_str().unwrap_or_default().to_owned(),
+        last_updated_at: raw["lastUpdatedAt"].as_str().unwrap_or_default().to_owned(),
+        ttl_ms: raw["ttl"].as_u64().or_else(|| raw["ttlMs"].as_u64()),
+        poll_interval_ms: raw["pollInterval"]
+            .as_u64()
+            .or_else(|| raw["pollIntervalMs"].as_u64()),
+        input_required,
+        result: raw.get("result").cloned(),
+        error: raw.get("error").cloned(),
+        raw,
+    })
+}
+
+fn parse_mcp_operation_outcome<T>(
+    session_id: &SessionId,
+    server: &str,
+    value: serde_json::Value,
+    operation: McpOperationIdentity,
+    parse_complete: impl FnOnce(serde_json::Value) -> Result<T, Error>,
+) -> Result<McpOperationOutcome<T>, Error> {
+    let client_id = value["clientId"]
+        .as_u64()
+        .ok_or_else(|| Error::Operation("MCP operation omitted client generation".into()))?;
+    let result = value
+        .get("result")
+        .cloned()
+        .ok_or_else(|| Error::Operation("MCP operation omitted result".into()))?;
+    match value["outcome"].as_str() {
+        Some("complete") => Ok(McpOperationOutcome::Complete {
+            client_id,
+            result: parse_complete(result)?,
+        }),
+        Some("input_required") => {
+            let mut input = parse_input_required(result)?;
+            input.continuation_identity = Some(McpContinuationIdentity {
+                session_id: session_id.clone(),
+                server: server.to_owned(),
+                client_id,
+                operation,
+                request_ids: input
+                    .requests
+                    .iter()
+                    .map(|request| request.id.clone())
+                    .collect(),
+            });
+            Ok(McpOperationOutcome::InputRequired { client_id, input })
+        }
+        Some("task") => {
+            let task = parse_task(session_id, server, client_id, result)?;
+            Ok(McpOperationOutcome::Task {
+                handle: task.handle.clone(),
+                task,
+            })
+        }
+        _ => Err(Error::Operation("unsupported MCP operation outcome".into())),
+    }
+}
+
+fn validate_mcp_continuation(
+    continuation: Option<McpContinuation>,
+    session_id: &SessionId,
+    server: &str,
+    operation: &McpOperationIdentity,
+) -> Result<(Option<McpInputResponses>, Option<String>, Option<u64>), Error> {
+    let Some(continuation) = continuation else {
+        return Ok((None, None, None));
+    };
+    if continuation.identity.session_id != *session_id
+        || continuation.identity.server != server
+        || continuation.identity.operation != *operation
+    {
+        return Err(Error::InvalidConfig(
+            "MCP continuation does not belong to this session, server, or operation".into(),
+        ));
+    }
+    Ok((
+        Some(continuation.input_responses),
+        continuation.request_state,
+        Some(continuation.identity.client_id),
+    ))
+}
+
+fn parse_subagent_snapshot(value: serde_json::Value) -> Result<SubagentSnapshot, Error> {
+    let required = |name: &str| {
+        value[name]
+            .as_str()
+            .map(str::to_owned)
+            .ok_or_else(|| Error::Operation(format!("subagent snapshot omitted {name}")))
+    };
+    Ok(SubagentSnapshot {
+        subagent_id: required("subagentId")?,
+        parent_session_id: required("parentSessionId")?,
+        child_session_id: required("childSessionId")?,
+        subagent_type: required("subagentType")?,
+        description: required("description")?,
+        started_at_epoch_ms: value["startedAtEpochMs"].as_u64().unwrap_or_default(),
+        duration_ms: value["durationMs"].as_u64().unwrap_or_default(),
+        status: value["status"].as_str().unwrap_or("running").to_owned(),
+        turn_count: value["turnCount"].as_u64().and_then(|v| v.try_into().ok()),
+        tool_call_count: value["toolCallCount"]
+            .as_u64()
+            .and_then(|v| v.try_into().ok()),
+        tokens_used: value["tokensUsed"].as_u64(),
+        context_window_tokens: value["contextWindowTokens"].as_u64(),
+        context_usage_pct: value["contextUsagePct"]
+            .as_u64()
+            .and_then(|v| v.try_into().ok()),
+        tools_used: value["toolsUsed"].as_array().map(|tools| {
+            tools
+                .iter()
+                .filter_map(|tool| tool.as_str().map(str::to_owned))
+                .collect()
+        }),
+        error_count: value["errorCount"].as_u64().and_then(|v| v.try_into().ok()),
+        output: value["output"].as_str().map(str::to_owned),
+        tool_calls: value["toolCalls"].as_u64().and_then(|v| v.try_into().ok()),
+        turns: value["turns"].as_u64().and_then(|v| v.try_into().ok()),
+        worktree_path: value["worktreePath"].as_str().map(PathBuf::from),
+        failure_error: value["failureError"].as_str().map(str::to_owned),
+        cancel_reason: value["cancelReason"].as_str().map(str::to_owned),
+        fork_context_source: value["forkContextSource"].as_str().map(str::to_owned),
+        fork_parent_prompt_id: value["forkParentPromptId"].as_str().map(str::to_owned),
+        resumed_from: value["resumedFrom"].as_str().map(str::to_owned),
+        raw: value,
+    })
+}
+
 /// Complete explicit external-service selection for an embedded runtime.
 /// Empty/default values preserve the legacy `RuntimeConfig.endpoint` and
 /// `RuntimeConfig.api_key` provider for every model.
@@ -139,6 +1206,10 @@ pub struct RuntimeOptions {
     pub plugin_paths: Vec<PathBuf>,
     pub services: RuntimeServices,
     pub host: Option<Arc<dyn HostDelegate>>,
+    pub tool_permission_handler: Option<Arc<dyn ToolPermissionHandler>>,
+    pub mcp_host_services: xai_grok_mcp::servers::McpHostServices,
+    pub in_process_mcp_servers: Vec<InProcessMcpServer>,
+    pub agent_hooks: Vec<AgentHookRegistration>,
 }
 impl Default for RuntimeOptions {
     fn default() -> Self {
@@ -152,6 +1223,10 @@ impl Default for RuntimeOptions {
             plugin_paths: Vec::new(),
             services: RuntimeServices::default(),
             host: None,
+            tool_permission_handler: None,
+            mcp_host_services: xai_grok_mcp::servers::McpHostServices::default(),
+            in_process_mcp_servers: Vec::new(),
+            agent_hooks: Vec::new(),
         }
     }
 }
@@ -182,21 +1257,222 @@ pub trait HostDelegate: Send + Sync + 'static {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
-pub struct ExtensionRequest {
-    pub method: String,
-    pub params: serde_json::Value,
-}
-#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
-pub struct ExtensionResponse {
-    pub result: serde_json::Value,
-}
-#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
-pub struct ExtensionNotification {
-    pub method: String,
-    pub params: serde_json::Value,
+/// A typed, concurrency-safe policy for agent tool permission requests.
+/// It is routed only by the Desktop profile; returning an error never grants permission.
+#[async_trait::async_trait]
+pub trait ToolPermissionHandler: Send + Sync + 'static {
+    async fn request_permission(
+        &self,
+        request: ToolPermissionRequest,
+    ) -> Result<ToolPermissionDecision, ToolPermissionError>;
 }
 
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ToolPermissionRequest {
+    pub session_id: String,
+    pub tool_call: ToolCallSummary,
+    pub options: Vec<ToolPermissionOption>,
+    /// Lossless representation of the agent request received by this SDK version.
+    pub raw: serde_json::Value,
+}
+
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ToolCallSummary {
+    pub id: String,
+    pub title: Option<String>,
+    pub kind: Option<ToolKind>,
+    pub status: Option<ToolCallStatus>,
+    pub raw_input: Option<serde_json::Value>,
+    pub raw_output: Option<serde_json::Value>,
+    pub raw: serde_json::Value,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolKind {
+    Read,
+    Edit,
+    Delete,
+    Move,
+    Search,
+    Execute,
+    Think,
+    Fetch,
+    SwitchMode,
+    Other,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolCallStatus {
+    Pending,
+    InProgress,
+    Completed,
+    Failed,
+    Other,
+}
+
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ToolPermissionOption {
+    pub id: String,
+    pub name: String,
+    pub kind: ToolPermissionOptionKind,
+    /// Original wire spelling, retained for forward compatibility.
+    pub raw_kind: String,
+    pub meta: Option<serde_json::Value>,
+    pub raw: serde_json::Value,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolPermissionOptionKind {
+    AllowOnce,
+    AllowAlways,
+    RejectOnce,
+    RejectAlways,
+    Other,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ToolPermissionDecision {
+    Cancelled,
+    Selected(String),
+}
+
+#[derive(Clone, Debug, thiserror::Error)]
+#[error("tool permission policy error: {message}")]
+pub struct ToolPermissionError {
+    pub message: String,
+    pub data: serde_json::Value,
+}
+
+/// A concurrency-safe SDK-owned in-process MCP endpoint. The shell performs
+/// MCP initialization and capability negotiation; this losslessly transports
+/// individual JSON-RPC messages.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct InProcessMcpContext {
+    /// Monotonic identity of the owning SDK runtime within this process.
+    pub runtime_instance_id: u64,
+    pub session_id: SessionId,
+    /// Monotonic incarnation of this logical session within the runtime.
+    pub session_instance_id: u64,
+    pub server_name: String,
+    /// Opaque registration identifier selected in [`InProcessMcpServer::new`].
+    pub registration_id: String,
+}
+
+#[async_trait::async_trait]
+pub(crate) trait InProcessMcpOutbound: Send + Sync + 'static {
+    async fn send(&self, message: serde_json::Value) -> Result<(), HostError>;
+}
+
+/// Identity-bound server→client notification peer for an SDK-owned MCP
+/// server. The peer is bounded and becomes stale when its session actor is
+/// unloaded or replaced.
+#[derive(Clone)]
+pub struct InProcessMcpPeer {
+    outbound: Arc<dyn InProcessMcpOutbound>,
+}
+
+impl InProcessMcpPeer {
+    pub(crate) fn new(outbound: Arc<dyn InProcessMcpOutbound>) -> Self {
+        Self { outbound }
+    }
+
+    /// Send a protocol or extension notification. Requests are intentionally
+    /// not accepted: MCP 2026 roots/sampling/elicitation use MRTR input
+    /// requests rather than direct server→client requests.
+    pub async fn notify(
+        &self,
+        method: impl Into<String>,
+        params: serde_json::Value,
+    ) -> Result<(), HostError> {
+        let method = method.into();
+        if method.trim().is_empty() {
+            return Err(HostError {
+                code: -32600,
+                message: "MCP notification method must not be empty".into(),
+                data: serde_json::Value::Null,
+            });
+        }
+        self.outbound
+            .send(serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": method,
+                "params": params,
+            }))
+            .await
+    }
+}
+
+#[async_trait::async_trait]
+pub trait InProcessMcpHandler: Send + Sync + 'static {
+    async fn handle(&self, message: serde_json::Value) -> Result<serde_json::Value, HostError>;
+
+    /// Handles one message with the immutable session identity attached by the
+    /// session actor. Override this when one handler serves multiple sessions and
+    /// needs per-session authorization or state; the compatibility default calls
+    /// [`Self::handle`].
+    async fn handle_for_session(
+        &self,
+        _session_id: &SessionId,
+        message: serde_json::Value,
+    ) -> Result<serde_json::Value, HostError> {
+        self.handle(message).await
+    }
+
+    /// Full identity-aware handler. Override this for per-registration or
+    /// per-session-instance authorization. The compatibility default delegates
+    /// to [`Self::handle_for_session`].
+    async fn handle_with_context(
+        &self,
+        context: &InProcessMcpContext,
+        message: serde_json::Value,
+    ) -> Result<serde_json::Value, HostError> {
+        self.handle_for_session(&context.session_id, message).await
+    }
+
+    /// Called once when the full-duplex process-local transport is attached.
+    /// Retain the peer to emit MCP 2026 subscription acknowledgements and
+    /// notifications while requests are being handled.
+    async fn connected(
+        &self,
+        _context: &InProcessMcpContext,
+        _peer: InProcessMcpPeer,
+    ) -> Result<(), HostError> {
+        Ok(())
+    }
+}
+
+#[derive(Clone)]
+pub struct InProcessMcpServer {
+    pub name: String,
+    pub server_id: String,
+    pub handler: Arc<dyn InProcessMcpHandler>,
+}
+impl InProcessMcpServer {
+    pub fn new(
+        name: impl Into<String>,
+        server_id: impl Into<String>,
+        handler: Arc<dyn InProcessMcpHandler>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            server_id: server_id.into(),
+            handler,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct ExtensionRequest {
+    pub method: String,
+    pub params: serde_json::Value,
+}
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct ExtensionResponse {
+    pub result: serde_json::Value,
+}
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct CapabilityDescriptor {
     pub namespace: String,
@@ -207,12 +1483,9 @@ pub struct CapabilityDescriptor {
 }
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct RuntimeCapabilities {
-    pub protocol_version: String,
-    pub initialize: serde_json::Value,
     pub profile: RuntimeProfile,
     pub host: HostCapabilities,
-    pub generic_extension_transport: bool,
-    pub extension_families: Vec<CapabilityDescriptor>,
+    pub features: Vec<CapabilityDescriptor>,
 }
 
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -285,6 +1558,112 @@ pub struct SessionConfig {
     pub cwd: PathBuf,
     pub model: String,
     pub reasoning: Option<String>,
+    /// Replaces the agent's default system prompt for this session.
+    #[serde(default)]
+    pub system_prompt: Option<String>,
+    /// Host rules appended to the system prompt inside `<human_rules>`.
+    #[serde(default)]
+    pub rules: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct AgentCommand {
+    pub name: String,
+    pub description: String,
+    pub input_hint: Option<String>,
+    /// Lossless agent command metadata for future command kinds.
+    pub meta: Option<serde_json::Value>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct InterjectionReceipt {
+    pub interjection_id: Option<String>,
+    pub status: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ForkSessionRequest {
+    pub source_cwd: PathBuf,
+    pub new_cwd: PathBuf,
+    pub new_session_id: Option<String>,
+    pub new_model_id: Option<String>,
+    pub target_prompt_index: Option<usize>,
+    pub session_kind: Option<String>,
+    pub source_workspace_dir: Option<PathBuf>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ForkSessionReceipt {
+    pub new_session_id: SessionId,
+    pub chat_messages_copied: usize,
+    pub updates_copied: usize,
+    pub plan_state_copied: bool,
+    pub new_cwd: PathBuf,
+    pub parent_session_id: SessionId,
+    pub new_model_id: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct WorkflowInfo {
+    pub name: String,
+    pub description: String,
+    pub when_to_use: Option<String>,
+    pub source: String,
+    pub path: Option<PathBuf>,
+    /// Lossless workflow entry for forward-compatible fields.
+    pub raw: serde_json::Value,
+}
+
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SubagentSnapshot {
+    pub subagent_id: String,
+    pub parent_session_id: String,
+    pub child_session_id: String,
+    pub subagent_type: String,
+    pub description: String,
+    pub started_at_epoch_ms: u64,
+    pub duration_ms: u64,
+    pub status: String,
+    pub turn_count: Option<u32>,
+    pub tool_call_count: Option<u32>,
+    pub tokens_used: Option<u64>,
+    pub context_window_tokens: Option<u64>,
+    pub context_usage_pct: Option<u8>,
+    pub tools_used: Option<Vec<String>>,
+    pub error_count: Option<u32>,
+    pub output: Option<String>,
+    pub tool_calls: Option<u32>,
+    pub turns: Option<u32>,
+    pub worktree_path: Option<PathBuf>,
+    pub failure_error: Option<String>,
+    pub cancel_reason: Option<String>,
+    pub fork_context_source: Option<String>,
+    pub fork_parent_prompt_id: Option<String>,
+    pub resumed_from: Option<String>,
+    /// Lossless snapshot for fields added by newer agents.
+    pub raw: serde_json::Value,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SubagentCancelOutcome {
+    Cancelled,
+    AlreadyFinished {
+        status: String,
+    },
+    NotFound,
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SubagentCancelReceipt {
+    pub subagent_id: String,
+    pub cancelled: bool,
+    pub outcome: Option<SubagentCancelOutcome>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
@@ -308,6 +1687,52 @@ impl SessionId {
     pub fn runtime_events() -> Self {
         Self(Self::RUNTIME_EVENTS.into())
     }
+}
+
+/// SDK-owned scheduler request. `task_id == None` creates; otherwise only
+/// `interval` and/or `prompt` are updated and the existing phase is retained.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScheduledTaskRequest {
+    pub task_id: Option<String>,
+    pub interval: Option<String>,
+    pub prompt: Option<String>,
+    #[serde(default = "sdk_default_true")]
+    pub recurring: bool,
+    pub durable: Option<bool>,
+    pub foreground: Option<bool>,
+    #[serde(default)]
+    pub fire_immediately: bool,
+}
+fn sdk_default_true() -> bool {
+    true
+}
+
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScheduledTaskSummary {
+    pub id: String,
+    pub interval_seconds: u64,
+    pub prompt: String,
+    pub recurring: bool,
+    pub durable: bool,
+    pub foreground: bool,
+    pub created_at: String,
+    pub last_fired_at: Option<String>,
+    pub expires_at: Option<String>,
+    pub last_subagent: Option<String>,
+    pub next_fire_at: String,
+}
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ScheduledTaskReceipt {
+    pub task: ScheduledTaskSummary,
+    pub updated: bool,
+}
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeleteScheduledTaskReceipt {
+    pub task_id: String,
+    pub deleted: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -336,9 +1761,16 @@ pub enum EventUpdate {
     SessionInfo {
         title: Option<String>,
     },
+    McpServerStatus(McpServerStatusEvent),
+    McpTaskStatus(McpTaskStatusEvent),
+    McpToolsChanged(McpToolsChangedEvent),
+    McpInitializationProgress(McpInitializationProgress),
+    /// Redacted catalog update. Transport targets, headers, environment and
+    /// setup values are intentionally omitted.
+    McpServersChanged(Vec<McpServerSummary>),
     Unknown {
         tag: String,
-        /// Lossless JSON representation of the ACP update that this version of
+        /// Lossless JSON representation of the agent update that this version of
         /// the SDK does not yet model as a typed variant.
         payload: serde_json::Value,
         /// Original JSON encoding retained for hosts that need byte-for-byte
@@ -514,22 +1946,742 @@ impl Runtime {
     pub fn capabilities(&self) -> RuntimeCapabilities {
         self.inner.capabilities()
     }
-    pub async fn extension_request(
+    pub(crate) async fn extension_request(
         &self,
         request: ExtensionRequest,
     ) -> Result<ExtensionResponse, Error> {
         self.inner.extension_request(request).await
     }
-    pub async fn extension_notification(&self, request: ExtensionRequest) -> Result<(), Error> {
-        self.inner
-            .extension_notification(ExtensionNotification {
-                method: request.method,
-                params: request.params,
+    async fn raw_ext(
+        &self,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value, Error> {
+        Ok(self
+            .extension_request(ExtensionRequest {
+                method: method.to_owned(),
+                params,
             })
-            .await
+            .await?
+            .result)
     }
-    pub async fn notify_extension(&self, notification: ExtensionNotification) -> Result<(), Error> {
-        self.inner.extension_notification(notification).await
+    async fn typed_ext(
+        &self,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value, Error> {
+        let envelope = self
+            .extension_request(ExtensionRequest {
+                method: method.into(),
+                params,
+            })
+            .await?
+            .result;
+        if let Some(error) = envelope.get("error").filter(|value| !value.is_null()) {
+            let detail = error
+                .as_str()
+                .map(str::to_owned)
+                .unwrap_or_else(|| error.to_string());
+            return Err(Error::Operation(format!(
+                "extension '{method}' failed: {detail}"
+            )));
+        }
+        envelope
+            .get("result")
+            .cloned()
+            .filter(|value| !value.is_null())
+            .ok_or_else(|| Error::Operation(format!("extension '{method}' returned no result")))
+    }
+    async fn mcp_ext(
+        &self,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value, Error> {
+        self.typed_ext(method, params).await
+    }
+    /// Creates or updates a recurring task in an explicit session.
+    pub async fn upsert_scheduled_task(
+        &self,
+        id: &SessionId,
+        request: &ScheduledTaskRequest,
+    ) -> Result<ScheduledTaskReceipt, Error> {
+        let mut params =
+            serde_json::to_value(request).map_err(|e| Error::Operation(e.to_string()))?;
+        params["sessionId"] = serde_json::Value::String(id.as_str().to_owned());
+        serde_json::from_value(self.typed_ext("x.ai/scheduler/create", params).await?)
+            .map_err(|e| Error::Operation(format!("invalid scheduler create response: {e}")))
+    }
+    /// Lists tasks owned by an explicit session.
+    pub async fn list_scheduled_tasks(
+        &self,
+        id: &SessionId,
+    ) -> Result<Vec<ScheduledTaskSummary>, Error> {
+        let value = self
+            .typed_ext(
+                "x.ai/scheduler/list",
+                serde_json::json!({"sessionId": id.as_str()}),
+            )
+            .await?;
+        serde_json::from_value(value.get("tasks").cloned().unwrap_or_default())
+            .map_err(|e| Error::Operation(format!("invalid scheduler list response: {e}")))
+    }
+    pub async fn delete_scheduled_task(
+        &self,
+        id: &SessionId,
+        task_id: &str,
+    ) -> Result<DeleteScheduledTaskReceipt, Error> {
+        serde_json::from_value(
+            self.typed_ext(
+                "x.ai/scheduler/delete",
+                serde_json::json!({"sessionId": id.as_str(), "taskId": task_id}),
+            )
+            .await?,
+        )
+        .map_err(|e| Error::Operation(format!("invalid scheduler delete response: {e}")))
+    }
+    /// Discovers built-ins, skills (including `implement`) and workflows
+    /// available to this live session.
+    pub async fn list_agent_commands(&self, id: &SessionId) -> Result<Vec<AgentCommand>, Error> {
+        let value = self
+            .raw_ext(
+                "x.ai/commands/list",
+                serde_json::json!({"sessionId": id.as_str()}),
+            )
+            .await?;
+        let commands = value["commands"]
+            .as_array()
+            .ok_or_else(|| Error::Operation("invalid commands/list response".into()))?;
+        Ok(commands
+            .iter()
+            .filter_map(|command| {
+                Some(AgentCommand {
+                    name: command["name"].as_str()?.to_owned(),
+                    description: command["description"].as_str()?.to_owned(),
+                    input_hint: command["input"]["hint"].as_str().map(str::to_owned),
+                    meta: command.get("_meta").cloned(),
+                })
+            })
+            .collect())
+    }
+    /// Executes a discovered built-in, skill or workflow command as a normal
+    /// agent turn. The command is allowlisted against the live catalog first.
+    /// Use [`Runtime::upsert_scheduled_task`] for `/loop` when no model-based
+    /// interpretation of the schedule is desired.
+    pub async fn execute_agent_command(
+        &self,
+        id: &SessionId,
+        turn_id: impl Into<String>,
+        name: &str,
+        arguments: Option<&str>,
+    ) -> Result<PromptReceipt, Error> {
+        if name.is_empty()
+            || name.starts_with('/')
+            || name.chars().any(|ch| ch.is_whitespace() || ch.is_control())
+        {
+            return Err(Error::InvalidConfig(
+                "agent command name must be non-empty and contain no slash prefix or whitespace"
+                    .into(),
+            ));
+        }
+        let commands = self.list_agent_commands(id).await?;
+        if !commands.iter().any(|command| command.name == name) {
+            return Err(Error::Operation(format!(
+                "agent command '{name}' is not available in this session"
+            )));
+        }
+        let prompt = match arguments.filter(|value| !value.is_empty()) {
+            Some(arguments) => format!("/{name} {arguments}"),
+            None => format!("/{name}"),
+        };
+        self.prompt(id, turn_id, prompt).await
+    }
+    /// Queues a steering/follow-up instruction into the currently running turn.
+    pub async fn interject(
+        &self,
+        id: &SessionId,
+        text: impl Into<String>,
+        interjection_id: Option<String>,
+    ) -> Result<InterjectionReceipt, Error> {
+        let status = self
+            .typed_ext(
+                "x.ai/interject",
+                serde_json::json!({
+                    "sessionId": id.as_str(),
+                    "text": text.into(),
+                    "interjectionId": interjection_id
+                }),
+            )
+            .await?;
+        Ok(InterjectionReceipt {
+            interjection_id,
+            status: status["status"].as_str().unwrap_or("unknown").to_owned(),
+        })
+    }
+    /// Copies a persisted conversation branch. The returned child is not
+    /// resident until the host calls [`Runtime::load_session`].
+    pub async fn fork_session(
+        &self,
+        source: &SessionId,
+        request: &ForkSessionRequest,
+    ) -> Result<ForkSessionReceipt, Error> {
+        let value = self
+            .raw_ext(
+                "x.ai/session/fork",
+                serde_json::json!({
+                    "sourceSessionId": source.as_str(),
+                    "sourceCwd": request.source_cwd,
+                    "newCwd": request.new_cwd,
+                    "newSessionId": request.new_session_id,
+                    "newModelId": request.new_model_id,
+                    "targetPromptIndex": request.target_prompt_index,
+                    "sessionKind": request.session_kind,
+                    "sourceWorkspaceDir": request.source_workspace_dir
+                }),
+            )
+            .await?;
+        serde_json::from_value(value)
+            .map_err(|e| Error::Operation(format!("invalid session/fork response: {e}")))
+    }
+    /// Lists launchable workflows for this live session.
+    pub async fn list_workflows(&self, id: &SessionId) -> Result<Vec<WorkflowInfo>, Error> {
+        let value = self
+            .typed_ext(
+                "x.ai/workflows/list",
+                serde_json::json!({"sessionId": id.as_str()}),
+            )
+            .await?;
+        Ok(value["workflows"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|workflow| {
+                Some(WorkflowInfo {
+                    name: workflow["name"].as_str()?.to_owned(),
+                    description: workflow["description"].as_str()?.to_owned(),
+                    when_to_use: workflow["whenToUse"].as_str().map(str::to_owned),
+                    source: workflow["source"].as_str().unwrap_or("unknown").to_owned(),
+                    path: workflow["path"].as_str().map(PathBuf::from),
+                    raw: workflow.clone(),
+                })
+            })
+            .collect())
+    }
+    /// Lists subagents currently running under this root session.
+    pub async fn list_running_subagents(
+        &self,
+        id: &SessionId,
+    ) -> Result<Vec<SubagentSnapshot>, Error> {
+        let value = self
+            .typed_ext(
+                "x.ai/subagent/list_running",
+                serde_json::json!({"sessionId": id.as_str()}),
+            )
+            .await?;
+        value["subagents"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .cloned()
+            .map(parse_subagent_snapshot)
+            .collect()
+    }
+    /// Gets a live or terminal subagent snapshot, optionally waiting for it to finish.
+    pub async fn get_subagent(
+        &self,
+        subagent_id: &str,
+        block: bool,
+        timeout_ms: Option<u64>,
+    ) -> Result<Option<SubagentSnapshot>, Error> {
+        let value = self
+            .typed_ext(
+                "x.ai/subagent/get",
+                serde_json::json!({
+                    "subagentId": subagent_id,
+                    "block": block,
+                    "timeoutMs": timeout_ms
+                }),
+            )
+            .await?;
+        value
+            .get("snapshot")
+            .filter(|snapshot| !snapshot.is_null())
+            .cloned()
+            .map(parse_subagent_snapshot)
+            .transpose()
+    }
+    /// Cancels a subagent by its globally unique subagent id.
+    pub async fn cancel_subagent(&self, subagent_id: &str) -> Result<SubagentCancelReceipt, Error> {
+        serde_json::from_value(
+            self.typed_ext(
+                "x.ai/subagent/cancel",
+                serde_json::json!({"subagentId": subagent_id}),
+            )
+            .await?,
+        )
+        .map_err(|e| Error::Operation(format!("invalid subagent/cancel response: {e}")))
+    }
+    /// Returns a redacted catalog for the explicit session. Restricted runtimes fail closed.
+    pub async fn list_mcp_servers(
+        &self,
+        id: &SessionId,
+        refresh: bool,
+    ) -> Result<Vec<McpServerSummary>, Error> {
+        let value = self
+            .mcp_ext(
+                "x.ai/mcp/list",
+                serde_json::json!({
+                    "sessionId": id.as_str(),
+                    "cache": !refresh,
+                    "requireSession": true
+                }),
+            )
+            .await?;
+        parse_mcp_servers(&value)
+    }
+    /// Lists tools currently visible in an explicit session, optionally filtered by server.
+    pub async fn list_mcp_tools(
+        &self,
+        id: &SessionId,
+        server: Option<&str>,
+    ) -> Result<Vec<McpToolInfo>, Error> {
+        let mut tools: Vec<_> = self
+            .list_mcp_servers(id, false)
+            .await?
+            .into_iter()
+            .flat_map(|s| s.tools)
+            .collect();
+        if let Some(server) = server {
+            tools.retain(|t| t.server == server);
+        }
+        Ok(tools)
+    }
+    /// Calls one MCP tool through the session actor.
+    pub async fn call_mcp_tool(
+        &self,
+        id: &SessionId,
+        server: &str,
+        tool: &str,
+        arguments: serde_json::Value,
+    ) -> Result<McpToolResult, Error> {
+        let v = self.mcp_ext("x.ai/mcp/call", serde_json::json!({"sessionId":id.as_str(),"server":server,"tool":tool,"arguments":arguments})).await?;
+        parse_tool_result(v)
+    }
+    /// Checks liveness of one initialized MCP server using the protocol ping.
+    pub async fn ping_mcp(&self, id: &SessionId, server: &str) -> Result<(), Error> {
+        self.inner
+            .mcp_modern(
+                id,
+                server.to_owned(),
+                xai_grok_shell::extensions::mcp::McpModernOperation::Ping,
+            )
+            .await
+            .map(drop)
+    }
+
+    /// Notifies a server that the host root set changed. This fails unless a
+    /// roots service was installed with `list_changed` authorization.
+    pub async fn notify_mcp_roots_list_changed(
+        &self,
+        id: &SessionId,
+        server: &str,
+    ) -> Result<(), Error> {
+        self.inner
+            .mcp_modern(
+                id,
+                server.to_owned(),
+                xai_grok_shell::extensions::mcp::McpModernOperation::NotifyRootsListChanged,
+            )
+            .await
+            .map(drop)
+    }
+    /// Executes exactly one MCP 2026 tools/call round. Unlike
+    /// [`Runtime::call_mcp_tool`], this preserves MRTR and Task outcomes for
+    /// explicit orchestration by the host.
+    pub async fn call_mcp_tool_once(
+        &self,
+        id: &SessionId,
+        server: &str,
+        tool: &str,
+        arguments: serde_json::Value,
+        continuation: Option<McpContinuation>,
+    ) -> Result<McpOperationOutcome<McpToolResult>, Error> {
+        let operation = McpOperationIdentity::Tool {
+            name: tool.to_owned(),
+            arguments: arguments.clone(),
+        };
+        let (input_responses, request_state, expected_client_id) =
+            validate_mcp_continuation(continuation, id, server, &operation)?;
+        let value = self
+            .inner
+            .mcp_modern(
+                id,
+                server.to_owned(),
+                xai_grok_shell::extensions::mcp::McpModernOperation::CallToolOnce {
+                    tool_name: tool.to_owned(),
+                    arguments,
+                    input_responses,
+                    request_state,
+                    expected_client_id,
+                },
+            )
+            .await?;
+        parse_mcp_operation_outcome(id, server, value, operation, parse_tool_result)
+    }
+    /// Reads an MCP resource through the session actor.
+    pub async fn read_mcp_resource(
+        &self,
+        id: &SessionId,
+        server: &str,
+        uri: &str,
+    ) -> Result<McpReadResourceResult, Error> {
+        let v = self
+            .mcp_ext(
+                "x.ai/mcp/read_resource",
+                serde_json::json!({"sessionId":id.as_str(),"server":server,"uri":uri}),
+            )
+            .await?;
+        parse_resource_result(v)
+    }
+    /// Executes exactly one MCP 2026 resources/read round.
+    pub async fn read_mcp_resource_once(
+        &self,
+        id: &SessionId,
+        server: &str,
+        uri: &str,
+        continuation: Option<McpContinuation>,
+    ) -> Result<McpOperationOutcome<McpReadResourceResult>, Error> {
+        let operation = McpOperationIdentity::Resource {
+            uri: uri.to_owned(),
+        };
+        let (input_responses, request_state, expected_client_id) =
+            validate_mcp_continuation(continuation, id, server, &operation)?;
+        let value = self
+            .inner
+            .mcp_modern(
+                id,
+                server.to_owned(),
+                xai_grok_shell::extensions::mcp::McpModernOperation::ReadResourceOnce {
+                    uri: uri.to_owned(),
+                    input_responses,
+                    request_state,
+                    expected_client_id,
+                },
+            )
+            .await?;
+        parse_mcp_operation_outcome(id, server, value, operation, parse_resource_result)
+    }
+    /// Lists resources and URI templates from one live session server.
+    pub async fn list_mcp_resources(
+        &self,
+        id: &SessionId,
+        server: &str,
+    ) -> Result<McpResources, Error> {
+        let value = self
+            .mcp_ext(
+                "x.ai/mcp/resources/list",
+                serde_json::json!({"sessionId": id.as_str(), "server": server}),
+            )
+            .await?;
+        let resources = value["resources"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|raw| McpResourceInfo {
+                server: server.into(),
+                uri: raw["uri"].as_str().map(Into::into),
+                name: raw["name"].as_str().map(Into::into),
+                raw: raw.clone(),
+            })
+            .collect();
+        let templates = value["resourceTemplates"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|raw| McpResourceTemplateInfo {
+                server: server.into(),
+                uri_template: raw["uriTemplate"].as_str().map(Into::into),
+                name: raw["name"].as_str().map(Into::into),
+                raw: raw.clone(),
+            })
+            .collect();
+        Ok(McpResources {
+            resources,
+            templates,
+        })
+    }
+    pub async fn list_mcp_prompts(
+        &self,
+        id: &SessionId,
+        server: &str,
+    ) -> Result<Vec<McpPromptInfo>, Error> {
+        let value = self
+            .mcp_ext(
+                "x.ai/mcp/prompts/list",
+                serde_json::json!({"sessionId": id.as_str(), "server": server}),
+            )
+            .await?;
+        Ok(value["prompts"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|raw| McpPromptInfo {
+                server: server.into(),
+                name: raw["name"].as_str().unwrap_or_default().into(),
+                description: raw["description"].as_str().map(Into::into),
+                raw: raw.clone(),
+            })
+            .collect())
+    }
+    pub async fn get_mcp_prompt(
+        &self,
+        id: &SessionId,
+        server: &str,
+        name: &str,
+        arguments: Option<serde_json::Map<String, serde_json::Value>>,
+    ) -> Result<McpPromptResult, Error> {
+        let raw = self.mcp_ext("x.ai/mcp/prompts/get", serde_json::json!({"sessionId": id.as_str(), "server": server, "name": name, "arguments": arguments})).await?;
+        Ok(McpPromptResult { raw })
+    }
+    /// Executes exactly one MCP 2026 prompts/get round.
+    pub async fn get_mcp_prompt_once(
+        &self,
+        id: &SessionId,
+        server: &str,
+        name: &str,
+        arguments: Option<serde_json::Map<String, serde_json::Value>>,
+        continuation: Option<McpContinuation>,
+    ) -> Result<McpOperationOutcome<McpPromptResult>, Error> {
+        let operation = McpOperationIdentity::Prompt {
+            name: name.to_owned(),
+            arguments: arguments.clone(),
+        };
+        let (input_responses, request_state, expected_client_id) =
+            validate_mcp_continuation(continuation, id, server, &operation)?;
+        let value = self
+            .inner
+            .mcp_modern(
+                id,
+                server.to_owned(),
+                xai_grok_shell::extensions::mcp::McpModernOperation::GetPromptOnce {
+                    name: name.to_owned(),
+                    arguments,
+                    input_responses,
+                    request_state,
+                    expected_client_id,
+                },
+            )
+            .await?;
+        parse_mcp_operation_outcome(id, server, value, operation, |raw| {
+            Ok(McpPromptResult { raw })
+        })
+    }
+
+    /// Reads the latest state for a generation-bound MCP Task.
+    pub async fn get_mcp_task(&self, handle: &McpTaskHandle) -> Result<McpTask, Error> {
+        let value = self
+            .inner
+            .mcp_modern(
+                &handle.session_id,
+                handle.server.clone(),
+                xai_grok_shell::extensions::mcp::McpModernOperation::GetTask {
+                    client_id: handle.client_id,
+                    task_id: handle.task_id.clone(),
+                },
+            )
+            .await?;
+        let client_id = value["clientId"].as_u64().ok_or_else(|| {
+            Error::Operation("MCP Task response omitted client generation".into())
+        })?;
+        let raw = value
+            .get("result")
+            .cloned()
+            .ok_or_else(|| Error::Operation("MCP Task response omitted result".into()))?;
+        parse_task(&handle.session_id, &handle.server, client_id, raw)
+    }
+
+    /// Supplies responses to an input_required MCP Task. Task state is read
+    /// separately with [`Runtime::get_mcp_task`].
+    pub async fn update_mcp_task(
+        &self,
+        handle: &McpTaskHandle,
+        input_responses: McpInputResponses,
+    ) -> Result<(), Error> {
+        self.inner
+            .mcp_modern(
+                &handle.session_id,
+                handle.server.clone(),
+                xai_grok_shell::extensions::mcp::McpModernOperation::UpdateTask {
+                    client_id: handle.client_id,
+                    task_id: handle.task_id.clone(),
+                    input_responses,
+                },
+            )
+            .await
+            .map(drop)
+    }
+
+    /// Requests cancellation of a generation-bound MCP Task.
+    pub async fn cancel_mcp_task(&self, handle: &McpTaskHandle) -> Result<(), Error> {
+        self.inner
+            .mcp_modern(
+                &handle.session_id,
+                handle.server.clone(),
+                xai_grok_shell::extensions::mcp::McpModernOperation::CancelTask {
+                    client_id: handle.client_id,
+                    task_id: handle.task_id.clone(),
+                },
+            )
+            .await
+            .map(drop)
+    }
+    /// Opens a bounded MCP 2026 `subscriptions/listen` stream and waits for
+    /// the server's acknowledgement. Dropping the returned stream cancels the
+    /// listen request; reconnects require a new call.
+    pub async fn listen_mcp(
+        &self,
+        id: &SessionId,
+        server: &str,
+        filter: McpSubscriptionFilter,
+        capacity: usize,
+    ) -> Result<McpSubscription, Error> {
+        let capacity = std::num::NonZeroUsize::new(capacity)
+            .filter(|capacity| capacity.get() <= 4096)
+            .ok_or_else(|| {
+                Error::InvalidConfig("MCP subscription capacity must be in 1..=4096".into())
+            })?;
+        let bridge = self
+            .inner
+            .mcp_subscribe(
+                id,
+                server.to_owned(),
+                xai_grok_shell::extensions::mcp::McpModernSubscriptionFilter {
+                    tools_list_changed: filter.tools_list_changed,
+                    prompts_list_changed: filter.prompts_list_changed,
+                    resources_list_changed: filter.resources_list_changed,
+                    resource_subscriptions: filter.resource_subscriptions,
+                },
+                capacity,
+            )
+            .await?;
+        let acknowledged = serde_json::from_value(bridge.acknowledged)
+            .map_err(|error| Error::Operation(format!("invalid MCP subscription ack: {error}")))?;
+        Ok(McpSubscription {
+            session_id: id.clone(),
+            server: server.to_owned(),
+            client_id: bridge.client_id,
+            acknowledged,
+            events: bridge.events,
+            terminal: bridge.terminal,
+            cancel: Some(bridge.cancel),
+            pending_end: None,
+            ended: false,
+        })
+    }
+    /// Completes either a `prompt` name argument or `resource` URI-template argument.
+    pub async fn complete_mcp_argument(
+        &self,
+        id: &SessionId,
+        server: &str,
+        reference: &str,
+        target: &str,
+        argument: &str,
+        value: &str,
+        context: Option<BTreeMap<String, String>>,
+    ) -> Result<McpCompletionResult, Error> {
+        if !matches!(reference, "prompt" | "resource") {
+            return Err(Error::InvalidConfig(
+                "MCP completion reference must be 'prompt' or 'resource'".into(),
+            ));
+        }
+        let raw = self.mcp_ext("x.ai/mcp/complete", serde_json::json!({"sessionId": id.as_str(), "server": server, "reference": reference, "target": target, "argument": argument, "value": value, "context": context})).await?;
+        Ok(McpCompletionResult {
+            values: raw["values"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|v| v.as_str().map(Into::into))
+                .collect(),
+            total: raw["total"].as_u64(),
+            has_more: raw["hasMore"].as_bool(),
+            raw,
+        })
+    }
+    /// Returns per-server authentication state for this session.
+    pub async fn mcp_auth_status(&self, id: &SessionId) -> Result<Vec<McpAuthStatus>, Error> {
+        let v = self
+            .mcp_ext(
+                "x.ai/mcp/auth_status",
+                serde_json::json!({"session_id":id.as_str()}),
+            )
+            .await?;
+        Ok(v.get("servers")
+            .and_then(|v| v.as_array())
+            .into_iter()
+            .flatten()
+            .map(|x| McpAuthStatus {
+                server_name: x["server_name"].as_str().unwrap_or_default().into(),
+                status: parse_mcp_authentication_state(x["status"].as_str().unwrap_or("unknown")),
+                error: None,
+            })
+            .collect())
+    }
+    /// Starts authentication and returns its immediate/deferred typed status.
+    pub async fn start_mcp_auth(
+        &self,
+        id: &SessionId,
+        server: &str,
+    ) -> Result<McpAuthStatus, Error> {
+        let v = self
+            .mcp_ext(
+                "x.ai/mcp/auth_trigger",
+                serde_json::json!({"session_id":id.as_str(),"server_name":server}),
+            )
+            .await?;
+        Ok(McpAuthStatus {
+            server_name: server.into(),
+            status: parse_mcp_authentication_state(v["status"].as_str().unwrap_or("unknown")),
+            error: v["error"].as_str().map(Into::into),
+        })
+    }
+    /// Changes server state only in this session; no preference file is mutated.
+    pub async fn set_mcp_server_enabled(
+        &self,
+        id: &SessionId,
+        server: &str,
+        enabled: bool,
+    ) -> Result<(), Error> {
+        self.mcp_ext("x.ai/mcp/toggle",serde_json::json!({"session_id":id.as_str(),"server_name":server,"enabled":enabled,"session_local":true})).await.map(drop)
+    }
+    /// Changes tool state only in this session.
+    pub async fn set_mcp_tool_enabled(
+        &self,
+        id: &SessionId,
+        server: &str,
+        tool: &str,
+        enabled: bool,
+    ) -> Result<(), Error> {
+        self.mcp_ext("x.ai/mcp/toggle_tool",serde_json::json!({"session_id":id.as_str(),"server_name":server,"tool_name":tool,"enabled":enabled,"session_local":true})).await.map(drop)
+    }
+    /// Atomically replaces the session's client-provided MCP server set. The
+    /// receipt contains names only and never echoes transport credentials.
+    pub async fn replace_mcp_servers(
+        &self,
+        id: &SessionId,
+        servers: Vec<McpServerConfig>,
+    ) -> Result<McpServerReplacementReceipt, Error> {
+        let names = servers
+            .iter()
+            .map(|s| match s {
+                McpServerConfig::Stdio { name, .. }
+                | McpServerConfig::Http { name, .. }
+                | McpServerConfig::Sse { name, .. } => name.clone(),
+            })
+            .collect::<Vec<_>>();
+        self.inner.replace_mcp_servers(id, servers).await?;
+        Ok(McpServerReplacementReceipt {
+            count: names.len(),
+            names,
+        })
     }
     pub async fn prompt_content(
         &self,
@@ -616,8 +2768,7 @@ impl Runtime {
             .await
     }
     /// Changes only the SDK sampling route for an existing conversation.
-    /// Unlike generic ACP model switching, this never rebuilds the harness or
-    /// rewrites the system prompt.
+    /// This never rebuilds the harness or rewrites the system prompt.
     pub async fn set_route(
         &self,
         id: &SessionId,
@@ -747,8 +2898,35 @@ impl RuntimeBuilder {
         self.options.services.mcp_servers = value.into_iter().collect();
         self
     }
+    /// Registers SDK-owned MCP servers for direct in-process dispatch. These
+    /// are advertised and routable only in the Desktop profile.
+    pub fn in_process_mcp_servers(
+        mut self,
+        value: impl IntoIterator<Item = InProcessMcpServer>,
+    ) -> Self {
+        self.options.in_process_mcp_servers = value.into_iter().collect();
+        self
+    }
+    /// Installs typed roots, sampling, and elicitation services used to
+    /// fulfill MCP 2026 MRTR input requests. Capability advertisement is
+    /// derived from the installed services and cannot be enabled separately.
+    pub fn mcp_host_services(mut self, value: McpHostServices) -> Self {
+        self.options.mcp_host_services = value;
+        self
+    }
+    /// Registers typed reverse-channel hooks. Hooks are enabled only by the
+    /// Desktop profile; Restricted never advertises or routes them.
+    pub fn agent_hooks(mut self, value: impl IntoIterator<Item = AgentHookRegistration>) -> Self {
+        self.options.agent_hooks = value.into_iter().collect();
+        self
+    }
     pub fn host_delegate(mut self, value: Arc<dyn HostDelegate>) -> Self {
         self.options.host = Some(value);
+        self
+    }
+    /// Installs the typed tool policy used ahead of `HostDelegate` in Desktop mode.
+    pub fn tool_permission_handler(mut self, value: Arc<dyn ToolPermissionHandler>) -> Self {
+        self.options.tool_permission_handler = Some(value);
         self
     }
     pub async fn start(self) -> Result<(Runtime, mpsc::UnboundedReceiver<Event>), Error> {
@@ -826,6 +3004,289 @@ mod tests {
     use xai_grok_test_support::{
         InferenceEndpoint, InferenceRequestMatcher, MockInferenceServer, ScriptedResponse, SseEvent,
     };
+
+    #[test]
+    fn typed_mcp_content_preserves_known_and_unknown_protocol_blocks() {
+        let result = parse_tool_result(serde_json::json!({
+            "content": [
+                {
+                    "type": "text",
+                    "text": "hello",
+                    "annotations": {"audience": ["user"]},
+                    "_meta": {"trace": 7}
+                },
+                {"type": "futureBlock", "payload": {"answer": 42}}
+            ],
+            "structuredContent": {"ok": true},
+            "isError": false,
+            "_meta": {"requestId": "req-1"}
+        }))
+        .expect("typed MCP result");
+
+        assert!(matches!(
+            &result.content[0],
+            McpContent::Text { text, raw }
+                if text == "hello"
+                    && raw["annotations"]["audience"][0] == "user"
+                    && raw["_meta"]["trace"] == 7
+        ));
+        assert!(matches!(
+            &result.content[1],
+            McpContent::Unknown { raw } if raw["payload"]["answer"] == 42
+        ));
+        assert_eq!(result.structured_content.unwrap()["ok"], true);
+        assert_eq!(result.meta.unwrap()["requestId"], "req-1");
+    }
+
+    #[test]
+    fn typed_mcp_catalog_is_allowlist_redacted() {
+        let servers = parse_mcp_servers(&serde_json::json!({
+            "servers": [{
+                "name": "fixture",
+                "source": "local",
+                "type": "stdio",
+                "command": "/secret/command",
+                "args": ["--token", "argument-secret"],
+                "env": [{"name": "TOKEN", "value": "environment-secret"}],
+                "setupValues": {"token": "setup-secret"},
+                "session": {
+                    "enabled": true,
+                    "status": "ready",
+                    "tools": [{"name": "echo", "enabled": true}]
+                }
+            }]
+        }))
+        .expect("catalog parses");
+
+        let json = serde_json::to_string(&servers).expect("summary serializes");
+        for secret in [
+            "/secret/command",
+            "argument-secret",
+            "environment-secret",
+            "setup-secret",
+        ] {
+            assert!(!json.contains(secret), "redacted catalog leaked {secret}");
+        }
+        assert_eq!(servers[0].transport, McpTransportKind::Stdio);
+        assert_eq!(servers[0].tools[0].name, "echo");
+    }
+
+    fn test_subscription(
+        values: impl IntoIterator<Item = serde_json::Value>,
+        terminal_value: Option<serde_json::Value>,
+    ) -> McpSubscription {
+        let (tx, events) = tokio::sync::mpsc::channel(1);
+        for value in values {
+            tx.try_send(value).expect("fixture event fits");
+        }
+        drop(tx);
+        let (terminal_tx, terminal) = tokio::sync::oneshot::channel();
+        if let Some(terminal_value) = terminal_value {
+            terminal_tx
+                .send(terminal_value)
+                .expect("fixture terminal receiver is open");
+        } else {
+            // Model a live producer so queued notification fixtures are parsed
+            // before any synthetic terminal closure.
+            std::mem::forget(terminal_tx);
+        }
+        let (cancel, _cancelled) = tokio::sync::oneshot::channel();
+        McpSubscription {
+            session_id: SessionId("subscription-test".into()),
+            server: "fixture".into(),
+            client_id: 7,
+            acknowledged: McpSubscriptionFilter::default(),
+            events,
+            terminal,
+            cancel: Some(cancel),
+            pending_end: None,
+            ended: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn modern_mcp_subscription_decodes_all_terminal_states() {
+        let fixtures = [
+            (
+                serde_json::json!({
+                    "reason":"graceful",
+                    "result":{"resultType":"complete"}
+                }),
+                McpSubscriptionEnd::Graceful,
+            ),
+            (
+                serde_json::json!({"reason":"abrupt"}),
+                McpSubscriptionEnd::Abrupt,
+            ),
+            (
+                serde_json::json!({"reason":"cancelled"}),
+                McpSubscriptionEnd::Cancelled,
+            ),
+            (
+                serde_json::json!({"reason":"lagged","capacity":17}),
+                McpSubscriptionEnd::Lagged { capacity: 17 },
+            ),
+            (
+                serde_json::json!({"reason":"error","message":"closed"}),
+                McpSubscriptionEnd::Error {
+                    message: "closed".into(),
+                },
+            ),
+        ];
+        for (raw, expected) in fixtures {
+            let mut subscription = test_subscription([], Some(raw));
+            assert_eq!(
+                subscription.next().await.expect("terminal event"),
+                Some(McpSubscriptionEvent::Ended(expected))
+            );
+            assert!(subscription.cancel.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn modern_mcp_subscription_rejects_unknown_or_malformed_notifications() {
+        for notification in [
+            serde_json::json!({"method":"notifications/future"}),
+            serde_json::json!({"method":"notifications/resources/updated","params":{}}),
+            serde_json::json!({"params":{}}),
+        ] {
+            let mut subscription = test_subscription(
+                [serde_json::json!({
+                    "type":"notification",
+                    "notification":notification
+                })],
+                None,
+            );
+            assert!(
+                subscription.next().await.is_err(),
+                "unknown or malformed subscription notifications must fail closed"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn modern_mcp_subscription_cancel_is_not_blocked_by_a_full_event_queue() {
+        let mut subscription = test_subscription(
+            [serde_json::json!({
+                "type":"notification",
+                "notification":{"method":"notifications/tools/list_changed"}
+            })],
+            None,
+        );
+        subscription.cancel();
+        let event =
+            tokio::time::timeout(std::time::Duration::from_millis(100), subscription.next())
+                .await
+                .expect("cancellation must not wait for event queue capacity")
+                .expect("valid terminal event");
+        assert_eq!(
+            event,
+            Some(McpSubscriptionEvent::Ended(McpSubscriptionEnd::Cancelled))
+        );
+    }
+
+    #[test]
+    fn modern_mcp_mrtr_and_task_parsers_reject_unknown_protocol_variants() {
+        assert!(
+            parse_input_required(serde_json::json!({
+                "resultType":"input_required",
+                "inputRequests":{"future":{"method":"future/input"}}
+            }))
+            .is_err()
+        );
+        assert!(
+            parse_task(
+                &SessionId("task-test".into()),
+                "fixture",
+                1,
+                serde_json::json!({
+                    "taskId":"future-task",
+                    "status":"future_status",
+                    "createdAt":"2026-08-09T00:00:00Z",
+                    "lastUpdatedAt":"2026-08-09T00:00:00Z"
+                })
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn modern_mcp_continuations_are_bound_to_the_exact_origin() {
+        let session = SessionId("continuation-session".into());
+        let operation = McpOperationIdentity::Tool {
+            name: "tool-a".into(),
+            arguments: serde_json::json!({"value": 1}),
+        };
+        let outcome = parse_mcp_operation_outcome(
+            &session,
+            "server-a",
+            serde_json::json!({
+                "clientId": 41,
+                "outcome": "input_required",
+                "result": {
+                    "resultType": "input_required",
+                    "inputRequests": {"request-1": {"method": "roots/list"}},
+                    "requestState": "opaque-state"
+                }
+            }),
+            operation.clone(),
+            parse_tool_result,
+        )
+        .expect("input requirement parses");
+        let McpOperationOutcome::InputRequired { input, .. } = outcome else {
+            panic!("expected input requirement");
+        };
+        assert!(input.respond(BTreeMap::new()).is_err());
+        let continuation = input
+            .respond(BTreeMap::from([(
+                "request-1".into(),
+                serde_json::json!({"roots": []}),
+            )]))
+            .expect("exact response IDs are accepted");
+
+        let (responses, request_state, generation) =
+            validate_mcp_continuation(Some(continuation.clone()), &session, "server-a", &operation)
+                .expect("matching origin is accepted");
+        assert_eq!(responses.expect("responses").len(), 1);
+        assert_eq!(request_state.as_deref(), Some("opaque-state"));
+        assert_eq!(generation, Some(41));
+
+        for (other_session, other_server, other_operation) in [
+            (
+                SessionId("other-session".into()),
+                "server-a",
+                operation.clone(),
+            ),
+            (session.clone(), "server-b", operation.clone()),
+            (
+                session.clone(),
+                "server-a",
+                McpOperationIdentity::Tool {
+                    name: "tool-b".into(),
+                    arguments: serde_json::json!({"value": 1}),
+                },
+            ),
+            (
+                session.clone(),
+                "server-a",
+                McpOperationIdentity::Prompt {
+                    name: "tool-a".into(),
+                    arguments: None,
+                },
+            ),
+        ] {
+            assert!(
+                validate_mcp_continuation(
+                    Some(continuation.clone()),
+                    &other_session,
+                    other_server,
+                    &other_operation,
+                )
+                .is_err(),
+                "cross-origin continuation must fail closed"
+            );
+        }
+    }
 
     #[derive(Clone, Debug)]
     struct MediaRequest {
@@ -1021,15 +3482,21 @@ mod tests {
                 Json(request): Json<serde_json::Value>,
             ) -> Response {
                 match request["method"].as_str() {
-                    Some("initialize") => (
+                    Some("server/discover") => (
                         [("mcp-session-id", "origin-runtime-http-test")],
                         Json(serde_json::json!({
                             "jsonrpc":"2.0",
                             "id":request["id"],
                             "result":{
-                                "protocolVersion":request["params"]["protocolVersion"],
+                                "resultType":"complete",
+                                "supportedVersions":["2026-07-28"],
                                 "capabilities":{"tools":{}},
-                                "serverInfo":{"name":"origin-runtime-http-test","version":"1"}
+                                "ttlMs":0,
+                                "cacheScope":"private",
+                                "_meta":{"io.modelcontextprotocol/serverInfo":{
+                                    "name":"origin-runtime-http-test",
+                                    "version":"1"
+                                }}
                             }
                         })),
                     )
@@ -1098,7 +3565,7 @@ mod tests {
                 }
             })
             .await
-            .expect("MCP HTTP initialize and tools/list complete");
+            .expect("MCP HTTP discovery and tools/list complete");
         }
 
         fn headers(&self) -> Vec<(String, String)> {
@@ -1258,6 +3725,8 @@ mod tests {
             cwd,
             model: "test-model".into(),
             reasoning: None,
+            system_prompt: None,
+            rules: None,
         }
     }
 
@@ -1417,6 +3886,8 @@ mod tests {
                 cwd: workspace,
                 model: "deep-model".into(),
                 reasoning: None,
+                system_prompt: None,
+                rules: None,
             })
             .await
             .expect("deep session");
@@ -1945,6 +4416,1071 @@ mod tests {
         runtime.shutdown().await.expect("runtime shuts down");
     }
 
+    struct InProcessFixture {
+        contexts: Arc<std::sync::Mutex<Vec<InProcessMcpContext>>>,
+    }
+    #[async_trait::async_trait]
+    impl InProcessMcpHandler for InProcessFixture {
+        async fn handle(&self, message: serde_json::Value) -> Result<serde_json::Value, HostError> {
+            let id = message.get("id").cloned();
+            let result = match message["method"].as_str() {
+                Some("server/discover") => serde_json::json!({
+                    "resultType":"complete",
+                    "supportedVersions":["2026-07-28"],
+                    "capabilities":{"tools":{},"resources":{},"prompts":{},"completions":{}},
+                    "ttlMs":0,
+                    "cacheScope":"private",
+                    "_meta":{"io.modelcontextprotocol/serverInfo":{"name":"sdk-fixture","version":"1"}}
+                }),
+                Some("tools/list") => {
+                    serde_json::json!({"tools":[{"name":"echo","inputSchema":{"type":"object"}}]})
+                }
+                Some("tools/call") => {
+                    serde_json::json!({"content":[{"type":"text","text":"in-process ok"}],"isError":false})
+                }
+                Some("resources/list") => {
+                    serde_json::json!({"resources":[{"uri":"fixture://one","name":"one"}]})
+                }
+                Some("resources/templates/list") => {
+                    serde_json::json!({"resourceTemplates":[{"uriTemplate":"fixture://{id}","name":"by id"}]})
+                }
+                Some("prompts/list") => {
+                    serde_json::json!({"prompts":[{"name":"welcome","description":"Welcome prompt","arguments":[{"name":"who"}]}]})
+                }
+                Some("prompts/get") => {
+                    serde_json::json!({"description":"rendered","messages":[{"role":"user","content":{"type":"text","text":format!("hello {}", message["params"]["arguments"]["who"].as_str().unwrap_or("world"))}}]})
+                }
+                Some("completion/complete") => {
+                    serde_json::json!({"completion":{"values":["alice","alex"],"total":2,"hasMore":false}})
+                }
+                _ => {
+                    return Ok(
+                        serde_json::json!({"jsonrpc":"2.0","id":id,"error":{"code":-32601,"message":"Method not found"}}),
+                    );
+                }
+            };
+            Ok(serde_json::json!({"jsonrpc":"2.0","id":id,"result":result}))
+        }
+
+        async fn handle_with_context(
+            &self,
+            context: &InProcessMcpContext,
+            message: serde_json::Value,
+        ) -> Result<serde_json::Value, HostError> {
+            self.contexts.lock().unwrap().push(context.clone());
+            self.handle(message).await
+        }
+    }
+
+    struct LiveGatewayMcpFixture {
+        called: Arc<AtomicBool>,
+    }
+    #[async_trait::async_trait]
+    impl InProcessMcpHandler for LiveGatewayMcpFixture {
+        async fn handle(&self, message: serde_json::Value) -> Result<serde_json::Value, HostError> {
+            let id = message.get("id").cloned();
+            let result = match message["method"].as_str() {
+                Some("server/discover") => serde_json::json!({
+                    "resultType":"complete",
+                    "supportedVersions":["2026-07-28"],
+                    "capabilities":{"tools":{}},
+                    "ttlMs":0,
+                    "cacheScope":"private",
+                    "_meta":{"io.modelcontextprotocol/serverInfo":{"name":"live-sdk-fixture","version":"1"}}
+                }),
+                Some("tools/list") => serde_json::json!({
+                    "tools":[{
+                        "name":"gateway_probe",
+                        "description":"Required verification tool. Call it with code LIVE_GATEWAY_E2E.",
+                        "inputSchema":{
+                            "type":"object",
+                            "properties":{"code":{"type":"string"}},
+                            "required":["code"]
+                        }
+                    }]
+                }),
+                Some("tools/call") => {
+                    if message["params"]["arguments"]["code"] == "LIVE_GATEWAY_E2E" {
+                        self.called.store(true, Ordering::Release);
+                    }
+                    serde_json::json!({
+                        "content":[{"type":"text","text":"LIVE_MCP_TOOL_OK"}],
+                        "structuredContent":{"verified":true},
+                        "isError":false
+                    })
+                }
+                _ => {
+                    return Ok(serde_json::json!({
+                        "jsonrpc":"2.0",
+                        "id":id,
+                        "error":{"code":-32601,"message":"Method not found"}
+                    }));
+                }
+            };
+            Ok(serde_json::json!({"jsonrpc":"2.0","id":id,"result":result}))
+        }
+    }
+
+    struct ModernMcpFixture {
+        peer: std::sync::Mutex<Option<InProcessMcpPeer>>,
+        task_status: std::sync::atomic::AtomicU8,
+        subscription_cancelled: tokio::sync::Notify,
+        subscription_cancellations: std::sync::atomic::AtomicU8,
+        subscription_auto_complete: AtomicBool,
+    }
+
+    impl ModernMcpFixture {
+        fn task(&self) -> serde_json::Value {
+            match self.task_status.load(Ordering::Acquire) {
+                0 => serde_json::json!({
+                    "resultType": "complete",
+                    "taskId": "fixture-task",
+                    "status": "input_required",
+                    "statusMessage": "needs roots",
+                    "createdAt": "2026-08-09T00:00:00Z",
+                    "lastUpdatedAt": "2026-08-09T00:00:01Z",
+                    "ttlMs": 60000,
+                    "pollIntervalMs": 10,
+                    "inputRequests": {
+                        "roots": {"method": "roots/list"}
+                    }
+                }),
+                1 => serde_json::json!({
+                    "resultType": "complete",
+                    "taskId": "fixture-task",
+                    "status": "completed",
+                    "statusMessage": "done",
+                    "createdAt": "2026-08-09T00:00:00Z",
+                    "lastUpdatedAt": "2026-08-09T00:00:02Z",
+                    "ttlMs": 60000,
+                    "result": {
+                        "resultType": "complete",
+                        "content": [{"type":"text","text":"task complete"}],
+                        "isError": false
+                    }
+                }),
+                _ => serde_json::json!({
+                    "resultType": "complete",
+                    "taskId": "fixture-task",
+                    "status": "cancelled",
+                    "createdAt": "2026-08-09T00:00:00Z",
+                    "lastUpdatedAt": "2026-08-09T00:00:03Z",
+                    "ttlMs": 60000
+                }),
+            }
+        }
+
+        async fn notify_task(&self) {
+            let peer = self.peer.lock().unwrap().clone();
+            if let Some(peer) = peer {
+                let _ = peer.notify("notifications/tasks", self.task()).await;
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl InProcessMcpHandler for ModernMcpFixture {
+        async fn handle(&self, message: serde_json::Value) -> Result<serde_json::Value, HostError> {
+            let id = message.get("id").cloned();
+            if id.is_none() {
+                if message["method"] == "notifications/cancelled" {
+                    self.subscription_cancellations
+                        .fetch_add(1, Ordering::AcqRel);
+                    self.subscription_cancelled.notify_one();
+                }
+                return Ok(serde_json::Value::Null);
+            }
+            let result = match message["method"].as_str() {
+                Some("server/discover") => serde_json::json!({
+                    "resultType":"complete",
+                    "supportedVersions":["2026-07-28"],
+                    "capabilities":{
+                        "tools":{"listChanged":true},
+                        "resources":{"listChanged":true,"subscribe":true},
+                        "prompts":{"listChanged":true},
+                        "extensions":{"io.modelcontextprotocol/tasks":{}}
+                    },
+                    "ttlMs":0,
+                    "cacheScope":"private",
+                    "_meta":{"io.modelcontextprotocol/serverInfo":{"name":"modern-sdk-fixture","version":"1"}}
+                }),
+                Some("ping") => serde_json::json!({}),
+                Some("tools/list") => serde_json::json!({
+                    "tools":[
+                        {"name":"mrtr","inputSchema":{"type":"object"}},
+                        {"name":"task","inputSchema":{"type":"object"}}
+                    ]
+                }),
+                Some("tools/call") if message["params"]["name"] == "mrtr" => {
+                    if message["params"].get("inputResponses").is_none() {
+                        serde_json::json!({
+                            "resultType":"input_required",
+                            "inputRequests":{"roots":{"method":"roots/list"}},
+                            "requestState":"opaque-fixture-state"
+                        })
+                    } else if message["params"]["requestState"] == "opaque-fixture-state" {
+                        serde_json::json!({
+                            "resultType":"complete",
+                            "content":[{"type":"text","text":"mrtr complete"}],
+                            "isError":false
+                        })
+                    } else {
+                        return Ok(serde_json::json!({
+                            "jsonrpc":"2.0",
+                            "id":id,
+                            "error":{"code":-32602,"message":"request state mismatch"}
+                        }));
+                    }
+                }
+                Some("tools/call") if message["params"]["name"] == "task" => {
+                    self.task_status.store(0, Ordering::Release);
+                    serde_json::json!({
+                        "resultType":"task",
+                        "taskId":"fixture-task",
+                        "status":"working",
+                        "createdAt":"2026-08-09T00:00:00Z",
+                        "lastUpdatedAt":"2026-08-09T00:00:00Z",
+                        "ttlMs":60000,
+                        "pollIntervalMs":10
+                    })
+                }
+                Some("tasks/get") => self.task(),
+                Some("tasks/update") => {
+                    self.task_status.store(1, Ordering::Release);
+                    self.notify_task().await;
+                    serde_json::json!({"resultType":"complete"})
+                }
+                Some("tasks/cancel") => {
+                    self.task_status.store(2, Ordering::Release);
+                    self.notify_task().await;
+                    serde_json::json!({"resultType":"complete"})
+                }
+                Some("subscriptions/listen") => {
+                    let peer = self.peer.lock().unwrap().clone().ok_or_else(|| HostError {
+                        code: -32603,
+                        message: "subscription peer unavailable".into(),
+                        data: serde_json::Value::Null,
+                    })?;
+                    let subscription_id = id.clone().unwrap_or_default();
+                    peer.notify(
+                        "notifications/subscriptions/acknowledged",
+                        serde_json::json!({
+                            "_meta":{"io.modelcontextprotocol/subscriptionId":subscription_id},
+                            "notifications":{"toolsListChanged":true}
+                        }),
+                    )
+                    .await?;
+                    peer.notify(
+                        "notifications/tools/list_changed",
+                        serde_json::json!({
+                            "_meta":{"io.modelcontextprotocol/subscriptionId":subscription_id}
+                        }),
+                    )
+                    .await?;
+                    if !self
+                        .subscription_auto_complete
+                        .swap(false, Ordering::AcqRel)
+                    {
+                        self.subscription_cancelled.notified().await;
+                    }
+                    serde_json::json!({
+                        "resultType":"complete",
+                        "_meta":{"io.modelcontextprotocol/subscriptionId":subscription_id}
+                    })
+                }
+                _ => {
+                    return Ok(serde_json::json!({
+                        "jsonrpc":"2.0",
+                        "id":id,
+                        "error":{"code":-32601,"message":"Method not found"}
+                    }));
+                }
+            };
+            Ok(serde_json::json!({"jsonrpc":"2.0","id":id,"result":result}))
+        }
+
+        async fn connected(
+            &self,
+            _context: &InProcessMcpContext,
+            peer: InProcessMcpPeer,
+        ) -> Result<(), HostError> {
+            *self.peer.lock().unwrap() = Some(peer);
+            Ok(())
+        }
+    }
+
+    struct EmptyRootsService;
+
+    #[allow(deprecated)]
+    #[async_trait::async_trait]
+    impl McpRootsService for EmptyRootsService {
+        async fn list_roots(
+            &self,
+            _context: McpHostContext,
+        ) -> Result<mcp_model::ListRootsResult, McpHostServiceError> {
+            Ok(mcp_model::ListRootsResult::new(Vec::new()))
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn desktop_routes_sdk_owned_in_process_mcp() {
+        let sampling = MockInferenceServer::start()
+            .await
+            .expect("sampling provider");
+        let root = TempDir::new().expect("root");
+        let workspace = root.path().join("workspace");
+        std::fs::create_dir(&workspace).expect("workspace");
+        let contexts = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (runtime, _) = Runtime::builder(runtime_config(&root, sampling.url()))
+            .profile(RuntimeProfile::Desktop)
+            .in_process_mcp_servers([
+                InProcessMcpServer::new(
+                    "sdk-fixture",
+                    "fixture-id",
+                    Arc::new(InProcessFixture {
+                        contexts: contexts.clone(),
+                    }),
+                ),
+                InProcessMcpServer::new(
+                    "sdk-fixture-two",
+                    "fixture-id-two",
+                    Arc::new(InProcessFixture {
+                        contexts: contexts.clone(),
+                    }),
+                ),
+            ])
+            .start()
+            .await
+            .expect("desktop runtime");
+        let session = runtime
+            .create_session(session_config(workspace.clone()))
+            .await
+            .expect("session");
+        let tools = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if let Ok(tools) = runtime.list_mcp_tools(&session, Some("sdk-fixture")).await
+                    && !tools.is_empty()
+                {
+                    break tools;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("MCP initialization");
+        assert_eq!(tools[0].name, "echo");
+        let second_tools = runtime
+            .list_mcp_tools(&session, Some("sdk-fixture-two"))
+            .await
+            .expect("second MCP server shares the actor binding");
+        assert_eq!(second_tools[0].name, "echo");
+        let servers = runtime
+            .list_mcp_servers(&session, false)
+            .await
+            .expect("server capabilities");
+        let negotiated = servers[0]
+            .negotiated
+            .as_ref()
+            .expect("modern discovery metadata");
+        assert_eq!(negotiated.protocol_version, "2026-07-28");
+        assert!(negotiated.tools);
+        assert!(negotiated.resources);
+        assert!(negotiated.prompts);
+        assert!(negotiated.completions);
+        assert!(!negotiated.tasks);
+        let result = runtime
+            .call_mcp_tool(&session, "sdk-fixture", "echo", serde_json::json!({}))
+            .await
+            .expect("tool call");
+        assert!(
+            matches!(&result.content[0], McpContent::Text { text, .. } if text == "in-process ok")
+        );
+        runtime
+            .call_mcp_tool(&session, "sdk-fixture-two", "echo", serde_json::json!({}))
+            .await
+            .expect("second MCP tool call");
+        let observed = contexts.lock().unwrap().clone();
+        assert!(!observed.is_empty());
+        assert!(observed.iter().all(|context| {
+            context.runtime_instance_id > 0
+                && context.session_id == session
+                && context.session_instance_id == 1
+                && matches!(
+                    (
+                        context.server_name.as_str(),
+                        context.registration_id.as_str()
+                    ),
+                    ("sdk-fixture", "fixture-id") | ("sdk-fixture-two", "fixture-id-two")
+                )
+        }));
+        assert!(
+            observed
+                .iter()
+                .any(|context| context.server_name == "sdk-fixture-two")
+        );
+        let resources = runtime
+            .list_mcp_resources(&session, "sdk-fixture")
+            .await
+            .expect("resources and templates");
+        assert_eq!(resources.resources[0].uri.as_deref(), Some("fixture://one"));
+        assert_eq!(
+            resources.templates[0].uri_template.as_deref(),
+            Some("fixture://{id}")
+        );
+        let prompts = runtime
+            .list_mcp_prompts(&session, "sdk-fixture")
+            .await
+            .expect("prompts");
+        assert_eq!(prompts[0].name, "welcome");
+        let prompt = runtime
+            .get_mcp_prompt(
+                &session,
+                "sdk-fixture",
+                "welcome",
+                Some(serde_json::Map::from_iter([(
+                    "who".into(),
+                    serde_json::json!("sdk"),
+                )])),
+            )
+            .await
+            .expect("prompt get");
+        assert_eq!(prompt.raw["messages"][0]["content"]["text"], "hello sdk");
+        let completion = runtime
+            .complete_mcp_argument(
+                &session,
+                "sdk-fixture",
+                "prompt",
+                "welcome",
+                "who",
+                "al",
+                None,
+            )
+            .await
+            .expect("completion");
+        assert_eq!(completion.values, ["alice", "alex"]);
+        assert!(matches!(
+            runtime
+                .replace_mcp_servers(
+                    &session,
+                    vec![McpServerConfig::Stdio {
+                        name: "sdk-fixture".into(),
+                        command: "/bin/false".into(),
+                        args: Vec::new(),
+                        env: BTreeMap::new(),
+                    }],
+                )
+                .await,
+            Err(Error::InvalidConfig(_))
+        ));
+        runtime
+            .unload_session(session.clone())
+            .await
+            .expect("unload first session incarnation");
+        contexts.lock().unwrap().clear();
+        runtime
+            .load_session(session.clone(), session_config(workspace))
+            .await
+            .expect("load second session incarnation");
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if runtime
+                    .list_mcp_tools(&session, Some("sdk-fixture"))
+                    .await
+                    .is_ok_and(|tools| !tools.is_empty())
+                    && runtime
+                        .list_mcp_tools(&session, Some("sdk-fixture-two"))
+                        .await
+                        .is_ok_and(|tools| !tools.is_empty())
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("second MCP initialization");
+        assert!(
+            contexts
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|context| context.session_instance_id == 2)
+        );
+        runtime.shutdown().await.expect("shutdown");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn modern_mcp_mrtr_tasks_subscriptions_and_generation_safety() {
+        let root = TempDir::new().expect("root");
+        let workspace = root.path().join("workspace");
+        std::fs::create_dir(&workspace).expect("workspace");
+        let fixture = Arc::new(ModernMcpFixture {
+            peer: std::sync::Mutex::new(None),
+            task_status: std::sync::atomic::AtomicU8::new(0),
+            subscription_cancelled: tokio::sync::Notify::new(),
+            subscription_cancellations: std::sync::atomic::AtomicU8::new(0),
+            subscription_auto_complete: AtomicBool::new(false),
+        });
+        let (runtime, _) = Runtime::builder(runtime_config(&root, "http://127.0.0.1:1".to_owned()))
+            .profile(RuntimeProfile::Desktop)
+            .in_process_mcp_servers([InProcessMcpServer::new(
+                "modern-fixture",
+                "modern-fixture-id",
+                fixture.clone(),
+            )])
+            .mcp_host_services(
+                McpHostServices::default().with_roots(Arc::new(EmptyRootsService), true),
+            )
+            .start()
+            .await
+            .expect("runtime starts");
+        let session = runtime
+            .create_session(session_config(workspace.clone()))
+            .await
+            .expect("session starts");
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if runtime
+                    .list_mcp_tools(&session, Some("modern-fixture"))
+                    .await
+                    .is_ok_and(|tools| tools.len() == 2)
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("modern fixture initializes");
+
+        runtime
+            .ping_mcp(&session, "modern-fixture")
+            .await
+            .expect("ping");
+        runtime
+            .notify_mcp_roots_list_changed(&session, "modern-fixture")
+            .await
+            .expect("authorized roots notification");
+
+        let input = runtime
+            .call_mcp_tool_once(
+                &session,
+                "modern-fixture",
+                "mrtr",
+                serde_json::json!({}),
+                None,
+            )
+            .await
+            .expect("first MRTR round");
+        let input = match input {
+            McpOperationOutcome::InputRequired { input, .. } => input,
+            other => panic!("expected input_required, got {other:?}"),
+        };
+        assert_eq!(input.request_state.as_deref(), Some("opaque-fixture-state"));
+        assert_eq!(input.requests[0].kind, McpInputRequestKind::Roots);
+        let continuation = input
+            .respond(BTreeMap::from([(
+                input.requests[0].id.clone(),
+                serde_json::json!({"roots": []}),
+            )]))
+            .expect("bound continuation");
+        let stale_continuation = continuation.clone();
+        let completed = runtime
+            .call_mcp_tool_once(
+                &session,
+                "modern-fixture",
+                "mrtr",
+                serde_json::json!({}),
+                Some(continuation),
+            )
+            .await
+            .expect("second MRTR round");
+        assert!(matches!(
+            completed,
+            McpOperationOutcome::Complete { result, .. }
+                if matches!(&result.content[0], McpContent::Text { text, .. } if text == "mrtr complete")
+        ));
+
+        let task = runtime
+            .call_mcp_tool_once(
+                &session,
+                "modern-fixture",
+                "task",
+                serde_json::json!({}),
+                None,
+            )
+            .await
+            .expect("Task creation");
+        let handle = match task {
+            McpOperationOutcome::Task { handle, .. } => handle,
+            other => panic!("expected Task, got {other:?}"),
+        };
+        let pending = runtime.get_mcp_task(&handle).await.expect("Task status");
+        assert_eq!(pending.status, McpTaskStatus::InputRequired);
+        runtime
+            .update_mcp_task(
+                &handle,
+                BTreeMap::from([("roots".into(), serde_json::json!({"roots": []}))]),
+            )
+            .await
+            .expect("Task update");
+        let completed = runtime.get_mcp_task(&handle).await.expect("completed Task");
+        assert_eq!(completed.status, McpTaskStatus::Completed);
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                if runtime
+                    .events_after(&session, 0)
+                    .await
+                    .expect("events")
+                    .iter()
+                    .any(|event| {
+                        matches!(
+                            &event.update,
+                            EventUpdate::McpTaskStatus(event)
+                                if event.status == McpTaskStatus::Completed
+                                    && event.handle == handle
+                        )
+                    })
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("Task push event");
+
+        let mut subscription = runtime
+            .listen_mcp(
+                &session,
+                "modern-fixture",
+                McpSubscriptionFilter {
+                    tools_list_changed: true,
+                    ..Default::default()
+                },
+                4,
+            )
+            .await
+            .expect("subscription acknowledged");
+        let stale_subscription_generation = subscription.client_id;
+        assert!(subscription.acknowledged.tools_list_changed);
+        assert!(matches!(
+            subscription.next().await.expect("subscription event"),
+            Some(McpSubscriptionEvent::ToolsListChanged)
+        ));
+        subscription.cancel();
+        assert!(matches!(
+            subscription.next().await.expect("subscription end"),
+            Some(McpSubscriptionEvent::Ended(McpSubscriptionEnd::Cancelled))
+        ));
+
+        let mut full_subscription = runtime
+            .listen_mcp(
+                &session,
+                "modern-fixture",
+                McpSubscriptionFilter {
+                    tools_list_changed: true,
+                    ..Default::default()
+                },
+                1,
+            )
+            .await
+            .expect("capacity-one subscription acknowledged");
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        full_subscription.cancel();
+        assert!(matches!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                full_subscription.next(),
+            )
+            .await
+            .expect("full queue must not delay cancellation")
+            .expect("typed cancellation"),
+            Some(McpSubscriptionEvent::Ended(McpSubscriptionEnd::Cancelled))
+        ));
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while fixture.subscription_cancellations.load(Ordering::Acquire) < 2 {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("transport cancellation must bypass the full SDK data queue");
+
+        fixture
+            .subscription_auto_complete
+            .store(true, Ordering::Release);
+        let mut server_completed_subscription = runtime
+            .listen_mcp(
+                &session,
+                "modern-fixture",
+                McpSubscriptionFilter {
+                    tools_list_changed: true,
+                    ..Default::default()
+                },
+                1,
+            )
+            .await
+            .expect("server-completed subscription acknowledged");
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert!(matches!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                server_completed_subscription.next(),
+            )
+            .await
+            .expect("server terminal must bypass a full data queue")
+            .expect("typed server terminal"),
+            Some(McpSubscriptionEvent::Ended(McpSubscriptionEnd::Graceful))
+        ));
+
+        let stale = handle.clone();
+        runtime
+            .unload_session(session.clone())
+            .await
+            .expect("unload");
+        runtime
+            .load_session(session.clone(), session_config(workspace))
+            .await
+            .expect("reload");
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if runtime
+                    .list_mcp_tools(&session, Some("modern-fixture"))
+                    .await
+                    .is_ok_and(|tools| tools.len() == 2)
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("replacement client initializes");
+        assert!(
+            runtime.get_mcp_task(&stale).await.is_err(),
+            "Task handle from an old client generation must fail closed"
+        );
+        assert!(
+            runtime
+                .call_mcp_tool_once(
+                    &session,
+                    "modern-fixture",
+                    "mrtr",
+                    serde_json::json!({}),
+                    Some(stale_continuation),
+                )
+                .await
+                .is_err(),
+            "MRTR continuation from an old connection generation must fail closed"
+        );
+        assert_eq!(
+            subscription.next().await.expect("ended subscription"),
+            None,
+            "an ended generation-bound subscription must not resume after reconnect"
+        );
+        let mut replacement_subscription = runtime
+            .listen_mcp(
+                &session,
+                "modern-fixture",
+                McpSubscriptionFilter {
+                    tools_list_changed: true,
+                    ..Default::default()
+                },
+                4,
+            )
+            .await
+            .expect("replacement subscription");
+        assert_ne!(
+            replacement_subscription.client_id,
+            stale_subscription_generation
+        );
+        replacement_subscription.cancel();
+        runtime.shutdown().await.expect("shutdown");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rejects_external_and_in_process_mcp_name_collisions() {
+        let root = TempDir::new().expect("root");
+        let result = Runtime::builder(runtime_config(&root, "http://127.0.0.1:1".into()))
+            .profile(RuntimeProfile::Desktop)
+            .mcp_servers([McpServerConfig::Stdio {
+                name: "same-name".into(),
+                command: "/bin/false".into(),
+                args: Vec::new(),
+                env: BTreeMap::new(),
+            }])
+            .in_process_mcp_servers([InProcessMcpServer::new(
+                "same-name",
+                "fixture-id",
+                Arc::new(InProcessFixture {
+                    contexts: Arc::new(std::sync::Mutex::new(Vec::new())),
+                }),
+            )])
+            .start()
+            .await;
+        assert!(matches!(result, Err(Error::InvalidConfig(_))));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn restricted_profile_never_registers_in_process_mcp() {
+        let root = TempDir::new().expect("root");
+        let workspace = root.path().join("workspace");
+        std::fs::create_dir(&workspace).expect("workspace");
+        let contexts = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (runtime, _) = Runtime::builder(runtime_config(&root, "http://127.0.0.1:1".into()))
+            .in_process_mcp_servers([InProcessMcpServer::new(
+                "sdk-fixture",
+                "fixture-id",
+                Arc::new(InProcessFixture {
+                    contexts: contexts.clone(),
+                }),
+            )])
+            .start()
+            .await
+            .expect("restricted runtime");
+        let session = runtime
+            .create_session(session_config(workspace))
+            .await
+            .expect("restricted session");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(contexts.lock().unwrap().is_empty());
+        assert!(matches!(
+            runtime.list_mcp_servers(&session, false).await,
+            Err(Error::Operation(_))
+        ));
+        assert!(runtime.capabilities().features.iter().any(|feature| {
+            feature.namespace == "sdk:in-process-mcp"
+                && !feature.enabled
+                && feature.disabled_reason.as_deref() == Some("restricted profile")
+        }));
+        runtime.shutdown().await.expect("shutdown");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn desktop_discovers_and_executes_implement_skill_as_an_agent_command() {
+        let sampling = MockInferenceServer::start()
+            .await
+            .expect("sampling provider");
+        let root = TempDir::new().expect("root");
+        let workspace = root.path().join("workspace");
+        let skills = root.path().join("skills");
+        let implement = skills.join("implement");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        std::fs::create_dir_all(&implement).expect("implement skill directory");
+        std::fs::write(
+            implement.join("SKILL.md"),
+            r#"---
+name: implement
+description: Implement a requested software change completely.
+argument-hint: change request
+---
+IMPLEMENT_SKILL_BODY: implement $ARGUMENTS and verify it.
+"#,
+        )
+        .expect("implement skill");
+
+        let (runtime, _) = Runtime::builder(runtime_config(&root, sampling.url()))
+            .profile(RuntimeProfile::Desktop)
+            .skill_paths([skills])
+            .start()
+            .await
+            .expect("desktop runtime");
+        let session = runtime
+            .create_session(session_config(workspace))
+            .await
+            .expect("session");
+        let commands = runtime
+            .list_agent_commands(&session)
+            .await
+            .expect("live command catalog");
+        let implement = commands
+            .iter()
+            .find(|command| command.name == "implement")
+            .expect("implement skill is advertised");
+        assert_eq!(implement.input_hint.as_deref(), Some("change request"));
+        assert!(commands.iter().any(|command| command.name == "loop"));
+        assert!(
+            runtime
+                .execute_agent_command(&session, "unknown-turn", "not-a-command", None)
+                .await
+                .is_err(),
+            "command execution must be allowlisted against the live catalog"
+        );
+        runtime
+            .execute_agent_command(&session, "implement-turn", "implement", Some("feature-x"))
+            .await
+            .expect("implement command turn");
+        assert!(sampling.requests().iter().any(|request| {
+            request.body.as_ref().is_some_and(|body| {
+                let body = body.to_string();
+                body.contains("IMPLEMENT_SKILL_BODY") && body.contains("feature-x")
+            })
+        }));
+        runtime.shutdown().await.expect("shutdown");
+
+        let restricted_root = TempDir::new().expect("restricted root");
+        let restricted_workspace = restricted_root.path().join("workspace");
+        std::fs::create_dir(&restricted_workspace).expect("restricted workspace");
+        let (restricted, _) = Runtime::builder(runtime_config(&restricted_root, sampling.url()))
+            .skill_paths([root.path().join("skills")])
+            .start()
+            .await
+            .expect("restricted runtime");
+        let restricted_session = restricted
+            .create_session(session_config(restricted_workspace))
+            .await
+            .expect("restricted session");
+        assert!(
+            restricted
+                .list_agent_commands(&restricted_session)
+                .await
+                .is_err()
+        );
+        restricted.shutdown().await.expect("restricted shutdown");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn session_system_prompt_and_rules_reach_the_real_agent_prompt_builder() {
+        let sampling = MockInferenceServer::start()
+            .await
+            .expect("sampling provider");
+        let root = TempDir::new().expect("root");
+        let workspace = root.path().join("workspace");
+        std::fs::create_dir(&workspace).expect("workspace");
+        let (runtime, _) = Runtime::start(runtime_config(&root, sampling.url()))
+            .await
+            .expect("runtime");
+
+        let mut override_config = session_config(workspace.clone());
+        override_config.system_prompt = Some("SDK_SYSTEM_OVERRIDE".into());
+        let override_session = runtime
+            .create_session(override_config)
+            .await
+            .expect("override session");
+        runtime
+            .prompt(&override_session, "override-turn", "override-marker")
+            .await
+            .expect("override turn");
+        let override_body = request_with_user_marker(&sampling, "override-marker");
+        assert!(
+            override_body["messages"][0]["content"]
+                .as_str()
+                .is_some_and(|prompt| prompt.starts_with("SDK_SYSTEM_OVERRIDE"))
+        );
+
+        let mut rules_config = session_config(workspace);
+        rules_config.rules = Some("SDK_RULES_MARKER: never omit verification.".into());
+        let rules_session = runtime
+            .create_session(rules_config)
+            .await
+            .expect("rules session");
+        runtime
+            .prompt(&rules_session, "rules-turn", "rules-marker")
+            .await
+            .expect("rules turn");
+        let rules_body = request_with_user_marker(&sampling, "rules-marker");
+        let rules_prompt = rules_body["messages"][0]["content"]
+            .as_str()
+            .expect("rules system prompt");
+        assert!(rules_prompt.contains("<human_rules>"));
+        assert!(rules_prompt.contains("SDK_RULES_MARKER"));
+
+        let mut blank = session_config(root.path().to_path_buf());
+        blank.system_prompt = Some("  ".into());
+        assert!(matches!(
+            runtime.create_session(blank).await,
+            Err(Error::InvalidConfig(_))
+        ));
+        runtime.shutdown().await.expect("shutdown");
+    }
+
+    /// Opt-in real gateway verification. No credential or response body is
+    /// logged; run explicitly with `OG_AI_GATEWAY` and `OG_API_KEY` set.
+    #[ignore = "requires the live OriginGame gateway and incurs a model request"]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn live_gateway_model_calls_sdk_owned_mcp_and_journals_the_turn() {
+        let endpoint = std::env::var("OG_AI_GATEWAY")
+            .expect("OG_AI_GATEWAY")
+            .trim_end_matches('/')
+            .to_owned()
+            + "/v1";
+        let api_key = std::env::var("OG_API_KEY").expect("OG_API_KEY");
+        let root = TempDir::new().expect("root");
+        let workspace = root.path().join("workspace");
+        std::fs::create_dir(&workspace).expect("workspace");
+        let called = Arc::new(AtomicBool::new(false));
+        let config = RuntimeConfig {
+            endpoint,
+            api_key,
+            grok_home: root.path().join("grok"),
+            session_storage: root.path().join("sessions"),
+            models: vec![ModelSpec {
+                id: "grok-4.5".into(),
+                context_window: 131_072,
+                api_backend: ApiBackend::ChatCompletions,
+                supports_reasoning: false,
+                default_reasoning: None,
+                reasoning_options: Vec::new(),
+            }],
+        };
+        let (runtime, _) = Runtime::builder(config)
+            .profile(RuntimeProfile::Desktop)
+            .yolo_mode(true)
+            .in_process_mcp_servers([InProcessMcpServer::new(
+                "live-sdk-fixture",
+                "live-fixture-id",
+                Arc::new(LiveGatewayMcpFixture {
+                    called: called.clone(),
+                }),
+            )])
+            .start()
+            .await
+            .expect("live runtime");
+        let session = runtime
+            .create_session(SessionConfig {
+                cwd: workspace,
+                model: "grok-4.5".into(),
+                reasoning: None,
+                system_prompt: None,
+                rules: Some(
+                    "When explicitly told to verify the gateway, call the supplied MCP tool before answering."
+                        .into(),
+                ),
+            })
+            .await
+            .expect("live session");
+        let receipt = tokio::time::timeout(
+            std::time::Duration::from_secs(120),
+            runtime.prompt(
+                &session,
+                "live-gateway-turn",
+                "Call the gateway_probe tool with code LIVE_GATEWAY_E2E. Only after the tool returns, answer LIVE_MCP_TOOL_OK.",
+            ),
+        )
+        .await
+        .expect("live gateway timeout")
+        .expect("live gateway turn");
+        assert_eq!(receipt.outcome, TurnOutcome::End);
+        assert!(
+            called.load(Ordering::Acquire),
+            "the real model did not call MCP"
+        );
+        let journal = runtime
+            .events_after(&session, 0)
+            .await
+            .expect("live journal");
+        assert!(
+            journal
+                .iter()
+                .any(|event| matches!(event.update, EventUpdate::ToolStart(_)))
+        );
+        assert_eq!(
+            journal.last().map(|event| event.sequence),
+            Some(receipt.final_sequence)
+        );
+        runtime.shutdown().await.expect("live runtime shutdown");
+    }
+
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn desktop_starts_explicit_stdio_mcp_and_restricted_does_not() {
@@ -1963,16 +5499,33 @@ mod tests {
 while IFS= read -r line; do
   id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
   case "$line" in
-    *'"method":"initialize"'*)
-      version=$(printf '%s' "$line" | sed -n 's/.*"protocolVersion":"\([^"]*\)".*/\1/p')
-      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"%s","capabilities":{"tools":{}},"serverInfo":{"name":"origin-runtime-test","version":"1"}}}\n' "$id" "$version"
+    *'"method":"server/discover"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{"tools":{},"resources":{},"prompts":{},"completions":{}},"ttlMs":0,"cacheScope":"private","_meta":{"io.modelcontextprotocol/serverInfo":{"name":"origin-runtime-test","version":"1"}}}}\n' "$id"
       ;;
     *'"method":"tools/list"'*)
       : > "$MCP_MARKER"
       printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"echo","description":"echo","inputSchema":{"type":"object"}}]}}\n' "$id"
       ;;
     *'"method":"tools/call"'*)
-      printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"ok"}],"isError":false}}\n' "$id"
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"ok","annotations":{"audience":["user"]}}],"structuredContent":{"fixture":true},"isError":false,"_meta":{"trace":"fixture"}}}\n' "$id"
+      ;;
+    *'"method":"resources/read"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"contents":[{"uri":"fixture://readme","mimeType":"text/plain","text":"fixture resource","_meta":{"revision":1}}]}}\n' "$id"
+      ;;
+    *'"method":"resources/list"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"resources":[{"uri":"fixture://readme","name":"readme"}]}}\n' "$id"
+      ;;
+    *'"method":"resources/templates/list"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"resourceTemplates":[{"uriTemplate":"fixture://{name}","name":"named"}]}}\n' "$id"
+      ;;
+    *'"method":"prompts/list"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"prompts":[{"name":"welcome","description":"welcome"}]}}\n' "$id"
+      ;;
+    *'"method":"prompts/get"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"messages":[{"role":"user","content":{"type":"text","text":"hello"}}]}}\n' "$id"
+      ;;
+    *'"method":"completion/complete"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"completion":{"values":["alpha"],"total":1,"hasMore":false}}}\n' "$id"
       ;;
   esac
 done
@@ -1983,7 +5536,10 @@ done
             name: "fixture".into(),
             command: "/bin/sh".into(),
             args: vec![script.to_string_lossy().into_owned()],
-            env: BTreeMap::from([("MCP_MARKER".into(), marker.to_string_lossy().into_owned())]),
+            env: BTreeMap::from([
+                ("MCP_MARKER".into(), marker.to_string_lossy().into_owned()),
+                ("MCP_SECRET".into(), "catalog-secret".into()),
+            ]),
         };
 
         let (restricted, _) = Runtime::builder(runtime_config(&root, sampling.url()))
@@ -1997,6 +5553,13 @@ done
             .expect("restricted session starts");
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
         assert!(!marker.exists(), "restricted profile must not start MCP");
+        assert!(
+            restricted
+                .list_mcp_servers(&restricted_session, false)
+                .await
+                .is_err(),
+            "restricted profile must reject typed MCP operations"
+        );
         restricted
             .close_session(restricted_session)
             .await
@@ -2006,7 +5569,7 @@ done
         let desktop_root = TempDir::new().expect("desktop root");
         let (desktop, _) = Runtime::builder(runtime_config(&desktop_root, sampling.url()))
             .profile(RuntimeProfile::Desktop)
-            .mcp_servers([mcp])
+            .mcp_servers([mcp.clone()])
             .start()
             .await
             .expect("desktop runtime starts");
@@ -2021,6 +5584,157 @@ done
         })
         .await
         .expect("MCP initialize and tools/list complete");
+
+        let catalog = desktop
+            .list_mcp_servers(&session, false)
+            .await
+            .expect("typed MCP catalog");
+        let fixture = catalog
+            .iter()
+            .find(|server| server.name == "fixture")
+            .expect("fixture in catalog");
+        assert_eq!(fixture.transport, McpTransportKind::Stdio);
+        assert_eq!(fixture.status, Some(McpServerStatus::Ready));
+        assert_eq!(fixture.tools.len(), 1);
+        assert!(
+            !serde_json::to_string(fixture)
+                .expect("catalog serializes")
+                .contains("catalog-secret"),
+            "typed catalog must not expose stdio environment values"
+        );
+
+        let tool_result = desktop
+            .call_mcp_tool(&session, "fixture", "echo", serde_json::json!({"value": 1}))
+            .await
+            .expect("direct MCP call");
+        assert!(matches!(
+            &tool_result.content[0],
+            McpContent::Text { text, raw }
+                if text == "ok" && raw["annotations"]["audience"][0] == "user"
+        ));
+        assert_eq!(tool_result.structured_content.unwrap()["fixture"], true);
+        assert_eq!(tool_result.meta.unwrap()["trace"], "fixture");
+
+        let resource = desktop
+            .read_mcp_resource(&session, "fixture", "fixture://readme")
+            .await
+            .expect("direct MCP resource read");
+        assert_eq!(
+            resource.contents[0].text.as_deref(),
+            Some("fixture resource")
+        );
+        assert_eq!(resource.contents[0].raw["_meta"]["revision"], 1);
+
+        desktop
+            .set_mcp_tool_enabled(&session, "fixture", "echo", false)
+            .await
+            .expect("disable MCP tool in session");
+        let tools = desktop
+            .list_mcp_tools(&session, Some("fixture"))
+            .await
+            .expect("list disabled tool");
+        assert_eq!(tools.len(), 1);
+        assert!(!tools[0].enabled);
+        desktop
+            .set_mcp_tool_enabled(&session, "fixture", "echo", true)
+            .await
+            .expect("re-enable MCP tool in session");
+
+        desktop
+            .set_mcp_server_enabled(&session, "fixture", false)
+            .await
+            .expect("disable MCP server in session");
+        assert!(
+            desktop
+                .call_mcp_tool(&session, "fixture", "echo", serde_json::json!({}))
+                .await
+                .is_err(),
+            "disabled MCP server must not be callable"
+        );
+        desktop
+            .set_mcp_server_enabled(&session, "fixture", true)
+            .await
+            .expect("re-enable MCP server in session");
+        desktop
+            .call_mcp_tool(&session, "fixture", "echo", serde_json::json!({}))
+            .await
+            .expect("re-enabled MCP server is callable");
+
+        let removed = desktop
+            .replace_mcp_servers(&session, Vec::new())
+            .await
+            .expect("remove session MCP servers atomically");
+        assert_eq!(removed.count, 0);
+        assert!(
+            desktop
+                .call_mcp_tool(&session, "fixture", "echo", serde_json::json!({}))
+                .await
+                .is_err(),
+            "removed MCP server must not be callable"
+        );
+        let replaced = desktop
+            .replace_mcp_servers(&session, vec![mcp])
+            .await
+            .expect("restore session MCP servers atomically");
+        assert_eq!(replaced.names, vec!["fixture"]);
+        desktop
+            .call_mcp_tool(&session, "fixture", "echo", serde_json::json!({}))
+            .await
+            .expect("replacement MCP server is callable");
+
+        let scheduled = desktop
+            .upsert_scheduled_task(
+                &session,
+                &ScheduledTaskRequest {
+                    task_id: None,
+                    interval: Some("5m".into()),
+                    prompt: Some("inspect the fixture".into()),
+                    recurring: true,
+                    durable: Some(false),
+                    foreground: Some(false),
+                    fire_immediately: false,
+                },
+            )
+            .await
+            .expect("create scheduled loop without a model turn");
+        assert!(!scheduled.updated);
+        assert_eq!(scheduled.task.interval_seconds, 300);
+        let tasks = desktop
+            .list_scheduled_tasks(&session)
+            .await
+            .expect("list scheduled loops");
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].id, scheduled.task.id);
+        let updated = desktop
+            .upsert_scheduled_task(
+                &session,
+                &ScheduledTaskRequest {
+                    task_id: Some(scheduled.task.id.clone()),
+                    interval: Some("10m".into()),
+                    prompt: Some("inspect the updated fixture".into()),
+                    recurring: true,
+                    durable: None,
+                    foreground: None,
+                    fire_immediately: false,
+                },
+            )
+            .await
+            .expect("update scheduled loop in place");
+        assert!(updated.updated);
+        assert_eq!(updated.task.interval_seconds, 600);
+        assert_eq!(updated.task.id, scheduled.task.id);
+        let deleted = desktop
+            .delete_scheduled_task(&session, &scheduled.task.id)
+            .await
+            .expect("delete scheduled loop");
+        assert!(deleted.deleted);
+        assert!(
+            desktop
+                .list_scheduled_tasks(&session)
+                .await
+                .expect("list after delete")
+                .is_empty()
+        );
         desktop
             .close_session(session)
             .await
@@ -2118,7 +5832,7 @@ done
             .expect("restricted runtime starts");
         let restricted_image = restricted
             .capabilities()
-            .extension_families
+            .features
             .into_iter()
             .find(|capability| capability.namespace == "feature:image_generation")
             .expect("image capability");
@@ -2160,7 +5874,7 @@ done
             .expect("desktop runtime starts");
         let image_capability = runtime
             .capabilities()
-            .extension_families
+            .features
             .into_iter()
             .find(|capability| capability.namespace == "feature:image_generation")
             .expect("image capability");
@@ -2349,6 +6063,11 @@ done
             .await
             .expect_err("Restricted generic extension transport must fail closed");
         assert!(matches!(extension_error, Error::Operation(_)));
+        let scheduler_error = runtime
+            .list_scheduled_tasks(&session)
+            .await
+            .expect_err("Restricted typed scheduler transport must fail closed");
+        assert!(matches!(scheduler_error, Error::Operation(_)));
         assert!(!workspace.join("extension.txt").exists());
         runtime.shutdown().await.expect("runtime shuts down");
     }
@@ -2523,20 +6242,18 @@ done
         assert!(matches!(restricted_plugins, Error::Operation(_)));
         let restricted_caps = restricted.capabilities();
         assert_eq!(restricted_caps.profile, RuntimeProfile::Restricted);
-        assert!(!restricted_caps.generic_extension_transport);
-        assert!(restricted_caps.extension_families.iter().any(|capability| {
+        assert!(restricted_caps.features.iter().any(|capability| {
             capability.namespace == "feature:app_deployment"
                 && !capability.enabled
                 && capability.disabled_reason.as_deref()
                     == Some("App Builder deployment is not implemented in this source checkout")
         }));
-        assert!(restricted_caps.extension_families.iter().any(|capability| {
-            capability.namespace == "x.ai/plugins"
+        assert!(restricted_caps.features.iter().any(|capability| {
+            capability.namespace == "sdk:mcp"
                 && !capability.enabled
-                && capability.disabled_reason.as_deref()
-                    == Some("generic extensions require the Desktop profile")
+                && capability.disabled_reason.as_deref() == Some("restricted profile")
         }));
-        assert!(restricted_caps.extension_families.iter().any(|capability| {
+        assert!(restricted_caps.features.iter().any(|capability| {
             capability.namespace == "feature:plugins"
                 && !capability.enabled
                 && capability.disabled_reason.as_deref() == Some("restricted profile")
@@ -2591,16 +6308,9 @@ done
             Error::Protocol { code: -32601, ref data, .. }
                 if data.as_str().is_some_and(|message| message.contains("x.ai/future/not-yet-implemented"))
         ));
-        desktop
-            .notify_extension(ExtensionNotification {
-                method: "x.ai/yolo_mode_changed".into(),
-                params: serde_json::json!({"yolo_mode":true}),
-            })
-            .await
-            .expect("extension notification reaches the agent");
         let desktop_caps = desktop.capabilities();
         assert_eq!(desktop_caps.profile, RuntimeProfile::Desktop);
-        assert!(desktop_caps.extension_families.iter().any(|capability| {
+        assert!(desktop_caps.features.iter().any(|capability| {
             capability.namespace == "feature:managed_mcp"
                 && !capability.enabled
                 && capability
@@ -2609,7 +6319,7 @@ done
                     .is_some_and(|reason| reason.contains("account-product service"))
         }));
         assert!(
-            desktop_caps.extension_families.iter().any(|capability| {
+            desktop_caps.features.iter().any(|capability| {
                 capability.namespace == "feature:plugins" && capability.enabled
             })
         );
@@ -2671,6 +6381,8 @@ done
                 cwd: workspace.clone(),
                 model: "test-model".into(),
                 reasoning: None,
+                system_prompt: None,
+                rules: None,
             })
             .await
             .expect("session starts");
@@ -2998,6 +6710,8 @@ done
                 cwd: workspace,
                 model: "fast-route".into(),
                 reasoning: Some("high".into()),
+                system_prompt: None,
+                rules: None,
             })
             .await
             .expect("session starts");

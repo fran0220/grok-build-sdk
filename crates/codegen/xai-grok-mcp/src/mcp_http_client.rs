@@ -2,9 +2,8 @@
 //! backoff, working around rmcp's zero-backoff reconnect loop: when an
 //! established SSE stream errors, rmcp re-issues the `GET` immediately with
 //! its retry counter reset to 0, never consulting its `SseRetryPolicy`
-//! (only connect failures and graceful EOF consult it). We ship rmcp 2.1;
-//! still unfixed upstream as of rmcp 2.1.0:
-//! <https://github.com/modelcontextprotocol/rust-sdk/blob/rmcp-v2.1.0/crates/rmcp/src/transport/common/client_side_sse.rs#L250-L261>
+//! (only connect failures and graceful EOF consult it). This wrapper is retained
+//! with rmcp 3.1 because rapid stream-error reconnects still need throttling.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -169,7 +168,7 @@ impl<C: StreamableHttpClient + Sync> StreamableHttpClient for McpHttpClient<C> {
     async fn get_stream(
         &self,
         uri: Arc<str>,
-        session_id: Arc<str>,
+        session_id: Option<Arc<str>>,
         last_event_id: Option<String>,
         auth_token: Option<String>,
         custom_headers: HashMap<HeaderName, HeaderValue>,
@@ -367,7 +366,7 @@ mod tests {
         async fn get_stream(
             &self,
             _uri: Arc<str>,
-            _session_id: Arc<str>,
+            _session_id: Option<Arc<str>>,
             _last_event_id: Option<String>,
             _auth_token: Option<String>,
             _custom_headers: HashMap<HeaderName, HeaderValue>,
@@ -446,7 +445,7 @@ mod tests {
         let stream = client
             .get_stream(
                 "http://mock".into(),
-                "session".into(),
+                Some("session".into()),
                 None,
                 None,
                 HashMap::new(),

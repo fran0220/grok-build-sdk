@@ -250,6 +250,37 @@ impl SessionHandle {
         }
         rx.await.unwrap_or(Err("session actor died".to_string()))
     }
+    pub(crate) async fn upsert_scheduled_task(
+        &self,
+        request: xai_grok_tools::implementations::grok_build::scheduler::create::SchedulerCreateInput,
+    ) -> Result<
+        (
+            xai_grok_tools::implementations::grok_build::scheduler::types::ScheduledTask,
+            bool,
+        ),
+        String,
+    > {
+        let (tx, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(SessionCommand::UpsertScheduledTask {
+                request,
+                respond_to: tx,
+            })
+            .map_err(|_| "session not found".to_string())?;
+        rx.await.unwrap_or(Err("session actor died".to_string()))
+    }
+    pub(crate) async fn list_scheduled_tasks(
+        &self,
+    ) -> Result<
+        Vec<xai_grok_tools::implementations::grok_build::scheduler::types::ScheduledTask>,
+        String,
+    > {
+        let (tx, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(SessionCommand::ListScheduledTasks { respond_to: tx })
+            .map_err(|_| "session not found".to_string())?;
+        rx.await.map_err(|_| "session actor died".to_string())
+    }
     /// Returns `true` if the session has work in flight: a running turn or
     /// queued inputs (`running_task.is_some() || !pending_inputs.is_empty()`).
     ///
@@ -443,6 +474,25 @@ impl SessionHandle {
         enabled: bool,
         server_config: Option<agent_client_protocol::McpServer>,
     ) -> Result<(), agent_client_protocol::Error> {
+        self.toggle_mcp_server_with_persistence(server_name, enabled, server_config, true)
+            .await
+    }
+    pub(crate) async fn toggle_mcp_server_session_local(
+        &self,
+        server_name: String,
+        enabled: bool,
+        server_config: Option<agent_client_protocol::McpServer>,
+    ) -> Result<(), agent_client_protocol::Error> {
+        self.toggle_mcp_server_with_persistence(server_name, enabled, server_config, false)
+            .await
+    }
+    async fn toggle_mcp_server_with_persistence(
+        &self,
+        server_name: String,
+        enabled: bool,
+        server_config: Option<agent_client_protocol::McpServer>,
+        persist: bool,
+    ) -> Result<(), agent_client_protocol::Error> {
         let (tx, rx) = oneshot::channel();
         if self
             .cmd_tx
@@ -450,6 +500,7 @@ impl SessionHandle {
                 server_name,
                 enabled,
                 server_config,
+                persist,
                 respond_to: tx,
             })
             .is_err()
@@ -465,7 +516,16 @@ impl SessionHandle {
         tool_name: String,
         enabled: bool,
     ) -> Result<(), agent_client_protocol::Error> {
-        self.toggle_mcp_tool_with_source(server_name, tool_name, enabled, false)
+        self.toggle_mcp_tool_with_source(server_name, tool_name, enabled, false, true)
+            .await
+    }
+    pub(crate) async fn toggle_mcp_tool_session_local(
+        &self,
+        server_name: String,
+        tool_name: String,
+        enabled: bool,
+    ) -> Result<(), agent_client_protocol::Error> {
+        self.toggle_mcp_tool_with_source(server_name, tool_name, enabled, false, false)
             .await
     }
     pub(crate) async fn toggle_managed_gateway_tool(
@@ -474,7 +534,16 @@ impl SessionHandle {
         tool_name: String,
         enabled: bool,
     ) -> Result<(), agent_client_protocol::Error> {
-        self.toggle_mcp_tool_with_source(server_name, tool_name, enabled, true)
+        self.toggle_mcp_tool_with_source(server_name, tool_name, enabled, true, true)
+            .await
+    }
+    pub(crate) async fn toggle_managed_gateway_tool_session_local(
+        &self,
+        server_name: String,
+        tool_name: String,
+        enabled: bool,
+    ) -> Result<(), agent_client_protocol::Error> {
+        self.toggle_mcp_tool_with_source(server_name, tool_name, enabled, true, false)
             .await
     }
     async fn toggle_mcp_tool_with_source(
@@ -483,6 +552,7 @@ impl SessionHandle {
         tool_name: String,
         enabled: bool,
         is_managed_gateway: bool,
+        persist: bool,
     ) -> Result<(), agent_client_protocol::Error> {
         let (tx, rx) = oneshot::channel();
         if self
@@ -492,6 +562,7 @@ impl SessionHandle {
                 tool_name,
                 enabled,
                 is_managed_gateway,
+                persist,
                 respond_to: tx,
             })
             .is_err()
@@ -566,6 +637,56 @@ impl SessionHandle {
         {
             return Err("session closed".to_string());
         }
+        rx.await
+            .unwrap_or_else(|_| Err("session closed".to_string()))
+    }
+    pub(crate) async fn mcp_primitive(
+        &self,
+        server_name: String,
+        operation: crate::extensions::mcp::McpPrimitiveOperation,
+    ) -> Result<serde_json::Value, String> {
+        let (tx, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(SessionCommand::McpPrimitive {
+                server_name,
+                operation,
+                respond_to: tx,
+            })
+            .map_err(|_| "session closed".to_string())?;
+        rx.await
+            .unwrap_or_else(|_| Err("session closed".to_string()))
+    }
+    pub(crate) async fn mcp_modern_operation(
+        &self,
+        server_name: String,
+        operation: crate::extensions::mcp::McpModernOperation,
+    ) -> Result<serde_json::Value, String> {
+        let (tx, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(SessionCommand::McpModernOperation {
+                server_name,
+                operation,
+                respond_to: tx,
+            })
+            .map_err(|_| "session closed".to_string())?;
+        rx.await
+            .unwrap_or_else(|_| Err("session closed".to_string()))
+    }
+    pub(crate) async fn mcp_modern_subscribe(
+        &self,
+        server_name: String,
+        filter: crate::extensions::mcp::McpModernSubscriptionFilter,
+        capacity: std::num::NonZeroUsize,
+    ) -> Result<crate::extensions::mcp::McpModernSubscription, String> {
+        let (tx, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(SessionCommand::McpModernSubscribe {
+                server_name,
+                filter,
+                capacity,
+                respond_to: tx,
+            })
+            .map_err(|_| "session closed".to_string())?;
         rx.await
             .unwrap_or_else(|_| Err("session closed".to_string()))
     }

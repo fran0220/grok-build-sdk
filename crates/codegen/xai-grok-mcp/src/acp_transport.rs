@@ -1,20 +1,15 @@
-//! rmcp transport bridge over the ACP reverse channel.
+//! rmcp request/response transport for process-local and ACP-hosted MCP servers.
 //!
 //! In-process SDK MCP servers (the official `grok-agent-sdk`'s `@tool` /
 //! `create_sdk_mcp_server`) run in the SDK-host process, not behind a socket. The
-//! agent reaches them by sending each MCP JSON-RPC message to the client as a
-//! reverse `x.ai/mcp/sdk_call` request and feeding the response back. This module
-//! adapts that request/response channel into an rmcp transport so an in-process
-//! server reuses the same `RunningService` / tool-dispatch path as HTTP/stdio
-//! servers for tool calls.
+//! The embedded SDK path invokes its handler directly in-process. The CLI adapter
+//! can use the same transport with its reverse `x.ai/mcp/sdk_call` channel. Both
+//! reuse the same `RunningService` / tool-dispatch path as HTTP/stdio servers.
 //!
-//! Half-duplex (v1 limitation): the bridge carries ONLY client→server requests and
-//! their responses. Server→client traffic is NOT bridged — neither notifications
-//! (`notifications/*`) nor server-initiated requests such as
-//! `sampling/createMessage`, `roots/list`, or elicitation are delivered. Tools that
-//! depend on those features will not work over this transport yet. The duplex
-//! plumbing below exists to decouple slow tool calls (one task per request), not to
-//! deliver a second message direction.
+//! The embedded path is full-duplex: in addition to request responses it carries
+//! bounded server→client notifications used by MCP 2026 subscriptions and Tasks.
+//! It intentionally does not expose a generic server→client request peer; modern
+//! roots, sampling, and elicitation are represented as MRTR input requests.
 //!
 //! The invoker is abstract ([`AcpReverseInvoker`]) so this crate stays free of the
 //! ACP gateway types; the host (shell) supplies an impl backed by its gateway.
@@ -38,12 +33,131 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, DuplexStream};
 /// threaded in from the bridge so zero-IPC and loopback share one tool budget.
 #[async_trait::async_trait]
 pub trait AcpReverseInvoker: Send + Sync + 'static {
+    /// Attach the server→client side of a process-local MCP connection. The
+    /// default keeps the legacy ACP adapter request/response-only; embedded SDK
+    /// invokers override it to support MCP 2026 subscriptions and push events.
+    async fn connect(
+        &self,
+        _server_id: &str,
+        _outbound: tokio::sync::mpsc::Sender<Value>,
+        _timeout: Duration,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
     async fn invoke(
         &self,
         server_id: &str,
         message: Value,
         timeout: Duration,
     ) -> Result<Value, String>;
+}
+
+/// Direct, process-local MCP message dispatcher used by embedded SDK hosts.
+/// Unlike [`AcpReverseInvoker`], this boundary carries the owning session and
+/// does not require an ACP reverse request or any serialized control-plane hop.
+#[async_trait::async_trait]
+pub trait EmbeddedMcpInvoker: Send + Sync + 'static {
+    /// Runtime-wide typed client-role services used for modern MRTR. These
+    /// services apply to stdio and HTTP clients as well as embedded servers;
+    /// the invoker is only the process-local carrier into the session actor.
+    fn host_services(&self) -> Option<crate::servers::McpHostServices> {
+        None
+    }
+
+    /// Establish an immutable actor binding before the first MCP message is
+    /// dispatched. Implementations use the returned token to distinguish a
+    /// replacement actor from a stale actor with the same durable session ID.
+    fn bind_session(&self, _session_id: &str) -> u64 {
+        0
+    }
+
+    /// Release a binding when the actor-owned transport is dropped. A stale
+    /// binding must not be able to revoke a newer replacement binding.
+    fn unbind_session(&self, _session_id: &str, _binding_id: u64) {}
+
+    async fn connect(
+        &self,
+        _session_id: &str,
+        _binding_id: u64,
+        _server_id: &str,
+        _outbound: tokio::sync::mpsc::Sender<Value>,
+        _timeout: Duration,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
+    async fn invoke(
+        &self,
+        session_id: &str,
+        binding_id: u64,
+        server_id: &str,
+        message: Value,
+        timeout: Duration,
+    ) -> Result<Value, String>;
+}
+
+struct SessionBoundInvoker {
+    session_id: String,
+    binding_id: u64,
+    inner: Arc<dyn EmbeddedMcpInvoker>,
+}
+
+#[async_trait::async_trait]
+impl AcpReverseInvoker for SessionBoundInvoker {
+    async fn connect(
+        &self,
+        server_id: &str,
+        outbound: tokio::sync::mpsc::Sender<Value>,
+        timeout: Duration,
+    ) -> Result<(), String> {
+        self.inner
+            .connect(
+                &self.session_id,
+                self.binding_id,
+                server_id,
+                outbound,
+                timeout,
+            )
+            .await
+    }
+
+    async fn invoke(
+        &self,
+        server_id: &str,
+        message: Value,
+        timeout: Duration,
+    ) -> Result<Value, String> {
+        self.inner
+            .invoke(
+                &self.session_id,
+                self.binding_id,
+                server_id,
+                message,
+                timeout,
+            )
+            .await
+    }
+}
+
+impl Drop for SessionBoundInvoker {
+    fn drop(&mut self) {
+        self.inner.unbind_session(&self.session_id, self.binding_id);
+    }
+}
+
+/// Bind a direct embedded dispatcher to one immutable session identity so it
+/// can reuse the common rmcp async read/write transport.
+pub fn bind_embedded_invoker(
+    session_id: String,
+    invoker: Arc<dyn EmbeddedMcpInvoker>,
+) -> Arc<dyn AcpReverseInvoker> {
+    let binding_id = invoker.bind_session(&session_id);
+    Arc::new(SessionBoundInvoker {
+        session_id,
+        binding_id,
+        inner: invoker,
+    })
 }
 
 /// rmcp transport for an in-process server reached over ACP reverse-RPC.
@@ -58,6 +172,10 @@ const BRIDGE_BUF: usize = 256 * 1024;
 /// own in-flight concurrency), so this small buffer gives backpressure/defensiveness
 /// without ever realistically blocking a producer.
 const RESPONSE_CHANNEL_CAP: usize = 128;
+
+/// Bounded server-push capacity. A handler that produces faster than rmcp can
+/// consume is backpressured instead of growing an unbounded process queue.
+const PUSH_CHANNEL_CAP: usize = 128;
 
 /// JSON-RPC "Internal error" code, used for every error this bridge synthesizes.
 const INTERNAL_ERROR_CODE: i64 = -32603;
@@ -101,7 +219,12 @@ async fn pump(
     server_to_client: DuplexStream,
 ) {
     let (responses_tx, responses_rx) = tokio::sync::mpsc::channel::<String>(RESPONSE_CHANNEL_CAP);
-    let writer = write_responses(server_to_client, responses_rx);
+    let (push_tx, push_rx) = tokio::sync::mpsc::channel::<Value>(PUSH_CHANNEL_CAP);
+    if let Err(error) = invoker.connect(&server_id, push_tx, invoke_timeout).await {
+        tracing::warn!(%error, "embedded MCP bridge: failed to attach outbound peer");
+        return;
+    }
+    let writer = write_server_messages(server_to_client, responses_rx, push_rx);
     let reader = read_requests(
         server_id,
         invoker,
@@ -109,8 +232,15 @@ async fn pump(
         client_to_server,
         responses_tx,
     );
-    // `writer` then drains and exits once `reader` returns and closes the channel.
-    tokio::join!(reader, writer);
+    tokio::pin!(reader);
+    tokio::pin!(writer);
+    // Either half closing tears down the whole connection. In particular, do
+    // not wait for every retained outbound peer to drop after rmcp closes its
+    // read side: that would keep the session binding alive indefinitely.
+    tokio::select! {
+        _ = &mut reader => {}
+        _ = &mut writer => {}
+    }
 }
 
 /// Read each client→server line and dispatch its request on a fresh task.
@@ -158,16 +288,12 @@ async fn read_requests(
                 continue;
             }
         };
-        // An id-less message is a notification (no response). The SDK peer rejects reverse
-        // `x.ai/mcp/sdk_call`s without a JSON-RPC id, so id-less messages (e.g. rmcp's
-        // `notifications/initialized` on every handshake) are logged and discarded locally
-        // rather than spawning a doomed round-trip. Safe only because the SDK `Server` is
-        // lenient about never receiving `initialized` (a documented v1 limit).
+        // Notifications have no transport response, but ordering still matters.
+        // Dispatch them inline so a following request cannot overtake them.
         let Some(id) = message.get("id").filter(|id| !id.is_null()).cloned() else {
-            tracing::debug!(
-                %message,
-                "acp mcp bridge: discarding id-less notification (half-duplex v1)"
-            );
+            if let Err(err) = invoker.invoke(&server_id, message, invoke_timeout).await {
+                tracing::warn!(%err, "acp mcp bridge: notification delivery failed");
+            }
             continue;
         };
         let invoker = invoker.clone();
@@ -176,7 +302,7 @@ async fn read_requests(
         invokes.spawn(async move {
             let result = invoker.invoke(&server_id, message, invoke_timeout).await;
             let response = match result {
-                Ok(response) => with_id(response, id),
+                Ok(response) => validate_response_id(response, id),
                 Err(err) => json_rpc_error(id, INTERNAL_ERROR_CODE, &err),
             };
             match serde_json::to_string(&response) {
@@ -191,11 +317,35 @@ async fn read_requests(
 }
 
 /// Serialize every server→client response onto the duplex through a single writer.
-async fn write_responses(
+async fn write_server_messages(
     mut server_to_client: DuplexStream,
     mut responses_rx: tokio::sync::mpsc::Receiver<String>,
+    mut push_rx: tokio::sync::mpsc::Receiver<Value>,
 ) {
-    while let Some(encoded) = responses_rx.recv().await {
+    loop {
+        let encoded = tokio::select! {
+            biased;
+            response = responses_rx.recv(), if !responses_rx.is_closed() || !responses_rx.is_empty() => match response {
+                Some(response) => response,
+                None if push_rx.is_closed() => break,
+                None => continue,
+            },
+            push = push_rx.recv(), if !push_rx.is_closed() || !push_rx.is_empty() => match push {
+                Some(push) => match serde_json::to_string(&push) {
+                    Ok(mut encoded) => {
+                        encoded.push('\n');
+                        encoded
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "embedded MCP bridge: failed to serialize server push");
+                        continue;
+                    }
+                },
+                None if responses_rx.is_closed() => break,
+                None => continue,
+            },
+            else => break,
+        };
         if server_to_client
             .write_all(encoded.as_bytes())
             .await
@@ -207,22 +357,21 @@ async fn write_responses(
     }
 }
 
-/// Overwrite a JSON-RPC response object's `id` with the request id.
-///
-/// If the SDK response isn't a JSON object (so it has nowhere to carry an `id`),
-/// rmcp can't correlate it and the waiting request would otherwise stall until its
-/// timeout. In that case synthesize a properly-keyed JSON-RPC error instead, so the
-/// waiting request fails fast and correctly.
-fn with_id(mut response: Value, id: Value) -> Value {
-    match response.as_object_mut() {
-        Some(obj) => {
-            obj.insert("id".to_string(), id);
-            response
-        }
+/// Accept a server response only when it is correlated to the exact request.
+/// Synthesizing an error under the original request ID makes malformed or
+/// cross-request responses fail fast without ever laundering their identity.
+fn validate_response_id(response: Value, id: Value) -> Value {
+    match response.as_object().and_then(|object| object.get("id")) {
+        Some(response_id) if response_id == &id => response,
+        Some(_) => json_rpc_error(
+            id,
+            INTERNAL_ERROR_CODE,
+            "embedded MCP bridge: server returned a mismatched JSON-RPC response id",
+        ),
         None => json_rpc_error(
             id,
             INTERNAL_ERROR_CODE,
-            "acp mcp bridge: server returned a non-object JSON-RPC response",
+            "embedded MCP bridge: server returned a response without a JSON-RPC id",
         ),
     }
 }
@@ -239,8 +388,8 @@ fn json_rpc_error(id: Value, code: i64, message: &str) -> Value {
 mod tests {
     use super::*;
 
-    /// Invoker that echoes the request's method back as the result, or fails for a
-    /// method named "boom".
+    /// Invoker that echoes the request's method back as the result, acknowledges
+    /// notifications with JSON null, or fails for a method named "boom".
     struct EchoInvoker;
 
     #[async_trait::async_trait]
@@ -254,6 +403,9 @@ mod tests {
             let method = message.get("method").cloned().unwrap_or(Value::Null);
             if method == "boom" {
                 return Err("server exploded".to_string());
+            }
+            if message.get("id").is_none_or(Value::is_null) {
+                return Ok(Value::Null);
             }
             let id = message.get("id").cloned().unwrap_or(Value::Null);
             Ok(serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": { "method": method } }))
@@ -291,8 +443,8 @@ mod tests {
             .write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n")
             .await
             .unwrap();
-        // ...so the first line we read back is the request's response (id 1), proving
-        // the notification was silently consumed.
+        // ...so the first line we read back is the request's response (id 1). The
+        // notification is nevertheless delivered to the reverse invoker.
         to_server
             .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}\n")
             .await
@@ -301,6 +453,157 @@ mod tests {
         let response = read_line(&mut reader).await;
         assert_eq!(response["id"], 1);
         assert_eq!(response["result"]["method"], "tools/list");
+    }
+
+    #[tokio::test]
+    async fn server_push_and_request_response_share_the_full_duplex_bridge() {
+        struct PushInvoker;
+        #[async_trait::async_trait]
+        impl AcpReverseInvoker for PushInvoker {
+            async fn connect(
+                &self,
+                _server_id: &str,
+                outbound: tokio::sync::mpsc::Sender<Value>,
+                _timeout: Duration,
+            ) -> Result<(), String> {
+                outbound
+                    .send(serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "method": "notifications/tools/list_changed",
+                    }))
+                    .await
+                    .map_err(|_| "bridge closed".to_owned())
+            }
+
+            async fn invoke(
+                &self,
+                _server_id: &str,
+                message: Value,
+                _timeout: Duration,
+            ) -> Result<Value, String> {
+                Ok(serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": message["id"],
+                    "result": {"tools": []},
+                }))
+            }
+        }
+
+        let (test_write, pump_read) = tokio::io::duplex(BRIDGE_BUF);
+        let (pump_write, test_read) = tokio::io::duplex(BRIDGE_BUF);
+        tokio::spawn(pump(
+            "srv".to_owned(),
+            Arc::new(PushInvoker),
+            Duration::from_secs(60),
+            pump_read,
+            pump_write,
+        ));
+        let mut to_server = test_write;
+        let mut reader = BufReader::new(test_read);
+        to_server
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/list\"}\n")
+            .await
+            .unwrap();
+        let first = read_line(&mut reader).await;
+        let second = read_line(&mut reader).await;
+        let messages = [first, second];
+        assert!(messages.iter().any(|message| message["id"] == 3));
+        assert!(
+            messages
+                .iter()
+                .any(|message| { message["method"] == "notifications/tools/list_changed" })
+        );
+    }
+
+    #[tokio::test]
+    async fn retained_push_sender_does_not_prevent_bridge_teardown() {
+        struct RetainingInvoker(std::sync::Mutex<Option<tokio::sync::mpsc::Sender<Value>>>);
+        #[async_trait::async_trait]
+        impl AcpReverseInvoker for RetainingInvoker {
+            async fn connect(
+                &self,
+                _server_id: &str,
+                outbound: tokio::sync::mpsc::Sender<Value>,
+                _timeout: Duration,
+            ) -> Result<(), String> {
+                *self.0.lock().unwrap() = Some(outbound);
+                Ok(())
+            }
+
+            async fn invoke(
+                &self,
+                _server_id: &str,
+                _message: Value,
+                _timeout: Duration,
+            ) -> Result<Value, String> {
+                Ok(Value::Null)
+            }
+        }
+
+        let invoker = Arc::new(RetainingInvoker(std::sync::Mutex::new(None)));
+        let (test_write, pump_read) = tokio::io::duplex(BRIDGE_BUF);
+        let (pump_write, test_read) = tokio::io::duplex(BRIDGE_BUF);
+        let handle = tokio::spawn(pump(
+            "srv".to_owned(),
+            invoker,
+            Duration::from_secs(60),
+            pump_read,
+            pump_write,
+        ));
+        drop(test_write);
+        drop(test_read);
+        tokio::time::timeout(Duration::from_secs(1), handle)
+            .await
+            .expect("retained push sender must not retain the bridge")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn initialized_notification_is_delivered_before_the_next_request() {
+        struct StatefulInvoker(std::sync::atomic::AtomicBool);
+        #[async_trait::async_trait]
+        impl AcpReverseInvoker for StatefulInvoker {
+            async fn invoke(
+                &self,
+                _server_id: &str,
+                message: Value,
+                _timeout: Duration,
+            ) -> Result<Value, String> {
+                let method = message["method"].as_str().unwrap_or_default();
+                if method == "notifications/initialized" {
+                    self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+                    return Ok(Value::Null);
+                }
+                let id = message["id"].clone();
+                if method == "tools/list" && !self.0.load(std::sync::atomic::Ordering::SeqCst) {
+                    return Ok(json_rpc_error(id, -32002, "server is not initialized"));
+                }
+                Ok(serde_json::json!({"jsonrpc":"2.0","id":id,"result":{"tools":[]}}))
+            }
+        }
+
+        let (test_write, pump_read) = tokio::io::duplex(BRIDGE_BUF);
+        let (pump_write, test_read) = tokio::io::duplex(BRIDGE_BUF);
+        tokio::spawn(pump(
+            "srv".to_string(),
+            Arc::new(StatefulInvoker(std::sync::atomic::AtomicBool::new(false))),
+            Duration::from_secs(60),
+            pump_read,
+            pump_write,
+        ));
+        let mut to_server = test_write;
+        let mut reader = BufReader::new(test_read);
+
+        to_server
+            .write_all(
+                b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}\n",
+            )
+            .await
+            .unwrap();
+
+        let response = read_line(&mut reader).await;
+        assert_eq!(response["id"], 1);
+        assert_eq!(response["result"]["tools"], serde_json::json!([]));
     }
 
     /// A slow request must not block a later fast one: the fast response comes back
@@ -477,6 +780,48 @@ mod tests {
         assert_eq!(response["error"]["code"], -32603);
     }
 
+    #[tokio::test]
+    async fn mismatched_response_id_is_rejected_instead_of_rewritten() {
+        struct MismatchedIdInvoker;
+        #[async_trait::async_trait]
+        impl AcpReverseInvoker for MismatchedIdInvoker {
+            async fn invoke(
+                &self,
+                _server_id: &str,
+                _message: Value,
+                _timeout: Duration,
+            ) -> Result<Value, String> {
+                Ok(serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 999,
+                    "result": {"mustNotBeDelivered": true},
+                }))
+            }
+        }
+
+        let (test_write, pump_read) = tokio::io::duplex(BRIDGE_BUF);
+        let (pump_write, test_read) = tokio::io::duplex(BRIDGE_BUF);
+        tokio::spawn(pump(
+            "srv".to_string(),
+            Arc::new(MismatchedIdInvoker),
+            Duration::from_secs(60),
+            pump_read,
+            pump_write,
+        ));
+        let mut to_server = test_write;
+        let mut reader = BufReader::new(test_read);
+
+        to_server
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":10,\"method\":\"tools/list\"}\n")
+            .await
+            .unwrap();
+
+        let response = read_line(&mut reader).await;
+        assert_eq!(response["id"], 10);
+        assert_eq!(response["error"]["code"], -32603);
+        assert!(response.get("result").is_none());
+    }
+
     /// The configured per-server timeout (not a hardcoded constant) must reach the
     /// invoker for every reverse call, so the zero-IPC path can't silently shrink a
     /// long tool's budget.
@@ -625,8 +970,8 @@ mod tests {
         );
     }
 
-    /// A mock SDK MCP **server** behind the reverse channel. It speaks just enough
-    /// real MCP to satisfy an rmcp client: the `initialize` handshake, a `tools/list`
+    /// A mock SDK MCP **server** behind the callback channel. It speaks just enough
+    /// real MCP to satisfy an rmcp client: modern discovery, a `tools/list`
     /// advertising one `echo` tool, and a `tools/call` that echoes its text argument.
     /// Each `invoke` receives one JSON-RPC request and returns one JSON-RPC response
     /// (the bridge overwrites the `id`), mirroring the real on-wire shapes.
@@ -646,11 +991,15 @@ mod tests {
                 .and_then(|m| m.as_str())
                 .unwrap_or_default();
             let result = match method {
-                "initialize" => serde_json::json!({
-                    // Echo the client's protocol version so the handshake is always compatible.
-                    "protocolVersion": message["params"]["protocolVersion"],
+                "server/discover" => serde_json::json!({
+                    "resultType": "complete",
+                    "supportedVersions": ["2026-07-28"],
                     "capabilities": { "tools": {} },
-                    "serverInfo": { "name": "mock-sdk-server", "version": "0.0.0" },
+                    "ttlMs": 0,
+                    "cacheScope": "private",
+                    "_meta": {"io.modelcontextprotocol/serverInfo": {
+                        "name": "mock-sdk-server", "version": "0.0.0"
+                    }},
                 }),
                 "tools/list" => serde_json::json!({
                     "tools": [{
@@ -680,14 +1029,13 @@ mod tests {
 
     /// End-to-end: drive a REAL `rmcp` client (`RunningService<RoleClient, _>`) through
     /// `acp_bridge_transport` against [`MockSdkServer`], proving the bridge speaks real
-    /// MCP — the full `initialize` handshake (including rmcp's id-less
-    /// `notifications/initialized`, which the bridge discards), `tools/list`, and
+    /// MCP — the modern `server/discover` handshake, `tools/list`, and
     /// `tools/call` — then a clean cancel/teardown. This is the same client path
     /// production uses in `servers.rs` (`client.serve(transport)`).
     #[tokio::test]
     async fn real_rmcp_client_handshakes_lists_and_calls_over_the_bridge() {
-        use rmcp::ServiceExt;
         use rmcp::model::{CallToolRequestParams, PaginatedRequestParams};
+        use rmcp::{ClientLifecycleMode, ClientServiceExt};
 
         let transport = acp_bridge_transport(
             "srv".to_string(),
@@ -695,12 +1043,15 @@ mod tests {
             Duration::from_secs(60),
         );
 
-        // `()` is rmcp's minimal `ClientHandler`; `serve` runs the real initialize
-        // handshake over our bridge transport and yields a live `RunningService`.
-        let client =
-            ().serve(transport)
-                .await
-                .expect("rmcp handshake over the bridge should succeed");
+        let client = ()
+            .serve_with_lifecycle(
+                transport,
+                ClientLifecycleMode::Discover {
+                    preferred_versions: vec![rmcp::model::ProtocolVersion::V_2026_07_28],
+                },
+            )
+            .await
+            .expect("rmcp discovery over the bridge should succeed");
 
         let tools = client
             .list_tools(Some(PaginatedRequestParams::default()))

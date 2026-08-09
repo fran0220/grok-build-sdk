@@ -1,8 +1,8 @@
 use crate::{
     ConversationRewindReceipt, ConversationRewindStatus, Error, Event, EventUpdate,
-    ExtensionNotification, ExtensionRequest, ExtensionResponse, LedgerTurnState, Prompt,
-    PromptBlock, PromptReceipt, RewindPoint, RuntimeCapabilities, RuntimeConfig, RuntimeOptions,
-    SessionConfig, SessionId, SessionLedger, SessionLedgerEntry, TurnOutcome,
+    ExtensionRequest, ExtensionResponse, LedgerTurnState, Prompt, PromptBlock, PromptReceipt,
+    RewindPoint, RuntimeCapabilities, RuntimeConfig, RuntimeOptions, SessionConfig, SessionId,
+    SessionLedger, SessionLedgerEntry, TurnOutcome,
 };
 use agent_client_protocol as acp;
 use agent_client_protocol::Agent as _;
@@ -18,8 +18,7 @@ use std::{
     },
 };
 use tokio::sync::{mpsc, oneshot};
-use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
-use xai_acp_lib::{AcpAgentGatewayReceiver, AcpAgentGatewaySender, LineBufferedRead};
+use xai_acp_lib::{AcpAgentGatewaySender, AcpGatewayReceiver};
 use xai_grok_shell::{
     agent::{
         config::{Config, ModelEntry, ModelEntryConfig, OriginMediaConfig},
@@ -29,8 +28,41 @@ use xai_grok_shell::{
     auth::AuthManager,
 };
 
-const BUFFER: usize = 8 * 1024 * 1024;
 const CANCEL_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+fn to_acp_mcp_server(server: &crate::McpServerConfig) -> acp::McpServer {
+    match server {
+        crate::McpServerConfig::Stdio {
+            name,
+            command,
+            args,
+            env,
+        } => acp::McpServer::Stdio(
+            acp::McpServerStdio::new(name, command)
+                .args(args.clone())
+                .env(
+                    env.iter()
+                        .map(|(k, v)| acp::EnvVariable::new(k, v))
+                        .collect(),
+                ),
+        ),
+        crate::McpServerConfig::Http { name, url, headers } => acp::McpServer::Http(
+            acp::McpServerHttp::new(name, url).headers(
+                headers
+                    .iter()
+                    .map(|(k, v)| acp::HttpHeader::new(k, v))
+                    .collect(),
+            ),
+        ),
+        crate::McpServerConfig::Sse { name, url, headers } => acp::McpServer::Sse(
+            acp::McpServerSse::new(name, url).headers(
+                headers
+                    .iter()
+                    .map(|(k, v)| acp::HttpHeader::new(k, v))
+                    .collect(),
+            ),
+        ),
+    }
+}
 type Reply<T> = oneshot::Sender<Result<T, Error>>;
 type SessionMeta = serde_json::Map<String, serde_json::Value>;
 enum Command {
@@ -40,7 +72,6 @@ enum Command {
     Prompt(SessionId, String, String, Reply<PromptReceipt>),
     PromptContent(SessionId, String, Prompt, Reply<PromptReceipt>),
     Extension(ExtensionRequest, Reply<ExtensionResponse>),
-    ExtensionNotification(ExtensionNotification, Reply<()>),
     SetMode(SessionId, String, Reply<()>),
     ListSessions(Reply<serde_json::Value>),
     EventsAfter(SessionId, u64, Reply<Vec<Event>>),
@@ -59,6 +90,20 @@ enum Command {
         Reply<ConversationRewindReceipt>,
     ),
     RewindStatus(SessionId, String, Reply<ConversationRewindStatus>),
+    ReplaceMcp(SessionId, Vec<crate::McpServerConfig>, Reply<()>),
+    McpModern(
+        SessionId,
+        String,
+        xai_grok_shell::extensions::mcp::McpModernOperation,
+        Reply<serde_json::Value>,
+    ),
+    McpSubscribe(
+        SessionId,
+        String,
+        xai_grok_shell::extensions::mcp::McpModernSubscriptionFilter,
+        std::num::NonZeroUsize,
+        Reply<xai_grok_shell::extensions::mcp::McpModernSubscription>,
+    ),
     Close(SessionId, Reply<()>),
     Unload(SessionId, Reply<()>),
     Shutdown(Reply<()>),
@@ -185,9 +230,6 @@ impl Runtime {
     pub async fn extension_request(&self, x: ExtensionRequest) -> Result<ExtensionResponse, Error> {
         self.call(|r| Command::Extension(x, r)).await
     }
-    pub async fn extension_notification(&self, x: ExtensionNotification) -> Result<(), Error> {
-        self.call(|r| Command::ExtensionNotification(x, r)).await
-    }
     pub async fn set_mode(&self, id: &SessionId, mode: String) -> Result<(), Error> {
         self.call(|r| Command::SetMode(id.clone(), mode, r)).await
     }
@@ -278,6 +320,33 @@ impl Runtime {
     pub async fn unload_session(&self, id: SessionId) -> Result<(), Error> {
         self.call(|r| Command::Unload(id, r)).await
     }
+    pub async fn replace_mcp_servers(
+        &self,
+        id: &SessionId,
+        servers: Vec<crate::McpServerConfig>,
+    ) -> Result<(), Error> {
+        self.call(|r| Command::ReplaceMcp(id.clone(), servers, r))
+            .await
+    }
+    pub async fn mcp_modern(
+        &self,
+        id: &SessionId,
+        server: String,
+        operation: xai_grok_shell::extensions::mcp::McpModernOperation,
+    ) -> Result<serde_json::Value, Error> {
+        self.call(|reply| Command::McpModern(id.clone(), server, operation, reply))
+            .await
+    }
+    pub async fn mcp_subscribe(
+        &self,
+        id: &SessionId,
+        server: String,
+        filter: xai_grok_shell::extensions::mcp::McpModernSubscriptionFilter,
+        capacity: std::num::NonZeroUsize,
+    ) -> Result<xai_grok_shell::extensions::mcp::McpModernSubscription, Error> {
+        self.call(|reply| Command::McpSubscribe(id.clone(), server, filter, capacity, reply))
+            .await
+    }
     pub async fn shutdown(&self) -> Result<(), Error> {
         let shutdown_result = if !self.shared.shutdown.swap(true, Ordering::AcqRel) {
             let (tx, rx) = oneshot::channel();
@@ -307,9 +376,232 @@ struct Client {
     retained: Rc<RefCell<HashMap<String, VecDeque<Event>>>>,
     capacity: usize,
     host: Option<Arc<dyn crate::HostDelegate>>,
+    tool_permission_handler: Option<Arc<dyn crate::ToolPermissionHandler>>,
     host_extension_methods: HashSet<String>,
+    agent_hooks: HashMap<String, Arc<dyn crate::AgentHookHandler>>,
     turns: Rc<RefCell<HashMap<String, String>>>,
     replay: Rc<RefCell<HashMap<String, ReplayMode>>>,
+}
+
+struct DirectMcpInvoker {
+    runtime_instance_id: u64,
+    handlers: HashMap<String, (String, Arc<dyn crate::InProcessMcpHandler>)>,
+    bindings: Arc<McpBindingRegistry>,
+    host_services: xai_grok_mcp::servers::McpHostServices,
+}
+
+struct DirectMcpOutbound {
+    session_id: String,
+    binding_id: u64,
+    bindings: Arc<McpBindingRegistry>,
+    outbound: tokio::sync::mpsc::Sender<serde_json::Value>,
+}
+
+#[async_trait::async_trait]
+impl crate::InProcessMcpOutbound for DirectMcpOutbound {
+    async fn send(&self, message: serde_json::Value) -> Result<(), crate::HostError> {
+        let permit = self
+            .outbound
+            .reserve()
+            .await
+            .map_err(|_| crate::HostError {
+                code: -32000,
+                message: "in-process MCP connection is closed".into(),
+                data: serde_json::Value::Null,
+            })?;
+        self.bindings
+            .active_instance(&self.session_id, self.binding_id)
+            .map_err(|message| crate::HostError {
+                code: -32000,
+                message,
+                data: serde_json::Value::Null,
+            })?;
+        permit.send(message);
+        Ok(())
+    }
+}
+
+#[derive(Default)]
+struct McpBindingRegistry {
+    state: std::sync::Mutex<McpBindingState>,
+}
+
+#[derive(Default)]
+struct McpBindingState {
+    next_binding_id: u64,
+    session_instances: HashMap<String, u64>,
+    active: HashMap<String, ActiveMcpBinding>,
+}
+
+#[derive(Clone, Copy)]
+struct ActiveMcpBinding {
+    binding_id: u64,
+    session_instance_id: u64,
+}
+
+impl McpBindingRegistry {
+    fn bind(&self, session_id: &str) -> u64 {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        state.next_binding_id = state.next_binding_id.saturating_add(1);
+        let binding_id = state.next_binding_id;
+        let session_instance_id = {
+            let instance = state
+                .session_instances
+                .entry(session_id.to_owned())
+                .or_insert(0);
+            *instance = instance.saturating_add(1);
+            *instance
+        };
+        state.active.insert(
+            session_id.to_owned(),
+            ActiveMcpBinding {
+                binding_id,
+                session_instance_id,
+            },
+        );
+        binding_id
+    }
+
+    fn active_instance(&self, session_id: &str, binding_id: u64) -> Result<u64, String> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| "embedded MCP binding registry failed".to_owned())?;
+        state
+            .active
+            .get(session_id)
+            .filter(|active| active.binding_id == binding_id)
+            .map(|active| active.session_instance_id)
+            .ok_or_else(|| "embedded MCP actor binding is stale or not resident".to_owned())
+    }
+
+    fn revoke_binding(&self, session_id: &str, binding_id: u64) {
+        if let Ok(mut state) = self.state.lock()
+            && state
+                .active
+                .get(session_id)
+                .is_some_and(|active| active.binding_id == binding_id)
+        {
+            state.active.remove(session_id);
+        }
+    }
+
+    fn revoke_session(&self, session_id: &str) {
+        if let Ok(mut state) = self.state.lock() {
+            state.active.remove(session_id);
+        }
+    }
+}
+
+struct ActiveMcpBindingGuard {
+    bindings: Arc<McpBindingRegistry>,
+    id: String,
+    keep: bool,
+}
+
+impl ActiveMcpBindingGuard {
+    fn new(bindings: Arc<McpBindingRegistry>, id: String) -> Self {
+        Self {
+            bindings,
+            id,
+            keep: false,
+        }
+    }
+
+    fn commit(mut self) {
+        self.keep = true;
+    }
+}
+
+impl Drop for ActiveMcpBindingGuard {
+    fn drop(&mut self) {
+        if !self.keep {
+            self.bindings.revoke_session(&self.id);
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl xai_grok_mcp::acp_transport::EmbeddedMcpInvoker for DirectMcpInvoker {
+    fn host_services(&self) -> Option<xai_grok_mcp::servers::McpHostServices> {
+        (!self.host_services.is_empty()).then(|| self.host_services.clone())
+    }
+
+    async fn connect(
+        &self,
+        session_id: &str,
+        binding_id: u64,
+        server_id: &str,
+        outbound: tokio::sync::mpsc::Sender<serde_json::Value>,
+        timeout: std::time::Duration,
+    ) -> Result<(), String> {
+        let handler = self
+            .handlers
+            .get(server_id)
+            .ok_or_else(|| "embedded MCP server is not registered".to_owned())?;
+        let session_instance_id = self.bindings.active_instance(session_id, binding_id)?;
+        let context = crate::InProcessMcpContext {
+            runtime_instance_id: self.runtime_instance_id,
+            session_id: SessionId(session_id.to_owned()),
+            session_instance_id,
+            server_name: handler.0.clone(),
+            registration_id: server_id.to_owned(),
+        };
+        let peer = crate::InProcessMcpPeer::new(Arc::new(DirectMcpOutbound {
+            session_id: session_id.to_owned(),
+            binding_id,
+            bindings: self.bindings.clone(),
+            outbound,
+        }));
+        tokio::time::timeout(timeout, handler.1.connected(&context, peer))
+            .await
+            .map_err(|_| "embedded MCP connect handler timed out".to_owned())?
+            .map_err(|error| error.message)?;
+        self.bindings
+            .active_instance(session_id, binding_id)
+            .map(|_| ())
+    }
+
+    fn bind_session(&self, session_id: &str) -> u64 {
+        self.bindings.bind(session_id)
+    }
+
+    fn unbind_session(&self, session_id: &str, binding_id: u64) {
+        self.bindings.revoke_binding(session_id, binding_id);
+    }
+
+    async fn invoke(
+        &self,
+        session_id: &str,
+        binding_id: u64,
+        server_id: &str,
+        message: serde_json::Value,
+        timeout: std::time::Duration,
+    ) -> Result<serde_json::Value, String> {
+        let handler = self
+            .handlers
+            .get(server_id)
+            .ok_or_else(|| "embedded MCP server is not registered".to_owned())?;
+        let session_instance_id = self.bindings.active_instance(session_id, binding_id)?;
+        let context = crate::InProcessMcpContext {
+            runtime_instance_id: self.runtime_instance_id,
+            session_id: SessionId(session_id.to_owned()),
+            session_instance_id,
+            server_name: handler.0.clone(),
+            registration_id: server_id.to_owned(),
+        };
+        let response = tokio::time::timeout(
+            timeout,
+            handler.1.handle_with_context(&context, message.clone()),
+        )
+        .await
+        .map_err(|_| "embedded MCP handler timed out".to_owned())?
+        .map_err(|_| "embedded MCP handler failed".to_owned())?;
+        self.bindings.active_instance(session_id, binding_id)?;
+        validate_mcp_response(&message, &response)
+            .map_err(|_| "embedded MCP handler returned an invalid JSON-RPC response".to_owned())?;
+        Ok(response)
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -319,6 +611,127 @@ enum ReplayMode {
 }
 
 impl Client {
+    fn typed_permission_request(
+        args: &acp::RequestPermissionRequest,
+    ) -> acp::Result<crate::ToolPermissionRequest> {
+        let raw = serde_json::to_value(args).map_err(|_| acp::Error::internal_error())?;
+        let raw_tool =
+            serde_json::to_value(&args.tool_call).map_err(|_| acp::Error::internal_error())?;
+        let tool_kind = args.tool_call.fields.kind.map(|kind| match kind {
+            acp::ToolKind::Read => crate::ToolKind::Read,
+            acp::ToolKind::Edit => crate::ToolKind::Edit,
+            acp::ToolKind::Delete => crate::ToolKind::Delete,
+            acp::ToolKind::Move => crate::ToolKind::Move,
+            acp::ToolKind::Search => crate::ToolKind::Search,
+            acp::ToolKind::Execute => crate::ToolKind::Execute,
+            acp::ToolKind::Think => crate::ToolKind::Think,
+            acp::ToolKind::Fetch => crate::ToolKind::Fetch,
+            acp::ToolKind::SwitchMode => crate::ToolKind::SwitchMode,
+            _ => crate::ToolKind::Other,
+        });
+        let status = args.tool_call.fields.status.map(|status| match status {
+            acp::ToolCallStatus::Pending => crate::ToolCallStatus::Pending,
+            acp::ToolCallStatus::InProgress => crate::ToolCallStatus::InProgress,
+            acp::ToolCallStatus::Completed => crate::ToolCallStatus::Completed,
+            acp::ToolCallStatus::Failed => crate::ToolCallStatus::Failed,
+            _ => crate::ToolCallStatus::Other,
+        });
+        let options = args
+            .options
+            .iter()
+            .map(|option| {
+                let raw = serde_json::to_value(option).map_err(|_| acp::Error::internal_error())?;
+                let raw_kind = raw
+                    .get("kind")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("other")
+                    .to_owned();
+                let kind = match option.kind {
+                    acp::PermissionOptionKind::AllowOnce => {
+                        crate::ToolPermissionOptionKind::AllowOnce
+                    }
+                    acp::PermissionOptionKind::AllowAlways => {
+                        crate::ToolPermissionOptionKind::AllowAlways
+                    }
+                    acp::PermissionOptionKind::RejectOnce => {
+                        crate::ToolPermissionOptionKind::RejectOnce
+                    }
+                    acp::PermissionOptionKind::RejectAlways => {
+                        crate::ToolPermissionOptionKind::RejectAlways
+                    }
+                    _ => crate::ToolPermissionOptionKind::Other,
+                };
+                Ok(crate::ToolPermissionOption {
+                    id: option.option_id.0.to_string(),
+                    name: option.name.clone(),
+                    kind,
+                    raw_kind,
+                    meta: option.meta.clone().map(serde_json::Value::Object),
+                    raw,
+                })
+            })
+            .collect::<acp::Result<Vec<_>>>()?;
+        Ok(crate::ToolPermissionRequest {
+            session_id: args.session_id.0.to_string(),
+            tool_call: crate::ToolCallSummary {
+                id: args.tool_call.tool_call_id.0.to_string(),
+                title: args.tool_call.fields.title.clone(),
+                kind: tool_kind,
+                status,
+                raw_input: args.tool_call.fields.raw_input.clone(),
+                raw_output: args.tool_call.fields.raw_output.clone(),
+                raw: raw_tool,
+            },
+            options,
+            raw,
+        })
+    }
+    async fn dispatch_agent_hook(&self, raw: &str) -> acp::Result<crate::AgentHookResponse> {
+        let value: serde_json::Value =
+            serde_json::from_str(raw).map_err(|_| acp::Error::invalid_params())?;
+        let callback_id = value
+            .get("hookCallbackId")
+            .and_then(|v| v.as_str())
+            .filter(|v| !v.is_empty())
+            .ok_or_else(acp::Error::invalid_params)?;
+        let event: crate::AgentHookEvent = serde_json::from_value(
+            value
+                .get("hookEventName")
+                .cloned()
+                .ok_or_else(acp::Error::invalid_params)?,
+        )
+        .map_err(|_| acp::Error::invalid_params())?;
+        let session_id = value
+            .get("sessionId")
+            .and_then(|v| v.as_str())
+            .filter(|v| !v.is_empty())
+            .ok_or_else(acp::Error::invalid_params)?
+            .to_owned();
+        let handler = self
+            .agent_hooks
+            .get(callback_id)
+            .ok_or_else(acp::Error::method_not_found)?;
+        let string = |key: &str| value.get(key).and_then(|v| v.as_str()).map(str::to_owned);
+        let invocation = crate::AgentHookInvocation {
+            event,
+            callback_id: callback_id.to_owned(),
+            session_id,
+            cwd: string("cwd").map(Into::into),
+            workspace_root: string("workspaceRoot").map(Into::into),
+            timestamp: string("timestamp"),
+            prompt_id: string("promptId"),
+            permission_mode: string("permissionMode"),
+            tool_name: string("toolName"),
+            tool_use_id: string("toolUseId"),
+            tool_input: value.get("toolInput").cloned(),
+            tool_result: value.get("toolResult").cloned(),
+            raw: value,
+        };
+        handler
+            .handle(invocation)
+            .await
+            .map_err(|_| acp::Error::internal_error())
+    }
     async fn host_call<T: serde::Serialize, R: serde::de::DeserializeOwned>(
         &self,
         method: &str,
@@ -410,6 +823,31 @@ impl acp::Client for Client {
         &self,
         args: acp::RequestPermissionRequest,
     ) -> acp::Result<acp::RequestPermissionResponse> {
+        if let Some(handler) = &self.tool_permission_handler {
+            let request = Self::typed_permission_request(&args)?;
+            let valid_ids: HashSet<_> = request.options.iter().map(|o| o.id.clone()).collect();
+            let decision = handler
+                .request_permission(request)
+                .await
+                // Policy errors can include host-only context or secrets. The
+                // agent only needs a fail-closed transport error, not details.
+                .map_err(|_| acp::Error::internal_error())?;
+            let outcome = match decision {
+                crate::ToolPermissionDecision::Cancelled => {
+                    acp::RequestPermissionOutcome::Cancelled
+                }
+                crate::ToolPermissionDecision::Selected(id) if valid_ids.contains(&id) => {
+                    acp::RequestPermissionOutcome::Selected(acp::SelectedPermissionOutcome::new(
+                        acp::PermissionOptionId::new(id),
+                    ))
+                }
+                crate::ToolPermissionDecision::Selected(id) => {
+                    return Err(acp::Error::invalid_params()
+                        .data(serde_json::json!({"invalidPermissionOptionId":id})));
+                }
+            };
+            return Ok(acp::RequestPermissionResponse::new(outcome));
+        }
         if self.host.is_none() {
             return Ok(acp::RequestPermissionResponse::new(
                 acp::RequestPermissionOutcome::Cancelled,
@@ -572,6 +1010,12 @@ impl acp::Client for Client {
     }
 
     async fn ext_method(&self, args: acp::ExtRequest) -> acp::Result<acp::ExtResponse> {
+        if args.method.as_ref() == "x.ai/hooks/run" {
+            let response = self.dispatch_agent_hook(args.params.get()).await?;
+            let raw = serde_json::value::to_raw_value(&response)
+                .map_err(|_| acp::Error::internal_error())?;
+            return Ok(acp::ExtResponse::new(Arc::from(raw)));
+        }
         if !self.host_extension_methods.contains(args.method.as_ref()) {
             return Err(acp::Error::method_not_found());
         }
@@ -593,6 +1037,10 @@ impl acp::Client for Client {
         Ok(acp::ExtResponse::new(Arc::from(raw)))
     }
     async fn ext_notification(&self, args: acp::ExtNotification) -> acp::Result<()> {
+        if args.method.as_ref() == "x.ai/hooks/event" {
+            self.dispatch_agent_hook(args.params.get()).await?;
+            return Ok(());
+        }
         let raw = args.params.get().to_owned();
         let payload =
             serde_json::from_str(&raw).unwrap_or_else(|_| serde_json::Value::String(raw.clone()));
@@ -603,15 +1051,24 @@ impl acp::Client for Client {
                 xai_grok_shell::origin_runtime::resolve_root_session(session_id, None)
             })
             .unwrap_or_else(|| SessionId::runtime_events().0);
-        self.emit_root(
-            root,
-            EventUpdate::Extension {
+        let is_mcp_notification = args.method.as_ref().starts_with("x.ai/mcp/");
+        let update = match typed_mcp_notification(args.method.as_ref(), &payload) {
+            Some(update) => update,
+            None if is_mcp_notification => {
+                // MCP configuration notifications are shell-owned control-plane
+                // data and may contain transport or setup credentials. Unknown
+                // methods fail closed instead of entering the public journal or
+                // HostDelegate as an untyped raw payload.
+                return Ok(());
+            }
+            None => EventUpdate::Extension {
                 method: args.method.to_string(),
                 payload: payload.clone(),
                 raw: raw.clone(),
             },
-        );
-        if let Some(host) = &self.host {
+        };
+        self.emit_root(root, update);
+        if !is_mcp_notification && let Some(host) = &self.host {
             host.notification(crate::HostNotification {
                 method: args.method.to_string(),
                 params: payload,
@@ -620,6 +1077,147 @@ impl acp::Client for Client {
             .map_err(host_acp_error)?;
         }
         Ok(())
+    }
+}
+
+fn validate_mcp_response(
+    request: &serde_json::Value,
+    response: &serde_json::Value,
+) -> acp::Result<()> {
+    let Some(request_id) = request.get("id") else {
+        return if response.is_null() {
+            Ok(())
+        } else {
+            Err(acp::Error::internal_error())
+        };
+    };
+    let object = response
+        .as_object()
+        .ok_or_else(acp::Error::internal_error)?;
+    if object.get("jsonrpc").and_then(|v| v.as_str()) == Some("2.0")
+        && object.get("id") == Some(request_id)
+        && (object.contains_key("result") ^ object.contains_key("error"))
+    {
+        Ok(())
+    } else {
+        Err(acp::Error::internal_error())
+    }
+}
+
+fn typed_mcp_notification(method: &str, payload: &serde_json::Value) -> Option<EventUpdate> {
+    match method {
+        "x.ai/mcp/server_status" => {
+            Some(EventUpdate::McpServerStatus(crate::McpServerStatusEvent {
+                name: payload["name"].as_str()?.to_owned(),
+                source: match payload["source"].as_str() {
+                    Some("local") => crate::McpServerSource::Local,
+                    Some("managed") => crate::McpServerSource::Managed,
+                    _ => crate::McpServerSource::Unknown,
+                },
+                status: match payload["status"].as_str() {
+                    Some("ready") => crate::McpServerStatus::Ready,
+                    Some("initializing") => crate::McpServerStatus::Initializing,
+                    Some("setuprequired") | Some("setup_required") => {
+                        crate::McpServerStatus::SetupRequired
+                    }
+                    Some("unavailable") => crate::McpServerStatus::Unavailable,
+                    Some("needsauth") | Some("needs_auth") => crate::McpServerStatus::NeedsAuth,
+                    _ => crate::McpServerStatus::Unknown,
+                },
+                reason: match payload["reason"].as_str() {
+                    Some("transport_closed") => crate::McpServerStatusReason::TransportClosed,
+                    Some("handshake_failed") => crate::McpServerStatusReason::HandshakeFailed,
+                    Some("config_added") => crate::McpServerStatusReason::ConfigAdded,
+                    Some("config_removed") => crate::McpServerStatusReason::ConfigRemoved,
+                    Some("config_changed") => crate::McpServerStatusReason::ConfigChanged,
+                    Some("disabled") => crate::McpServerStatusReason::Disabled,
+                    Some("auth_expired") => crate::McpServerStatusReason::AuthExpired,
+                    Some("initialized") => crate::McpServerStatusReason::Initialized,
+                    Some("restart_succeeded") => crate::McpServerStatusReason::RestartSucceeded,
+                    Some("restart_failed") => crate::McpServerStatusReason::RestartFailed,
+                    Some("managed_token_refreshed") => {
+                        crate::McpServerStatusReason::ManagedTokenRefreshed
+                    }
+                    _ => crate::McpServerStatusReason::Unknown,
+                },
+            }))
+        }
+        "x.ai/mcp/task_status" => {
+            let session_id = SessionId(payload["sessionId"].as_str()?.to_owned());
+            let server = payload["server"].as_str()?;
+            let client_id = payload["clientId"].as_u64()?;
+            let task = payload.get("task")?.as_object()?;
+            let task_id = task.get("taskId")?.as_str()?.to_owned();
+            let status = crate::parse_task_status(task.get("status")?).ok()?;
+            let status_message = match task.get("statusMessage") {
+                Some(serde_json::Value::Null) | None => None,
+                Some(value) => Some(value.as_str()?.to_owned()),
+            };
+            let last_updated_at = task.get("lastUpdatedAt")?.as_str()?.to_owned();
+            Some(EventUpdate::McpTaskStatus(crate::McpTaskStatusEvent {
+                handle: crate::McpTaskHandle {
+                    session_id,
+                    server: server.to_owned(),
+                    client_id,
+                    task_id,
+                },
+                status,
+                status_message,
+                last_updated_at,
+            }))
+        }
+        "x.ai/mcp/tools_changed" => {
+            let server_name = payload["serverName"]
+                .as_str()
+                .filter(|name| !name.is_empty())
+                .map(str::to_owned);
+            let tools = payload["tools"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|tool| crate::McpToolInfo {
+                    server: server_name.clone().unwrap_or_default(),
+                    name: tool["name"].as_str().unwrap_or_default().to_owned(),
+                    display_name: tool["displayName"].as_str().map(str::to_owned),
+                    description: tool["description"].as_str().map(str::to_owned),
+                    enabled: tool["enabled"].as_bool().unwrap_or(true),
+                    // Push events are a redacted hint to refetch the explicit
+                    // catalog; server-controlled metadata stays off the event
+                    // journal and HostDelegate boundary.
+                    meta: serde_json::Value::Null,
+                })
+                .collect();
+            Some(EventUpdate::McpToolsChanged(crate::McpToolsChangedEvent {
+                server_name,
+                tools,
+            }))
+        }
+        "x.ai/mcp/init_progress" => Some(EventUpdate::McpInitializationProgress(
+            crate::McpInitializationProgress {
+                connected: payload["connected"].as_u64()?.try_into().ok()?,
+                total: payload["total"].as_u64()?.try_into().ok()?,
+            },
+        )),
+        "x.ai/mcp/servers_updated" => {
+            let mut catalog = serde_json::Map::new();
+            catalog.insert("servers".to_owned(), payload.get("mcpServers")?.clone());
+            crate::parse_mcp_servers(&serde_json::Value::Object(catalog))
+                .ok()
+                .map(|mut servers| {
+                    for server in &mut servers {
+                        for tool in &mut server.tools {
+                            tool.meta = serde_json::Value::Null;
+                        }
+                        if let Some(negotiated) = &mut server.negotiated {
+                            negotiated.extensions.clear();
+                            negotiated.raw = serde_json::Value::Null;
+                        }
+                    }
+                    servers
+                })
+                .map(EventUpdate::McpServersChanged)
+        }
+        _ => None,
     }
 }
 
@@ -744,7 +1342,7 @@ impl Drop for TurnReservation {
 }
 
 struct Core {
-    connection: acp::ClientSideConnection,
+    agent: Rc<MvpAgent>,
     events: mpsc::UnboundedSender<Event>,
     catalog: HashMap<String, crate::ModelSpec>,
     sequences: Rc<RefCell<HashMap<String, u64>>>,
@@ -752,6 +1350,7 @@ struct Core {
     capacity: usize,
     options: RuntimeOptions,
     resident: RefCell<HashSet<String>>,
+    mcp_bindings: Arc<McpBindingRegistry>,
     turns: Rc<RefCell<HashMap<String, String>>>,
     prompt_tasks: RefCell<HashMap<String, tokio::task::AbortHandle>>,
     replay: Rc<RefCell<HashMap<String, ReplayMode>>>,
@@ -918,44 +1517,79 @@ impl Core {
             input.session_storage.clone(),
             profile,
         ));
-        let (c2a_a, c2a_b) = tokio::io::duplex(BUFFER);
-        let (a2c_a, a2c_b) = tokio::io::duplex(BUFFER);
-        let incoming = LineBufferedRead::spawn_local(c2a_b.compat());
-        let (agent_conn, agent_io) =
-            acp::AgentSideConnection::new(agent, a2c_a.compat_write(), incoming, |f| {
-                tokio::task::spawn_local(f);
-            });
-        tokio::task::spawn_local(
-            AcpAgentGatewayReceiver::new(gw_rx, agent_conn)
-                .with_on_meta(xai_file_utils::trace_context::span_from_meta_traceparent)
-                .run(),
-        );
-        tokio::task::spawn_local(agent_io);
+        static NEXT_RUNTIME_INSTANCE: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(1);
+        let runtime_instance_id = NEXT_RUNTIME_INSTANCE.fetch_add(1, Ordering::Relaxed);
+        let mcp_bindings = Arc::new(McpBindingRegistry::default());
+        if options.profile == crate::RuntimeProfile::Desktop
+            && (!options.in_process_mcp_servers.is_empty() || !options.mcp_host_services.is_empty())
+        {
+            let servers = options
+                .in_process_mcp_servers
+                .iter()
+                .map(|server| xai_grok_mcp::servers::AcpServerEntry {
+                    name: server.name.clone(),
+                    server_id: server.server_id.clone(),
+                })
+                .collect();
+            let handlers = options
+                .in_process_mcp_servers
+                .iter()
+                .map(|server| {
+                    (
+                        server.server_id.clone(),
+                        (server.name.clone(), server.handler.clone()),
+                    )
+                })
+                .collect();
+            agent.set_embedded_mcp_servers(
+                servers,
+                Arc::new(DirectMcpInvoker {
+                    runtime_instance_id,
+                    handlers,
+                    bindings: mcp_bindings.clone(),
+                    host_services: options.mcp_host_services.clone(),
+                }),
+            );
+        }
         let sequences = Rc::new(RefCell::new(HashMap::new()));
         let retained = Rc::new(RefCell::new(HashMap::new()));
         let turns = Rc::new(RefCell::new(HashMap::new()));
         let replay = Rc::new(RefCell::new(HashMap::new()));
-        let incoming = LineBufferedRead::spawn_local(a2c_b.compat());
         let client = Client {
             events: events.clone(),
             sequences: sequences.clone(),
             retained: retained.clone(),
             capacity: options.event_journal_capacity,
             host: options.host.clone(),
+            tool_permission_handler: if options.profile == crate::RuntimeProfile::Desktop {
+                options.tool_permission_handler.clone()
+            } else {
+                None
+            },
             host_extension_methods: options
                 .host_capabilities
                 .extension_methods
                 .iter()
                 .cloned()
                 .collect(),
+            agent_hooks: if options.profile == crate::RuntimeProfile::Desktop {
+                options
+                    .agent_hooks
+                    .iter()
+                    .map(|hook| (hook.callback_id.clone(), hook.handler.clone()))
+                    .collect()
+            } else {
+                HashMap::new()
+            },
             turns: turns.clone(),
             replay: replay.clone(),
         };
-        let (connection, io) =
-            acp::ClientSideConnection::new(client, c2a_a.compat_write(), incoming, |f| {
-                tokio::task::spawn_local(f);
-            });
-        tokio::task::spawn_local(io);
+        tokio::task::spawn_local(
+            AcpGatewayReceiver::new(gw_rx, client)
+                .with_on_meta(xai_file_utils::trace_context::span_from_meta_traceparent)
+                .run(),
+        );
         // Advertising ACP I/O prevents the shell from falling back to direct
         // process-local filesystem and terminal implementations. Restricted
         // intentionally advertises those routes without a delegate so every
@@ -968,18 +1602,17 @@ impl Core {
                 .write_text_file(restricted_io || options.host_capabilities.fs_write))
             .terminal(restricted_io || options.host_capabilities.terminal)
             .meta(client_capability_meta(&options)?);
-        let initialize = connection
+        agent
             .initialize(
                 acp::InitializeRequest::new(acp::ProtocolVersion::V1)
                     .client_capabilities(client_caps),
             )
             .await
             .map_err(|error| protocol("initialize", error))?;
-        let capabilities =
-            capabilities_for(&options, serde_json::to_value(&initialize).map_err(op)?);
+        let capabilities = capabilities_for(&options);
         Ok((
             Self {
-                connection,
+                agent,
                 events,
                 catalog: input
                     .models
@@ -991,6 +1624,7 @@ impl Core {
                 capacity: options.event_journal_capacity,
                 options,
                 resident: RefCell::new(HashSet::new()),
+                mcp_bindings,
                 turns,
                 prompt_tasks: RefCell::new(HashMap::new()),
                 replay,
@@ -1073,8 +1707,71 @@ impl Core {
                 Command::Extension(x, r) => {
                     let _ = r.send(self.extension_raw(x).await);
                 }
-                Command::ExtensionNotification(x, r) => {
-                    let _ = r.send(self.extension_notification(x).await);
+                Command::McpModern(id, server, operation, reply) => {
+                    let result = if self.options.profile == crate::RuntimeProfile::Restricted {
+                        Err(Error::Operation(
+                            "MCP operations require the Desktop profile".into(),
+                        ))
+                    } else {
+                        self.agent
+                            .sdk_mcp_modern_operation(id.as_str(), server, operation)
+                            .await
+                            .map_err(Error::Operation)
+                    };
+                    let _ = reply.send(result);
+                }
+                Command::McpSubscribe(id, server, filter, capacity, reply) => {
+                    let result = if self.options.profile == crate::RuntimeProfile::Restricted {
+                        Err(Error::Operation(
+                            "MCP operations require the Desktop profile".into(),
+                        ))
+                    } else {
+                        self.agent
+                            .sdk_mcp_modern_subscribe(id.as_str(), server, filter, capacity)
+                            .await
+                            .map_err(Error::Operation)
+                    };
+                    let _ = reply.send(result);
+                }
+                Command::ReplaceMcp(id, servers, r) => {
+                    let result = if self.options.profile == crate::RuntimeProfile::Restricted {
+                        Err(Error::Operation(
+                            "MCP operations require the Desktop profile".into(),
+                        ))
+                    } else {
+                        match validate_mcp_servers(&servers) {
+                            Err(error) => Err(error),
+                            Ok(())
+                                if servers.iter().any(|server| {
+                                    let name = match server {
+                                        crate::McpServerConfig::Stdio { name, .. }
+                                        | crate::McpServerConfig::Http { name, .. }
+                                        | crate::McpServerConfig::Sse { name, .. } => name,
+                                    };
+                                    self.options
+                                        .in_process_mcp_servers
+                                        .iter()
+                                        .any(|embedded| embedded.name == *name)
+                                }) =>
+                            {
+                                Err(Error::InvalidConfig(
+                                    "external MCP replacement collides with an in-process server"
+                                        .into(),
+                                ))
+                            }
+                            Ok(()) => {
+                                let mcp_servers: Vec<acp::McpServer> =
+                                    servers.iter().map(to_acp_mcp_server).collect();
+                                self.extension::<serde_json::Value>(
+                                    "x.ai/session/update_mcp_servers",
+                                    serde_json::json!({"sessionId":id.as_str(),"mcpServers":mcp_servers}),
+                                )
+                                .await
+                                .map(drop)
+                            }
+                        }
+                    };
+                    let _ = r.send(result);
                 }
                 Command::SetMode(i, mode, r) => {
                     let _ = r.send(self.set_mode(i, mode).await);
@@ -1183,10 +1880,20 @@ impl Core {
                 "session cwd must be an existing absolute directory".into(),
             ));
         }
+        for (name, value) in [
+            ("system prompt", config.system_prompt.as_deref()),
+            ("rules", config.rules.as_deref()),
+        ] {
+            if value.is_some_and(|value| value.trim().is_empty()) {
+                return Err(Error::InvalidConfig(format!(
+                    "session {name} must not be blank"
+                )));
+            }
+        }
         Ok(())
     }
     fn session_meta(&self, config: &SessionConfig) -> Result<SessionMeta, Error> {
-        serde_json::json!({
+        let mut meta = serde_json::json!({
             "modelId": config.model,
             "reasoningEffort": config.reasoning,
             "clientIdentifier": self.options.client_identifier,
@@ -1194,7 +1901,35 @@ impl Core {
         })
         .as_object()
         .cloned()
-        .ok_or_else(|| Error::Operation("failed to build session metadata".into()))
+        .ok_or_else(|| Error::Operation("failed to build session metadata".into()))?;
+        if let Some(system_prompt) = &config.system_prompt {
+            meta.insert(
+                "systemPromptOverride".into(),
+                serde_json::Value::String(system_prompt.clone()),
+            );
+        }
+        if let Some(rules) = &config.rules {
+            meta.insert("rules".into(), serde_json::Value::String(rules.clone()));
+        }
+        if self.options.profile == crate::RuntimeProfile::Desktop
+            && !self.options.agent_hooks.is_empty()
+        {
+            let mut groups = serde_json::Map::new();
+            for hook in &self.options.agent_hooks {
+                groups
+                    .entry(hook.event.registration_name())
+                    .or_insert_with(|| serde_json::Value::Array(Vec::new()))
+                    .as_array_mut()
+                    .expect("hook groups are arrays")
+                    .push(serde_json::json!({
+                        "matcher": hook.matcher,
+                        "hookCallbackIds": [hook.callback_id.clone()],
+                        "timeout": hook.timeout,
+                    }));
+            }
+            meta.insert("x.ai/hooks".into(), serde_json::Value::Object(groups));
+        }
+        Ok(meta)
     }
     fn mcp_servers(&self) -> Vec<acp::McpServer> {
         if self.options.profile == crate::RuntimeProfile::Restricted {
@@ -1279,7 +2014,7 @@ impl Core {
         self.check(&config)?;
         let meta = self.session_meta(&config)?;
         let x = self
-            .connection
+            .agent
             .new_session(
                 acp::NewSessionRequest::new(config.cwd)
                     .mcp_servers(self.mcp_servers())
@@ -1288,6 +2023,7 @@ impl Core {
             .await
             .map_err(|error| protocol("session/new", error))?;
         let id = SessionId(x.session_id.0.to_string());
+        let active_guard = ActiveMcpBindingGuard::new(self.mcp_bindings.clone(), id.0.clone());
         if let Err(error) = self.save_ledger(&id, &SessionLedger::default()) {
             return match self.detach_unregistered_session(&id).await {
                 Ok(()) => Err(error),
@@ -1310,6 +2046,7 @@ impl Core {
             return Err(Error::Operation(detail));
         }
         self.resident.borrow_mut().insert(id.0.clone());
+        active_guard.commit();
         self.emit(&id, EventUpdate::SessionStarted, None);
         Ok(id)
     }
@@ -1332,6 +2069,7 @@ impl Core {
             return Err(Error::Operation("session is already resident".into()));
         }
         self.load_ledger(&id)?;
+        let active_guard = ActiveMcpBindingGuard::new(self.mcp_bindings.clone(), id.0.clone());
         let meta = self.session_meta(&config)?;
         struct ReplayGuard<'a>(&'a RefCell<HashMap<String, ReplayMode>>, String);
         impl Drop for ReplayGuard<'_> {
@@ -1350,7 +2088,7 @@ impl Core {
         );
         let _guard = ReplayGuard(&self.replay, id.0.clone());
         if resume {
-            self.connection
+            self.agent
                 .resume_session(
                     acp::ResumeSessionRequest::new(acp::SessionId::new(id.0.clone()), config.cwd)
                         .mcp_servers(self.mcp_servers())
@@ -1359,7 +2097,7 @@ impl Core {
                 .await
                 .map_err(|error| protocol("session/resume", error))?;
         } else {
-            self.connection
+            self.agent
                 .load_session(
                     acp::LoadSessionRequest::new(acp::SessionId::new(id.0.clone()), config.cwd)
                         .mcp_servers(self.mcp_servers())
@@ -1379,6 +2117,7 @@ impl Core {
             };
         }
         self.resident.borrow_mut().insert(id.0.clone());
+        active_guard.commit();
         Ok(())
     }
     async fn prompt(&self, id: SessionId, t: String, x: String) -> Result<PromptReceipt, Error> {
@@ -1456,7 +2195,7 @@ impl Core {
             .cloned(),
         );
         let response = self
-            .connection
+            .agent
             .prompt(req)
             .await
             .map_err(|error| protocol("session/prompt", error));
@@ -1472,7 +2211,7 @@ impl Core {
             serde_json::json!({"sessionId": id.0}).to_string(),
         )
         .map_err(op)?;
-        self.connection
+        self.agent
             .ext_method(acp::ExtRequest::new("origin/session/sync", Arc::from(raw)))
             .await
             .map_err(|error| protocol("origin/session/sync", error))?;
@@ -1604,7 +2343,7 @@ impl Core {
     async fn cancel(&self, id: SessionId) -> Result<(), Error> {
         let session_id = id.0.clone();
         let result = self
-            .connection
+            .agent
             .cancel(acp::CancelNotification::new(acp::SessionId::new(id.0)))
             .await
             .map_err(|error| protocol("session/cancel", error));
@@ -1643,7 +2382,7 @@ impl Core {
     ) -> Result<T, Error> {
         let raw = serde_json::value::to_raw_value(&params).map_err(op)?;
         let response = self
-            .connection
+            .agent
             .ext_method(acp::ExtRequest::new(method, Arc::from(raw)))
             .await
             .map_err(|error| protocol(method, error))?;
@@ -1662,7 +2401,7 @@ impl Core {
         }
         let raw = serde_json::value::to_raw_value(&request.params).map_err(op)?;
         let response = self
-            .connection
+            .agent
             .ext_method(acp::ExtRequest::new(request.method.clone(), Arc::from(raw)))
             .await
             .map_err(|e| protocol(&request.method, e))?;
@@ -1670,28 +2409,8 @@ impl Core {
             result: serde_json::from_str(response.0.get()).map_err(op)?,
         })
     }
-    async fn extension_notification(&self, request: ExtensionNotification) -> Result<(), Error> {
-        if request.method.trim().is_empty() {
-            return Err(Error::InvalidConfig(
-                "extension notification method is required".into(),
-            ));
-        }
-        if self.options.profile == crate::RuntimeProfile::Restricted {
-            return Err(Error::Operation(
-                "generic extension notifications require the Desktop profile".into(),
-            ));
-        }
-        let raw = serde_json::value::to_raw_value(&request.params).map_err(op)?;
-        self.connection
-            .ext_notification(acp::ExtNotification::new(
-                request.method.clone(),
-                Arc::from(raw),
-            ))
-            .await
-            .map_err(|e| protocol(&request.method, e))
-    }
     async fn set_mode(&self, id: SessionId, mode: String) -> Result<(), Error> {
-        self.connection
+        self.agent
             .set_session_mode(acp::SetSessionModeRequest::new(
                 acp::SessionId::new(id.0),
                 acp::SessionModeId::new(mode),
@@ -1702,7 +2421,7 @@ impl Core {
     }
     async fn list_sessions(&self) -> Result<serde_json::Value, Error> {
         let response = self
-            .connection
+            .agent
             .list_sessions(acp::ListSessionsRequest::new())
             .await
             .map_err(|e| protocol("session/list", e))?;
@@ -1726,7 +2445,7 @@ impl Core {
         })
         .as_object()
         .cloned();
-        self.connection
+        self.agent
             .set_session_model(
                 acp::SetSessionModelRequest::new(
                     acp::SessionId::new(id.0),
@@ -2178,7 +2897,7 @@ impl Core {
         if self.turns.borrow().contains_key(&id.0) {
             self.cancel(id.clone()).await?;
         }
-        self.connection
+        self.agent
             .close_session(acp::CloseSessionRequest::new(acp::SessionId::new(
                 id.0.clone(),
             )))
@@ -2215,6 +2934,7 @@ impl Core {
     fn finish_close(&self, id: &SessionId) {
         self.emit(id, EventUpdate::SessionClosed, None);
         self.resident.borrow_mut().remove(&id.0);
+        self.mcp_bindings.revoke_session(&id.0);
         self.turns.borrow_mut().remove(&id.0);
         self.replay.borrow_mut().remove(&id.0);
         xai_grok_shell::origin_runtime::unregister_session_tree(&id.0);
@@ -2322,8 +3042,46 @@ fn validate(c: &RuntimeConfig, options: &RuntimeOptions) -> Result<(), Error> {
             "media service requires an explicit base URL, API key, non-empty header/query names, and non-empty optional model slugs".into(),
         ));
     }
+    validate_mcp_servers(&options.services.mcp_servers)?;
+    let mut names: HashSet<&str> = options
+        .services
+        .mcp_servers
+        .iter()
+        .map(|server| match server {
+            crate::McpServerConfig::Stdio { name, .. }
+            | crate::McpServerConfig::Http { name, .. }
+            | crate::McpServerConfig::Sse { name, .. } => name.as_str(),
+        })
+        .collect();
+    let mut ids = HashSet::new();
+    if options.in_process_mcp_servers.iter().any(|server| {
+        server.name.trim().is_empty()
+            || server.server_id.trim().is_empty()
+            || !names.insert(server.name.as_str())
+            || !ids.insert(server.server_id.as_str())
+    }) {
+        return Err(Error::InvalidConfig(
+            "MCP server names and in-process server IDs must be unique and non-empty".into(),
+        ));
+    }
+    if options.profile == crate::RuntimeProfile::Desktop {
+        let mut callback_ids = HashSet::new();
+        if options.agent_hooks.iter().any(|hook| {
+            hook.callback_id.trim().is_empty()
+                || !callback_ids.insert(hook.callback_id.as_str())
+                || hook.matcher.as_ref().is_some_and(|m| m.trim().is_empty())
+                || hook
+                    .timeout
+                    .is_some_and(|t| !t.is_finite() || t <= 0.0 || t > 600.0)
+        }) {
+            return Err(Error::InvalidConfig("agent hooks require unique non-empty callback IDs, non-empty matchers, and timeouts in (0, 600] seconds".into()));
+        }
+    }
+    Ok(())
+}
+fn validate_mcp_servers(servers: &[crate::McpServerConfig]) -> Result<(), Error> {
     let mut mcp_names = HashSet::new();
-    if options.services.mcp_servers.iter().any(|server| {
+    if servers.iter().any(|server| {
         let (name, target, key_values) = match server {
             crate::McpServerConfig::Stdio {
                 name, command, env, ..
@@ -2444,41 +3202,27 @@ fn client_capability_meta(options: &RuntimeOptions) -> Result<acp::Meta, Error> 
         "clientIdentifier".into(),
         serde_json::Value::String(options.client_identifier.clone()),
     );
+    let extension_methods = options.host_capabilities.extension_methods.clone();
     meta.insert(
         "originHostExtensionMethods".into(),
-        serde_json::to_value(&options.host_capabilities.extension_methods).map_err(op)?,
+        serde_json::to_value(extension_methods).map_err(op)?,
     );
     Ok(meta)
 }
 
-fn capabilities_for(
-    options: &RuntimeOptions,
-    initialize: serde_json::Value,
-) -> RuntimeCapabilities {
-    const FAMILIES: &[&str] = &[
-        "auth",
-        "session",
-        "git",
-        "worktree",
-        "plugins",
-        "marketplace",
-        "hooks",
-        "hunk",
-        "pr",
-        "mcp",
-        "task",
-        "scheduler",
-        "subagent",
-        "terminal",
-        "fs",
-        "search",
-        "bundle",
-        "code",
-        "skills",
-        "workflows",
-        "review",
-        "debug",
-        "rewind",
+fn capabilities_for(options: &RuntimeOptions) -> RuntimeCapabilities {
+    const SDK_FEATURES: &[(&str, &str, bool)] = &[
+        ("sdk:session-lifecycle", "state", false),
+        ("sdk:agent-turns", "agent", false),
+        ("sdk:event-journal", "read", false),
+        ("sdk:commands", "agent", true),
+        ("sdk:scheduler", "background", true),
+        ("sdk:workflows", "process", true),
+        ("sdk:subagents", "process", true),
+        ("sdk:mcp", "network-process", true),
+        ("sdk:rewind", "workspace-write", true),
+        ("sdk:hooks", "process", true),
+        ("sdk:permissions", "policy", true),
     ];
     const OPTIONAL_FEATURES: &[(&str, &str, Option<&str>)] = &[
         ("feature:web_search", "network", None),
@@ -2503,19 +3247,35 @@ fn capabilities_for(
             Some("HostDelegate extension"),
         ),
     ];
-    let mut descriptors = FAMILIES
+    let mut descriptors = SDK_FEATURES
         .iter()
-        .map(|family| crate::CapabilityDescriptor {
-            namespace: format!("x.ai/{family}"),
-            // This describes route availability. Individual operations can
-            // still reject based on profile, auth, session state, or platform.
-            enabled: options.profile == crate::RuntimeProfile::Desktop,
-            disabled_reason: (options.profile == crate::RuntimeProfile::Restricted)
-                .then(|| "generic extensions require the Desktop profile".into()),
-            effect_class: extension_effect(family).into(),
-            host_requirement: None,
+        .map(|(name, effect, desktop_only)| {
+            let enabled = !desktop_only || options.profile == crate::RuntimeProfile::Desktop;
+            crate::CapabilityDescriptor {
+                namespace: (*name).into(),
+                enabled,
+                disabled_reason: (!enabled).then(|| "restricted profile".into()),
+                effect_class: (*effect).into(),
+                host_requirement: None,
+            }
         })
         .collect::<Vec<_>>();
+    descriptors.push(crate::CapabilityDescriptor {
+        namespace: "sdk:in-process-mcp".into(),
+        enabled: options.profile == crate::RuntimeProfile::Desktop
+            && !options.in_process_mcp_servers.is_empty(),
+        disabled_reason: (options.profile != crate::RuntimeProfile::Desktop
+            || options.in_process_mcp_servers.is_empty())
+        .then(|| {
+            if options.profile == crate::RuntimeProfile::Restricted {
+                "restricted profile".into()
+            } else {
+                "no in-process MCP server registered".into()
+            }
+        }),
+        effect_class: "in-process".into(),
+        host_requirement: None,
+    });
     descriptors.extend(OPTIONAL_FEATURES.iter().map(|(name, effect, host)| {
         let enabled = match *name {
             "host:filesystem" => {
@@ -2591,30 +3351,434 @@ fn capabilities_for(
         }
     }));
     RuntimeCapabilities {
-        protocol_version: "1".into(),
-        initialize,
         profile: options.profile,
         host: options.host_capabilities.clone(),
-        generic_extension_transport: options.profile == crate::RuntimeProfile::Desktop,
-        extension_families: descriptors,
-    }
-}
-
-fn extension_effect(family: &str) -> &'static str {
-    match family {
-        "session" | "search" | "code" | "skills" => "read",
-        "git" | "worktree" | "hunk" | "rewind" | "fs" => "workspace-write",
-        "terminal" | "task" | "scheduler" | "subagent" | "workflows" => "process",
-        "auth" | "marketplace" | "mcp" | "pr" => "network",
-        "plugins" | "hooks" | "bundle" => "process-write",
-        "review" | "debug" => "diagnostic",
-        _ => "extension-defined",
+        features: descriptors,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct PermissionPolicy {
+        decision: Result<crate::ToolPermissionDecision, crate::ToolPermissionError>,
+        requests: std::sync::Mutex<Vec<crate::ToolPermissionRequest>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::ToolPermissionHandler for PermissionPolicy {
+        async fn request_permission(
+            &self,
+            request: crate::ToolPermissionRequest,
+        ) -> Result<crate::ToolPermissionDecision, crate::ToolPermissionError> {
+            self.requests.lock().unwrap().push(request);
+            self.decision.clone()
+        }
+    }
+
+    struct InProcessProbe {
+        called: Arc<AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::InProcessMcpHandler for InProcessProbe {
+        async fn handle(
+            &self,
+            message: serde_json::Value,
+        ) -> Result<serde_json::Value, crate::HostError> {
+            self.called.store(true, Ordering::Release);
+            Ok(match message.get("id") {
+                Some(id) => serde_json::json!({"jsonrpc":"2.0","id":id,"result":{}}),
+                None => serde_json::Value::Null,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn direct_mcp_invoker_rejects_unregistered_stale_and_nonresident_bindings() {
+        let called = Arc::new(AtomicBool::new(false));
+        let handler: Arc<dyn crate::InProcessMcpHandler> = Arc::new(InProcessProbe {
+            called: called.clone(),
+        });
+        let bindings = Arc::new(McpBindingRegistry::default());
+        let invoker = DirectMcpInvoker {
+            runtime_instance_id: 1,
+            handlers: HashMap::from([("registration".into(), ("server".into(), handler))]),
+            bindings: bindings.clone(),
+            host_services: Default::default(),
+        };
+
+        let unregistered = xai_grok_mcp::acp_transport::EmbeddedMcpInvoker::invoke(
+            &invoker,
+            "unknown-session",
+            u64::MAX,
+            "registration",
+            serde_json::json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}),
+            std::time::Duration::from_secs(1),
+        )
+        .await
+        .expect_err("unregistered bindings fail closed");
+        assert!(unregistered.contains("stale or not resident"));
+
+        let old_binding = bindings.bind("closed-session");
+        let new_binding = bindings.bind("closed-session");
+        let stale = xai_grok_mcp::acp_transport::EmbeddedMcpInvoker::invoke(
+            &invoker,
+            "closed-session",
+            old_binding,
+            "registration",
+            serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/list"}),
+            std::time::Duration::from_secs(1),
+        )
+        .await
+        .expect_err("replacement invalidates the old actor binding");
+        assert!(stale.contains("stale or not resident"));
+
+        xai_grok_mcp::acp_transport::EmbeddedMcpInvoker::invoke(
+            &invoker,
+            "closed-session",
+            new_binding,
+            "registration",
+            serde_json::json!({"jsonrpc":"2.0","id":3,"method":"tools/list"}),
+            std::time::Duration::from_secs(1),
+        )
+        .await
+        .expect("the replacement binding is active");
+
+        bindings.revoke_session("closed-session");
+        let error = xai_grok_mcp::acp_transport::EmbeddedMcpInvoker::invoke(
+            &invoker,
+            "closed-session",
+            new_binding,
+            "registration",
+            serde_json::json!({"jsonrpc":"2.0","id":4,"method":"tools/list"}),
+            std::time::Duration::from_secs(1),
+        )
+        .await
+        .expect_err("nonresident sessions fail closed");
+        assert!(error.contains("stale or not resident"));
+        assert!(called.load(Ordering::Acquire));
+    }
+
+    struct OutboundProbe {
+        peer: std::sync::Mutex<Option<crate::InProcessMcpPeer>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::InProcessMcpHandler for OutboundProbe {
+        async fn handle(
+            &self,
+            message: serde_json::Value,
+        ) -> Result<serde_json::Value, crate::HostError> {
+            Ok(match message.get("id") {
+                Some(id) => serde_json::json!({"jsonrpc":"2.0","id":id,"result":{}}),
+                None => serde_json::Value::Null,
+            })
+        }
+
+        async fn connected(
+            &self,
+            _context: &crate::InProcessMcpContext,
+            peer: crate::InProcessMcpPeer,
+        ) -> Result<(), crate::HostError> {
+            *self.peer.lock().unwrap() = Some(peer);
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn in_process_outbound_peer_is_bounded_and_generation_bound() {
+        let probe = Arc::new(OutboundProbe {
+            peer: std::sync::Mutex::new(None),
+        });
+        let bindings = Arc::new(McpBindingRegistry::default());
+        let invoker = DirectMcpInvoker {
+            runtime_instance_id: 1,
+            handlers: HashMap::from([(
+                "registration".into(),
+                (
+                    "server".into(),
+                    probe.clone() as Arc<dyn crate::InProcessMcpHandler>,
+                ),
+            )]),
+            bindings: bindings.clone(),
+            host_services: Default::default(),
+        };
+        let first_binding = bindings.bind("session");
+        let (first_tx, mut first_rx) = tokio::sync::mpsc::channel(1);
+        xai_grok_mcp::acp_transport::EmbeddedMcpInvoker::connect(
+            &invoker,
+            "session",
+            first_binding,
+            "registration",
+            first_tx,
+            std::time::Duration::from_secs(1),
+        )
+        .await
+        .expect("first peer connects");
+        let first_peer = probe.peer.lock().unwrap().clone().expect("first peer");
+        first_peer
+            .notify("notifications/tools/list_changed", serde_json::json!({}))
+            .await
+            .expect("active peer pushes");
+        assert_eq!(
+            first_rx.recv().await.unwrap()["method"],
+            "notifications/tools/list_changed"
+        );
+
+        let second_binding = bindings.bind("session");
+        assert!(
+            first_peer
+                .notify("notifications/tools/list_changed", serde_json::json!({}))
+                .await
+                .is_err(),
+            "replacement invalidates a retained old peer"
+        );
+        assert!(first_rx.try_recv().is_err());
+
+        let (second_tx, mut second_rx) = tokio::sync::mpsc::channel(1);
+        xai_grok_mcp::acp_transport::EmbeddedMcpInvoker::connect(
+            &invoker,
+            "session",
+            second_binding,
+            "registration",
+            second_tx,
+            std::time::Duration::from_secs(1),
+        )
+        .await
+        .expect("replacement peer connects");
+        let second_peer = probe.peer.lock().unwrap().clone().expect("second peer");
+        second_peer
+            .notify(
+                "notifications/resources/list_changed",
+                serde_json::json!({}),
+            )
+            .await
+            .expect("replacement peer pushes");
+        assert_eq!(
+            second_rx.recv().await.unwrap()["method"],
+            "notifications/resources/list_changed"
+        );
+    }
+
+    #[tokio::test]
+    async fn in_process_outbound_backpressure_rechecks_generation_before_delivery() {
+        let bindings = Arc::new(McpBindingRegistry::default());
+        let binding_id = bindings.bind("session");
+        let (outbound, mut receiver) = tokio::sync::mpsc::channel(1);
+        let peer = crate::InProcessMcpPeer::new(Arc::new(DirectMcpOutbound {
+            session_id: "session".into(),
+            binding_id,
+            bindings: bindings.clone(),
+            outbound,
+        }));
+        peer.notify(
+            "notifications/tools/list_changed",
+            serde_json::json!({"n":1}),
+        )
+        .await
+        .expect("first notification fills the bounded channel");
+
+        let blocked = {
+            let peer = peer.clone();
+            tokio::spawn(async move {
+                peer.notify(
+                    "notifications/tools/list_changed",
+                    serde_json::json!({"n":2}),
+                )
+                .await
+            })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        assert!(
+            !blocked.is_finished(),
+            "a full outbound channel must apply backpressure"
+        );
+
+        bindings.revoke_session("session");
+        assert_eq!(receiver.recv().await.unwrap()["params"]["n"], 1);
+        blocked
+            .await
+            .expect("blocked sender task")
+            .expect_err("a sender released after unload must fail closed");
+        assert!(receiver.try_recv().is_err());
+    }
+
+    struct BlockingInProcessProbe {
+        started: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::InProcessMcpHandler for BlockingInProcessProbe {
+        async fn handle(
+            &self,
+            message: serde_json::Value,
+        ) -> Result<serde_json::Value, crate::HostError> {
+            self.started.notify_one();
+            self.release.notified().await;
+            Ok(serde_json::json!({
+                "jsonrpc":"2.0",
+                "id":message["id"],
+                "result":{}
+            }))
+        }
+    }
+
+    #[tokio::test]
+    async fn direct_mcp_invoker_rejects_a_result_after_its_binding_is_revoked() {
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let bindings = Arc::new(McpBindingRegistry::default());
+        let invoker = Arc::new(DirectMcpInvoker {
+            runtime_instance_id: 1,
+            handlers: HashMap::from([(
+                "registration".into(),
+                (
+                    "server".into(),
+                    Arc::new(BlockingInProcessProbe {
+                        started: started.clone(),
+                        release: release.clone(),
+                    }) as Arc<dyn crate::InProcessMcpHandler>,
+                ),
+            )]),
+            bindings: bindings.clone(),
+            host_services: Default::default(),
+        });
+        let binding_id = bindings.bind("session");
+        let invocation = {
+            let invoker = invoker.clone();
+            tokio::spawn(async move {
+                xai_grok_mcp::acp_transport::EmbeddedMcpInvoker::invoke(
+                    invoker.as_ref(),
+                    "session",
+                    binding_id,
+                    "registration",
+                    serde_json::json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}),
+                    std::time::Duration::from_secs(2),
+                )
+                .await
+            })
+        };
+        started.notified().await;
+        bindings.revoke_session("session");
+        release.notify_one();
+        let error = invocation
+            .await
+            .expect("invocation task")
+            .expect_err("a revoked binding cannot accept a late result");
+        assert!(error.contains("stale or not resident"));
+    }
+
+    fn permission_client(handler: Option<Arc<dyn crate::ToolPermissionHandler>>) -> Client {
+        let (events, _) = mpsc::unbounded_channel();
+        Client {
+            events,
+            sequences: Rc::new(RefCell::new(HashMap::new())),
+            retained: Rc::new(RefCell::new(HashMap::new())),
+            capacity: 1,
+            host: None,
+            tool_permission_handler: handler,
+            host_extension_methods: HashSet::new(),
+            agent_hooks: HashMap::new(),
+            turns: Rc::new(RefCell::new(HashMap::new())),
+            replay: Rc::new(RefCell::new(HashMap::new())),
+        }
+    }
+
+    fn permission_request() -> acp::RequestPermissionRequest {
+        acp::RequestPermissionRequest::new(
+            "session-typed",
+            acp::ToolCallUpdate::new(
+                "call-1",
+                acp::ToolCallUpdateFields::new()
+                    .title("Run tests")
+                    .kind(acp::ToolKind::Execute)
+                    .status(acp::ToolCallStatus::Pending)
+                    .raw_input(serde_json::json!({"command":"cargo test"}))
+                    .raw_output(serde_json::json!({"preview":true})),
+            ),
+            [
+                ("once", "Once", acp::PermissionOptionKind::AllowOnce),
+                ("always", "Always", acp::PermissionOptionKind::AllowAlways),
+                ("reject", "Reject", acp::PermissionOptionKind::RejectOnce),
+                ("never", "Never", acp::PermissionOptionKind::RejectAlways),
+            ]
+            .into_iter()
+            .map(|(id, name, kind)| acp::PermissionOption::new(id, name, kind))
+            .collect(),
+        )
+    }
+
+    #[tokio::test]
+    async fn typed_permission_policy_parses_routes_and_fails_closed() {
+        use agent_client_protocol::Client as _;
+        let policy = Arc::new(PermissionPolicy {
+            decision: Ok(crate::ToolPermissionDecision::Selected("always".into())),
+            requests: Default::default(),
+        });
+        let response = permission_client(Some(policy.clone()))
+            .request_permission(permission_request())
+            .await
+            .unwrap();
+        assert!(
+            matches!(response.outcome, acp::RequestPermissionOutcome::Selected(ref selected) if selected.option_id.0.as_ref() == "always")
+        );
+        let requests = policy.requests.lock().unwrap();
+        let request = &requests[0];
+        assert_eq!(request.session_id, "session-typed");
+        assert_eq!(request.tool_call.id, "call-1");
+        assert_eq!(request.tool_call.title.as_deref(), Some("Run tests"));
+        assert_eq!(request.tool_call.kind, Some(crate::ToolKind::Execute));
+        assert_eq!(
+            request.tool_call.raw_input.as_ref().unwrap()["command"],
+            "cargo test"
+        );
+        assert_eq!(request.raw["toolCall"]["rawOutput"]["preview"], true);
+        assert_eq!(
+            request.options.iter().map(|o| o.kind).collect::<Vec<_>>(),
+            vec![
+                crate::ToolPermissionOptionKind::AllowOnce,
+                crate::ToolPermissionOptionKind::AllowAlways,
+                crate::ToolPermissionOptionKind::RejectOnce,
+                crate::ToolPermissionOptionKind::RejectAlways
+            ]
+        );
+        drop(requests);
+
+        let invalid = Arc::new(PermissionPolicy {
+            decision: Ok(crate::ToolPermissionDecision::Selected("invented".into())),
+            requests: Default::default(),
+        });
+        let error = permission_client(Some(invalid))
+            .request_permission(permission_request())
+            .await
+            .unwrap_err();
+        assert_eq!(i32::from(error.code), -32602);
+
+        let failing = Arc::new(PermissionPolicy {
+            decision: Err(crate::ToolPermissionError {
+                message: "denied by policy service".into(),
+                data: serde_json::json!({"rule":"prod"}),
+            }),
+            requests: Default::default(),
+        });
+        let error = permission_client(Some(failing))
+            .request_permission(permission_request())
+            .await
+            .unwrap_err();
+        assert_eq!(i32::from(error.code), -32603);
+
+        let cancelled = permission_client(None)
+            .request_permission(permission_request())
+            .await
+            .unwrap();
+        assert!(matches!(
+            cancelled.outcome,
+            acp::RequestPermissionOutcome::Cancelled
+        ));
+    }
 
     #[derive(Default)]
     struct EchoHost {
@@ -2671,6 +3835,258 @@ mod tests {
         assert!(native_rewind_already_applied(&[drifted], 1, &ledger).is_err());
     }
 
+    #[test]
+    fn known_mcp_notifications_are_typed_and_unknown_methods_fail_closed() {
+        let payload = serde_json::json!({
+            "sessionId": "session-1",
+            "name": "fixture",
+            "source": "local",
+            "status": "needs_auth",
+            "reason": "auth_expired",
+            "detail": "reauthorize",
+            "tools": null,
+            "future": {"preserved": true}
+        });
+        assert!(matches!(
+            typed_mcp_notification("x.ai/mcp/server_status", &payload),
+            Some(EventUpdate::McpServerStatus(crate::McpServerStatusEvent {
+                name,
+                status: crate::McpServerStatus::NeedsAuth,
+                reason: crate::McpServerStatusReason::AuthExpired,
+                ..
+            })) if name == "fixture"
+        ));
+        assert!(typed_mcp_notification("x.ai/mcp/future_notification", &payload).is_none());
+
+        let task_status = typed_mcp_notification(
+            "x.ai/mcp/task_status",
+            &serde_json::json!({
+                "sessionId": "session-1",
+                "server": "fixture",
+                "clientId": 17,
+                "task": {
+                    "taskId": "task-1",
+                    "status": "completed",
+                    "statusMessage": "done",
+                    "lastUpdatedAt": "2026-08-09T00:00:00Z",
+                    "result": {"secret": "must-not-escape"},
+                    "_meta": {"token": "must-not-escape"}
+                }
+            }),
+        )
+        .expect("typed Task status event");
+        let serialized = serde_json::to_string(&task_status).expect("Task event serializes");
+        assert!(!serialized.contains("must-not-escape"));
+        assert!(matches!(
+            task_status,
+            EventUpdate::McpTaskStatus(crate::McpTaskStatusEvent {
+                status: crate::McpTaskStatus::Completed,
+                handle: crate::McpTaskHandle { client_id: 17, .. },
+                ..
+            })
+        ));
+        assert!(
+            typed_mcp_notification(
+                "x.ai/mcp/task_status",
+                &serde_json::json!({
+                    "sessionId": "session-1",
+                    "server": "fixture",
+                    "clientId": 17,
+                    "task": {
+                        "taskId": "task-1",
+                        "status": "future_status",
+                        "lastUpdatedAt": "2026-08-09T00:00:00Z"
+                    }
+                }),
+            )
+            .is_none()
+        );
+
+        let servers = typed_mcp_notification(
+            "x.ai/mcp/servers_updated",
+            &serde_json::json!({
+                "sessionId": "session-1",
+                "mcpServers": [{
+                    "name": "fixture",
+                    "source": "local",
+                    "type": "stdio",
+                    "env": [{"name": "TOKEN", "value": "must-not-escape"}],
+                    "session": {
+                        "enabled": true,
+                        "tools": [{"name":"echo","_meta":{"token":"tool-meta-secret"}}],
+                        "negotiated": {
+                            "protocolVersion":"2026-07-28",
+                            "capabilities": {
+                                "tools":{},
+                                "extensions":{"future":{"token":"extension-secret"}},
+                                "future":{"token":"capability-raw-secret"}
+                            }
+                        }
+                    }
+                }]
+            }),
+        )
+        .expect("typed server catalog event");
+        let serialized = serde_json::to_string(&servers).expect("event serializes");
+        for secret in [
+            "must-not-escape",
+            "tool-meta-secret",
+            "extension-secret",
+            "capability-raw-secret",
+        ] {
+            assert!(!serialized.contains(secret), "event leaked {secret}");
+        }
+    }
+
+    #[tokio::test]
+    async fn mcp_notifications_never_forward_raw_catalog_secrets_to_the_host() {
+        use agent_client_protocol::Client as _;
+
+        let (events, mut event_rx) = mpsc::unbounded_channel();
+        let host = Arc::new(EchoHost::default());
+        let client = Client {
+            events,
+            sequences: Rc::new(RefCell::new(HashMap::new())),
+            retained: Rc::new(RefCell::new(HashMap::new())),
+            capacity: 4,
+            host: Some(host.clone()),
+            tool_permission_handler: None,
+            host_extension_methods: HashSet::new(),
+            agent_hooks: HashMap::new(),
+            turns: Rc::new(RefCell::new(HashMap::new())),
+            replay: Rc::new(RefCell::new(HashMap::new())),
+        };
+        let payload = serde_json::json!({
+            "sessionId":"session-1",
+            "mcpServers":[
+                {
+                    "name":"http-fixture",
+                    "source":"local",
+                    "type":"http",
+                    "url":"https://user:url-secret@example.invalid/mcp",
+                    "setupValues":{"token":"setup-secret"},
+                    "session":{
+                        "enabled":true,
+                        "tools":[{"name":"echo","_meta":{"token":"tool-meta-secret"}}],
+                        "negotiated":{
+                            "protocolVersion":"2026-07-28",
+                            "capabilities":{
+                                "tools":{},
+                                "extensions":{"future":{"token":"extension-secret"}},
+                                "future":{"token":"capability-raw-secret"}
+                            }
+                        }
+                    }
+                },
+                {
+                    "name":"stdio-fixture",
+                    "source":"local",
+                    "type":"stdio",
+                    "command":"/secret/command",
+                    "args":["--token","argument-secret"],
+                    "env":[{"name":"TOKEN","value":"environment-secret"}],
+                    "session":{"enabled":true,"tools":[]}
+                }
+            ]
+        });
+        client
+            .ext_notification(acp::ExtNotification::new(
+                "x.ai/mcp/servers_updated",
+                Arc::from(serde_json::value::to_raw_value(&payload).unwrap()),
+            ))
+            .await
+            .expect("typed MCP catalog notification");
+        let event = event_rx.recv().await.expect("redacted typed event");
+        let serialized = serde_json::to_string(&event).expect("event serializes");
+        for secret in [
+            "url-secret",
+            "setup-secret",
+            "/secret/command",
+            "argument-secret",
+            "environment-secret",
+            "tool-meta-secret",
+            "extension-secret",
+            "capability-raw-secret",
+        ] {
+            assert!(!serialized.contains(secret), "journal leaked {secret}");
+        }
+        assert!(host.notifications.lock().unwrap().is_empty());
+
+        for (method, payload, secrets) in [
+            (
+                "x.ai/mcp/server_status",
+                serde_json::json!({
+                    "sessionId":"session-1",
+                    "name":"fixture",
+                    "source":"local",
+                    "status":"unavailable",
+                    "reason":"handshake_failed",
+                    "detail":"status-detail-secret",
+                    "tools":{"token":"status-tools-secret"},
+                    "future":{"token":"status-raw-secret"}
+                }),
+                [
+                    "status-detail-secret",
+                    "status-tools-secret",
+                    "status-raw-secret",
+                ],
+            ),
+            (
+                "x.ai/mcp/tools_changed",
+                serde_json::json!({
+                    "sessionId":"session-1",
+                    "serverName":"fixture",
+                    "tools":[{"name":"echo","_meta":{"token":"changed-meta-secret"}}],
+                    "future":{"token":"changed-raw-secret"}
+                }),
+                ["changed-meta-secret", "changed-raw-secret", "unused-secret"],
+            ),
+            (
+                "x.ai/mcp/init_progress",
+                serde_json::json!({
+                    "sessionId":"session-1",
+                    "connected":1,
+                    "total":2,
+                    "future":{"token":"progress-raw-secret"}
+                }),
+                ["progress-raw-secret", "unused-secret", "unused-secret"],
+            ),
+        ] {
+            client
+                .ext_notification(acp::ExtNotification::new(
+                    method,
+                    Arc::from(serde_json::value::to_raw_value(&payload).unwrap()),
+                ))
+                .await
+                .expect("known MCP notification");
+            let event = event_rx.recv().await.expect("typed MCP event");
+            let serialized = serde_json::to_string(&event).expect("event serializes");
+            for secret in secrets {
+                assert!(!serialized.contains(secret), "journal leaked {secret}");
+            }
+        }
+        assert!(host.notifications.lock().unwrap().is_empty());
+
+        client
+            .ext_notification(acp::ExtNotification::new(
+                "x.ai/mcp/future_catalog",
+                Arc::from(
+                    serde_json::value::to_raw_value(&serde_json::json!({
+                        "sessionId":"session-1",
+                        "futureSecret":"must-not-enter-an-untyped-fallback"
+                    }))
+                    .unwrap(),
+                ),
+            ))
+            .await
+            .expect("unknown MCP notifications are suppressed");
+        assert!(matches!(
+            event_rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+        assert!(host.notifications.lock().unwrap().is_empty());
+    }
+
     #[tokio::test]
     async fn reverse_extension_transport_preserves_json_and_journals_notifications() {
         use agent_client_protocol::Client as _;
@@ -2683,7 +4099,9 @@ mod tests {
             retained: Rc::new(RefCell::new(HashMap::new())),
             capacity: 4,
             host: Some(host.clone()),
+            tool_permission_handler: None,
             host_extension_methods: HashSet::from(["host.desktop/screenshot".into()]),
+            agent_hooks: HashMap::new(),
             turns: Rc::new(RefCell::new(HashMap::new())),
             replay: Rc::new(RefCell::new(HashMap::new())),
         };
@@ -2735,5 +4153,73 @@ mod tests {
         assert_eq!(notifications.len(), 1);
         assert_eq!(notifications[0].method, "host.desktop/window_changed");
         assert_eq!(notifications[0].params, notification_params);
+    }
+
+    struct RecordingHook(std::sync::Mutex<Vec<crate::AgentHookInvocation>>);
+    #[async_trait::async_trait]
+    impl crate::AgentHookHandler for RecordingHook {
+        async fn handle(
+            &self,
+            invocation: crate::AgentHookInvocation,
+        ) -> Result<crate::AgentHookResponse, crate::AgentHookError> {
+            self.0.lock().unwrap().push(invocation);
+            Ok(crate::AgentHookResponse {
+                decision: crate::AgentHookDecision::Deny,
+                system_message: Some("policy denied".into()),
+                ..Default::default()
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn reverse_hook_transport_is_typed_and_fails_closed() {
+        use agent_client_protocol::Client as _;
+        let (events, _) = mpsc::unbounded_channel();
+        let hook = Arc::new(RecordingHook(std::sync::Mutex::new(Vec::new())));
+        let client = Client {
+            events,
+            sequences: Rc::new(RefCell::new(HashMap::new())),
+            retained: Rc::new(RefCell::new(HashMap::new())),
+            capacity: 1,
+            host: None,
+            tool_permission_handler: None,
+            host_extension_methods: HashSet::new(),
+            agent_hooks: HashMap::from([("pre".into(), hook.clone() as _)]),
+            turns: Rc::new(RefCell::new(HashMap::new())),
+            replay: Rc::new(RefCell::new(HashMap::new())),
+        };
+        let payload = serde_json::json!({
+            "hookCallbackId":"pre", "hookEventName":"pre_tool_use",
+            "sessionId":"s", "cwd":"/tmp", "toolName":"write_file",
+            "toolUseId":"call", "toolInput":{"path":"a"}, "future":42
+        });
+        let response = client
+            .ext_method(acp::ExtRequest::new(
+                "x.ai/hooks/run",
+                Arc::from(serde_json::value::to_raw_value(&payload).unwrap()),
+            ))
+            .await
+            .unwrap();
+        let response: serde_json::Value = serde_json::from_str(response.0.get()).unwrap();
+        assert_eq!(response["decision"], "deny");
+        assert_eq!(response["systemMessage"], "policy denied");
+        let calls = hook.0.lock().unwrap();
+        assert_eq!(calls[0].event, crate::AgentHookEvent::PreToolUse);
+        assert_eq!(calls[0].tool_name.as_deref(), Some("write_file"));
+        assert_eq!(calls[0].tool_input.as_ref().unwrap()["path"], "a");
+        assert_eq!(calls[0].raw["future"], 42);
+        drop(calls);
+
+        let unknown = serde_json::json!({
+            "hookCallbackId":"missing", "hookEventName":"post_tool_use", "sessionId":"s"
+        });
+        let error = client
+            .ext_notification(acp::ExtNotification::new(
+                "x.ai/hooks/event",
+                Arc::from(serde_json::value::to_raw_value(&unknown).unwrap()),
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(i32::from(error.code), -32601);
     }
 }

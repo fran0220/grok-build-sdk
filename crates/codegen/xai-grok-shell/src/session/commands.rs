@@ -468,6 +468,8 @@ pub enum SessionCommand {
         /// caller via `merge_managed_mcp_servers` (with OAuth headers injected).
         /// `None` when disabling.
         server_config: Option<acp::McpServer>,
+        /// Whether the change should also update the user's on-disk preference.
+        persist: bool,
         respond_to: oneshot::Sender<Result<(), acp::Error>>,
     },
     /// Toggle a single MCP tool on/off within a server. The server stays connected;
@@ -477,6 +479,8 @@ pub enum SessionCommand {
         tool_name: String,
         enabled: bool,
         is_managed_gateway: bool,
+        /// Whether the change should also update the user's on-disk preference.
+        persist: bool,
         respond_to: oneshot::Sender<Result<(), acp::Error>>,
     },
     /// Read MCP status: which servers are configured, which clients are healthy, what tools.
@@ -520,6 +524,22 @@ pub enum SessionCommand {
         respond_to:
             oneshot::Sender<Result<crate::extensions::mcp::McpReadResourceResponse, String>>,
     },
+    McpPrimitive {
+        server_name: String,
+        operation: crate::extensions::mcp::McpPrimitiveOperation,
+        respond_to: oneshot::Sender<Result<serde_json::Value, String>>,
+    },
+    McpModernOperation {
+        server_name: String,
+        operation: crate::extensions::mcp::McpModernOperation,
+        respond_to: oneshot::Sender<Result<serde_json::Value, String>>,
+    },
+    McpModernSubscribe {
+        server_name: String,
+        filter: crate::extensions::mcp::McpModernSubscriptionFilter,
+        capacity: std::num::NonZeroUsize,
+        respond_to: oneshot::Sender<Result<crate::extensions::mcp::McpModernSubscription, String>>,
+    },
     McpAuthStatus {
         respond_to: oneshot::Sender<Vec<crate::extensions::mcp::McpAuthStatusEntry>>,
     },
@@ -546,6 +566,24 @@ pub enum SessionCommand {
     DeleteScheduledTask {
         task_id: String,
         respond_to: oneshot::Sender<Result<bool, String>>,
+    },
+    UpsertScheduledTask {
+        request:
+            xai_grok_tools::implementations::grok_build::scheduler::create::SchedulerCreateInput,
+        respond_to: oneshot::Sender<
+            Result<
+                (
+                    xai_grok_tools::implementations::grok_build::scheduler::types::ScheduledTask,
+                    bool,
+                ),
+                String,
+            >,
+        >,
+    },
+    ListScheduledTasks {
+        respond_to: oneshot::Sender<
+            Vec<xai_grok_tools::implementations::grok_build::scheduler::types::ScheduledTask>,
+        >,
     },
     /// List all background tasks.
     /// Routes through the ToolBridge's TerminalBackend.

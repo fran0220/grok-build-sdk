@@ -386,9 +386,124 @@ struct DeleteScheduledTaskResponse {
     deleted: bool,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UpsertScheduledTaskRequest {
+    session_id: String,
+    #[serde(default)]
+    task_id: Option<String>,
+    #[serde(default)]
+    interval: Option<String>,
+    #[serde(default)]
+    prompt: Option<String>,
+    #[serde(default = "scheduler_default_true")]
+    recurring: bool,
+    #[serde(default)]
+    durable: Option<bool>,
+    #[serde(default)]
+    foreground: Option<bool>,
+    #[serde(default)]
+    fire_immediately: bool,
+}
+fn scheduler_default_true() -> bool {
+    true
+}
+impl From<UpsertScheduledTaskRequest>
+    for xai_grok_tools::implementations::grok_build::scheduler::create::SchedulerCreateInput
+{
+    fn from(request: UpsertScheduledTaskRequest) -> Self {
+        Self {
+            task_id: request.task_id,
+            interval: request.interval,
+            prompt: request.prompt,
+            recurring: request.recurring,
+            durable: request.durable,
+            foreground: request.foreground,
+            fire_immediately: request.fire_immediately,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ListScheduledTasksRequest {
+    session_id: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ScheduledTaskDto {
+    id: String,
+    interval_seconds: u64,
+    prompt: String,
+    recurring: bool,
+    durable: bool,
+    foreground: bool,
+    created_at: String,
+    last_fired_at: Option<String>,
+    expires_at: Option<String>,
+    last_subagent: Option<String>,
+    next_fire_at: String,
+}
+impl From<xai_grok_tools::implementations::grok_build::scheduler::types::ScheduledTask>
+    for ScheduledTaskDto
+{
+    fn from(
+        t: xai_grok_tools::implementations::grok_build::scheduler::types::ScheduledTask,
+    ) -> Self {
+        Self {
+            next_fire_at: t.next_fire_at().to_rfc3339(),
+            id: t.id,
+            interval_seconds: t.interval_secs,
+            prompt: t.prompt,
+            recurring: t.recurring,
+            durable: t.durable,
+            foreground: t.foreground,
+            created_at: t.created_at.to_rfc3339(),
+            last_fired_at: t.last_fired_at.map(|v| v.to_rfc3339()),
+            expires_at: t.expires_at.map(|v| v.to_rfc3339()),
+            last_subagent: t.last_subagent_id,
+        }
+    }
+}
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UpsertScheduledTaskResponse {
+    task: ScheduledTaskDto,
+    updated: bool,
+}
+#[derive(Debug, Clone, Serialize)]
+struct ListScheduledTasksResponse {
+    tasks: Vec<ScheduledTaskDto>,
+}
+
 /// Handle `x.ai/scheduler/*` extension methods.
 pub(crate) async fn handle_scheduler(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult {
     match args.method.as_ref() {
+        "x.ai/scheduler/create" => {
+            let req: UpsertScheduledTaskRequest = parse(args)?;
+            let session_id = req.session_id.clone();
+            respond(
+                agent
+                    .upsert_scheduled_task(&session_id, req.into())
+                    .await
+                    .map(|(task, updated)| UpsertScheduledTaskResponse {
+                        task: task.into(),
+                        updated,
+                    }),
+            )
+        }
+        "x.ai/scheduler/list" => {
+            let req: ListScheduledTasksRequest = parse(args)?;
+            respond(
+                agent
+                    .list_scheduled_tasks(&req.session_id)
+                    .await
+                    .map(|tasks| ListScheduledTasksResponse {
+                        tasks: tasks.into_iter().map(Into::into).collect(),
+                    }),
+            )
+        }
         "x.ai/scheduler/delete" => {
             let req: DeleteScheduledTaskRequest = parse(args)?;
             let result = agent
@@ -485,6 +600,23 @@ mod tests {
         let json = serde_json::to_value(&resp).expect("should serialize");
         assert_eq!(json["taskId"], "task-42");
         assert_eq!(json["deleted"], true);
+    }
+
+    #[test]
+    fn upsert_scheduled_task_request_preserves_camel_case_update_id() {
+        let request: UpsertScheduledTaskRequest = serde_json::from_value(serde_json::json!({
+            "sessionId": "sess-1",
+            "taskId": "task-42",
+            "interval": "10m",
+            "prompt": "inspect the update"
+        }))
+        .expect("should parse");
+        assert_eq!(request.session_id, "sess-1");
+        let input: xai_grok_tools::implementations::grok_build::scheduler::create::SchedulerCreateInput = request.into();
+        assert_eq!(input.task_id.as_deref(), Some("task-42"));
+        assert_eq!(input.interval.as_deref(), Some("10m"));
+        assert_eq!(input.prompt.as_deref(), Some("inspect the update"));
+        assert!(input.recurring);
     }
 
     #[test]

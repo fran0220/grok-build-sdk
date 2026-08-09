@@ -121,18 +121,34 @@ impl SchedulerActor {
         }
     }
 
-    async fn persist_resources(&self) -> Result<(), SchedulerError> {
-        let acknowledgement = {
-            let resources = self.resources.lock().await;
-            self.resources_persistence
-                .enqueue_save_and_flush(resources.serialize())
-                .map_err(SchedulerError::Persistence)?
-        };
+    async fn persist_snapshot(&self, snapshot: serde_json::Value) -> Result<(), SchedulerError> {
+        let acknowledgement = self
+            .resources_persistence
+            .enqueue_save_and_flush(snapshot)
+            .map_err(SchedulerError::Persistence)?;
         self.await_bounded(
             crate::persistence::ResourcesPersistence::await_save_and_flush(acknowledgement),
             SchedulerError::Persistence,
         )
         .await
+    }
+
+    async fn persist_resources(&self) -> Result<(), SchedulerError> {
+        let snapshot = self.resources.lock().await.serialize();
+        self.persist_snapshot(snapshot).await
+    }
+
+    async fn persist_rollback(
+        &self,
+        original_error: SchedulerError,
+        snapshot: serde_json::Value,
+    ) -> SchedulerError {
+        match self.persist_snapshot(snapshot).await {
+            Ok(()) => original_error,
+            Err(rollback_error) => SchedulerError::DurabilityOutcomeUnknown(format!(
+                "mutation failed with {original_error}; rollback failed with {rollback_error}"
+            )),
+        }
     }
 
     async fn publish_durable_removal(
@@ -784,6 +800,23 @@ impl SchedulerActor {
                 }
                 let mut reservation = self.clock.prepare_transition(1);
                 state.tasks.push(task.clone());
+                drop(res);
+                if task.durable
+                    && let Err(error) = self.persist_resources().await
+                {
+                    let mut res = self.resources.lock().await;
+                    res.get_or_default::<State<SchedulerState>>()
+                        .tasks
+                        .retain(|candidate| candidate.id != task.id);
+                    let rollback = res.serialize();
+                    drop(res);
+                    // The acknowledged rollback is queued behind any timed-out
+                    // write whose final outcome is unknown. A definitive error
+                    // therefore means the failed mutation is durably absent.
+                    let error = self.persist_rollback(error, rollback).await;
+                    let _ = reply.send(Err(error));
+                    return;
+                }
                 let commit = reservation.commit_next(&mut self.clock);
                 log_rollover("create", Some(&task.id), commit.rollover);
                 self.notification_handle
@@ -808,6 +841,7 @@ impl SchedulerActor {
                     return;
                 };
                 let mut reservation = self.clock.prepare_transition(1);
+                let original = state.tasks[index].clone();
                 let task = &mut state.tasks[index];
                 if let Some(prompt) = prompt {
                     // A new prompt is a new job: the next fire starts a fresh
@@ -828,6 +862,25 @@ impl SchedulerActor {
                 }
                 let updated = task.clone();
                 drop(res);
+
+                if updated.durable
+                    && let Err(error) = self.persist_resources().await
+                {
+                    let mut res = self.resources.lock().await;
+                    if let Some(task) = res
+                        .get_or_default::<State<SchedulerState>>()
+                        .tasks
+                        .iter_mut()
+                        .find(|candidate| candidate.id == id)
+                    {
+                        *task = original;
+                    }
+                    let rollback = res.serialize();
+                    drop(res);
+                    let error = self.persist_rollback(error, rollback).await;
+                    let _ = reply.send(Err(error));
+                    return;
+                }
 
                 let commit = reservation.commit_next(&mut self.clock);
                 log_rollover("update", Some(&id), commit.rollover);
@@ -1073,6 +1126,173 @@ mod tests {
         assert_eq!(snapshot.tasks[0].prompt, "check deploy");
 
         cancel.cancel();
+    }
+
+    #[tokio::test]
+    async fn durable_create_and_update_reply_only_after_persistence_acknowledges() {
+        let (mut actor, _notifications) = make_boundary_actor(Vec::new(), 0);
+        let (persistence, mut saves) = crate::persistence::ResourcesPersistence::controlled();
+        actor.resources_persistence = Arc::new(persistence);
+
+        {
+            let mut task = ScheduledTask::new(300, "durable create".into(), true, true);
+            task.id = "durable-task".into();
+            let (create_reply, mut create_response) = tokio::sync::oneshot::channel();
+            let create = actor.handle_command(SchedulerCommand::Create {
+                task,
+                reply: create_reply,
+            });
+            tokio::pin!(create);
+            let (create_snapshot, create_acknowledgement) = tokio::select! {
+                _ = &mut create => panic!("durable create replied before persistence"),
+                save = saves.recv() => save.expect("durable create save"),
+            };
+            assert!(create_snapshot.to_string().contains("durable create"));
+            assert!(matches!(
+                create_response.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+            ));
+            create_acknowledgement.send(Ok(())).unwrap();
+            create.await;
+            assert_eq!(create_response.await.unwrap().unwrap().id, "durable-task");
+        }
+
+        {
+            let (update_reply, mut update_response) = tokio::sync::oneshot::channel();
+            let update = actor.handle_command(SchedulerCommand::Update {
+                id: "durable-task".into(),
+                prompt: Some("durable update".into()),
+                interval_secs: None,
+                reply: update_reply,
+            });
+            tokio::pin!(update);
+            let (update_snapshot, update_acknowledgement) = tokio::select! {
+                _ = &mut update => panic!("durable update replied before persistence"),
+                save = saves.recv() => save.expect("durable update save"),
+            };
+            assert!(update_snapshot.to_string().contains("durable update"));
+            assert!(matches!(
+                update_response.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+            ));
+            update_acknowledgement.send(Ok(())).unwrap();
+            update.await;
+            assert_eq!(
+                update_response.await.unwrap().unwrap().prompt,
+                "durable update"
+            );
+        }
+
+        let (failed_reply, mut failed_response) = tokio::sync::oneshot::channel();
+        let failed_update = actor.handle_command(SchedulerCommand::Update {
+            id: "durable-task".into(),
+            prompt: Some("must roll back".into()),
+            interval_secs: None,
+            reply: failed_reply,
+        });
+        tokio::pin!(failed_update);
+        let (_, failed_acknowledgement) = tokio::select! {
+            _ = &mut failed_update => panic!("failed durable update replied before persistence"),
+            save = saves.recv() => save.expect("failed durable update save"),
+        };
+        failed_acknowledgement
+            .send(Err(std::io::Error::other("injected persistence failure")))
+            .unwrap();
+        let (rollback_snapshot, rollback_acknowledgement) = tokio::select! {
+            _ = &mut failed_update => panic!("failed durable update replied before rollback persistence"),
+            save = saves.recv() => save.expect("durable update rollback save"),
+        };
+        assert!(rollback_snapshot.to_string().contains("durable update"));
+        assert!(!rollback_snapshot.to_string().contains("must roll back"));
+        assert!(matches!(
+            failed_response.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+        rollback_acknowledgement.send(Ok(())).unwrap();
+        failed_update.await;
+        assert!(matches!(
+            failed_response.await.unwrap(),
+            Err(SchedulerError::Persistence(_))
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn timed_out_durable_create_waits_for_an_acknowledged_rollback() {
+        let (mut actor, _notifications) = make_boundary_actor(Vec::new(), 0);
+        let (persistence, mut saves) = crate::persistence::ResourcesPersistence::controlled();
+        actor.resources_persistence = Arc::new(persistence);
+
+        let mut task = ScheduledTask::new(300, "timed out create".into(), true, true);
+        task.id = "timed-out-task".into();
+        let (reply, mut response) = tokio::sync::oneshot::channel();
+        let create = actor.handle_command(SchedulerCommand::Create { task, reply });
+        tokio::pin!(create);
+        let (_, original_acknowledgement) = tokio::select! {
+            _ = &mut create => panic!("durable create replied before persistence"),
+            save = saves.recv() => save.expect("durable create save"),
+        };
+
+        tokio::time::advance(DURABILITY_BARRIER_TIMEOUT + Duration::from_secs(1)).await;
+        let (rollback_snapshot, rollback_acknowledgement) = tokio::select! {
+            _ = &mut create => panic!("timed-out create replied before rollback persistence"),
+            save = saves.recv() => save.expect("durable create rollback save"),
+        };
+        assert!(!rollback_snapshot.to_string().contains("timed out create"));
+        assert!(matches!(
+            response.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+        assert!(original_acknowledgement.send(Ok(())).is_err());
+        rollback_acknowledgement.send(Ok(())).unwrap();
+        create.await;
+        assert!(matches!(
+            response.await.unwrap(),
+            Err(SchedulerError::Timeout)
+        ));
+    }
+
+    #[tokio::test]
+    async fn failed_durable_rollback_reports_an_unknown_outcome() {
+        let (mut actor, _notifications) = make_boundary_actor(Vec::new(), 0);
+        let (persistence, mut saves) = crate::persistence::ResourcesPersistence::controlled();
+        actor.resources_persistence = Arc::new(persistence);
+
+        {
+            let mut task = ScheduledTask::new(300, "uncertain create".into(), true, true);
+            task.id = "uncertain-task".into();
+            let (reply, response) = tokio::sync::oneshot::channel();
+            let create = actor.handle_command(SchedulerCommand::Create { task, reply });
+            tokio::pin!(create);
+            let (_, original_acknowledgement) = tokio::select! {
+                _ = &mut create => panic!("durable create replied before persistence"),
+                save = saves.recv() => save.expect("durable create save"),
+            };
+            original_acknowledgement
+                .send(Err(std::io::Error::other("injected write failure")))
+                .unwrap();
+            let (_, rollback_acknowledgement) = tokio::select! {
+                _ = &mut create => panic!("durable create replied before rollback persistence"),
+                save = saves.recv() => save.expect("durable create rollback save"),
+            };
+            rollback_acknowledgement
+                .send(Err(std::io::Error::other("injected rollback failure")))
+                .unwrap();
+            create.await;
+            assert!(matches!(
+                response.await.unwrap(),
+                Err(SchedulerError::DurabilityOutcomeUnknown(_))
+            ));
+        }
+
+        assert!(
+            actor
+                .resources
+                .lock()
+                .await
+                .get_or_default::<State<SchedulerState>>()
+                .tasks
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -2463,7 +2683,10 @@ mod tests {
             .await;
         assert!(!response.await.unwrap().unwrap());
 
-        let mut replacement = ScheduledTask::new(300, "replacement".into(), true, true);
+        // This assertion is about the abandoned delete no longer blocking
+        // mutations. Keep the replacement non-durable because the test has
+        // deliberately removed its persistence directory above.
+        let mut replacement = ScheduledTask::new(300, "replacement".into(), true, false);
         replacement.id = "replacement".into();
         let (reply, response) = tokio::sync::oneshot::channel();
         actor

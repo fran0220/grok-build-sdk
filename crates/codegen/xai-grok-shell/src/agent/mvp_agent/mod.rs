@@ -743,6 +743,14 @@ pub struct MvpAgent {
     resident_roster_titles: RefCell<RosterDisplayCache>,
     pub(crate) initialize_request: OnceLock<acp::InitializeRequest>,
     pub(crate) gateway: GatewaySender,
+    /// Process-local MCP handlers installed by the embedded SDK. These bypass
+    /// ACP reverse RPC; each session receives a bound direct dispatcher.
+    embedded_mcp: RefCell<
+        Option<(
+            Vec<xai_grok_mcp::servers::AcpServerEntry>,
+            Arc<dyn xai_grok_mcp::acp_transport::EmbeddedMcpInvoker>,
+        )>,
+    >,
     /// Agent configuration. LEADER-SAFE(init-once): never mutated after construction.
     pub(crate) cfg: RefCell<AgentConfig>,
     /// Current auth method. LEADER-SAFE(shared): all clients share the same auth;
@@ -1438,6 +1446,25 @@ pub(crate) struct OrphanedTask {
     cwd: String,
 }
 impl MvpAgent {
+    /// Install SDK-owned process-local MCP servers before creating sessions.
+    /// The registrations are cloned into each subsequently spawned root session.
+    pub fn set_embedded_mcp_servers(
+        &self,
+        servers: Vec<xai_grok_mcp::servers::AcpServerEntry>,
+        invoker: Arc<dyn xai_grok_mcp::acp_transport::EmbeddedMcpInvoker>,
+    ) {
+        *self.embedded_mcp.borrow_mut() = Some((servers, invoker));
+    }
+
+    pub(super) fn embedded_mcp_servers(
+        &self,
+    ) -> Option<(
+        Vec<xai_grok_mcp::servers::AcpServerEntry>,
+        Arc<dyn xai_grok_mcp::acp_transport::EmbeddedMcpInvoker>,
+    )> {
+        self.embedded_mcp.borrow().clone()
+    }
+
     /// Replay updates from disk and drain completions.
     /// Returns `(initial_total_tokens, end_offset)`.
     pub(super) async fn replay_session_updates(

@@ -1,5 +1,32 @@
 use super::*;
 impl SessionActor {
+    /// Initialize and wait for exactly one MCP configuration generation.
+    /// A newer replacement must not accidentally satisfy an older control-plane
+    /// request; superseded callers receive an explicit error instead.
+    pub(super) async fn initialize_mcp_generation(
+        &self,
+        expected_generation: u64,
+    ) -> Result<(), acp::Error> {
+        loop {
+            let initializing = {
+                let state = self.mcp_state.lock().await;
+                if state.generation() != expected_generation {
+                    return Err(acp::Error::internal_error()
+                        .data("MCP configuration update was superseded"));
+                }
+                if state.is_initialized() {
+                    return Ok(());
+                }
+                state.is_initializing()
+            };
+            if !initializing {
+                self.ensure_mcp_tools_initialized().await;
+            } else {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        }
+    }
+
     /// Wait for MCP tools to be initialized.
     /// If initialization is in progress by another task, this will poll until complete.
     pub(super) async fn wait_for_mcp_initialized(&self) {

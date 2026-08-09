@@ -80,6 +80,78 @@ fn default_true() -> bool {
     true
 }
 
+/// Execute the scheduler control-plane operation after its shared resource has
+/// been resolved. Kept here so model tool calls and headless callers have
+/// exactly the same validation and actor-command semantics.
+pub(crate) async fn upsert_with_sender(
+    sender: tokio::sync::mpsc::UnboundedSender<SchedulerCommand>,
+    input: SchedulerCreateInput,
+) -> Result<(ScheduledTask, bool), xai_tool_runtime::ToolError> {
+    let interval_secs = input
+        .interval
+        .as_deref()
+        .map(parse_interval)
+        .transpose()
+        .map_err(|e| xai_tool_runtime::ToolError::invalid_arguments(e.to_string()))?;
+    let send_and_wait = |cmd: SchedulerCommand,
+                         rx: tokio::sync::oneshot::Receiver<
+        Result<ScheduledTask, super::types::SchedulerError>,
+    >| async {
+        sender.send(cmd).map_err(|_| {
+            xai_tool_runtime::ToolError::custom("process_manager", "Scheduler actor stopped")
+        })?;
+        rx.await
+            .map_err(|_| {
+                xai_tool_runtime::ToolError::custom(
+                    "process_manager",
+                    "Scheduler actor dropped reply",
+                )
+            })?
+            .map_err(scheduler_tool_error)
+    };
+    if let Some(task_id) = input.task_id {
+        if input.prompt.is_none() && interval_secs.is_none() {
+            return Err(xai_tool_runtime::ToolError::invalid_arguments(
+                "nothing to update: provide interval and/or prompt alongside task_id",
+            ));
+        }
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let task = send_and_wait(
+            SchedulerCommand::Update {
+                id: task_id,
+                prompt: input.prompt,
+                interval_secs,
+                reply: tx,
+            },
+            rx,
+        )
+        .await?;
+        return Ok((task, true));
+    }
+    if !input.recurring {
+        return Err(xai_tool_runtime::ToolError::invalid_arguments(
+            "one-shot tasks are not supported; run a background terminal command instead (`sleep <secs> && <command>`, background: true) or do the work now",
+        ));
+    }
+    let interval_secs = interval_secs.ok_or_else(|| {
+        xai_tool_runtime::ToolError::invalid_arguments("interval is required when creating a task")
+    })?;
+    let prompt = input.prompt.ok_or_else(|| {
+        xai_tool_runtime::ToolError::invalid_arguments("prompt is required when creating a task")
+    })?;
+    let mut task = ScheduledTask::with_fire_immediately(
+        interval_secs,
+        prompt,
+        true,
+        input.durable.unwrap_or(false),
+        input.fire_immediately,
+    );
+    task.foreground = input.foreground.unwrap_or(false);
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let task = send_and_wait(SchedulerCommand::Create { task, reply: tx }, rx).await?;
+    Ok((task, false))
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct SchedulerCreateOutput {
@@ -168,13 +240,6 @@ impl xai_tool_runtime::Tool for SchedulerCreateTool {
         use crate::types::tool_metadata::shared_resources;
         let resources = shared_resources(&ctx)?;
 
-        let interval_secs = input
-            .interval
-            .as_deref()
-            .map(parse_interval)
-            .transpose()
-            .map_err(|e| xai_tool_runtime::ToolError::invalid_arguments(e.to_string()))?;
-
         let sender = {
             let res = resources.lock().await;
             res.get::<SchedulerHandle>()
@@ -185,91 +250,11 @@ impl xai_tool_runtime::Tool for SchedulerCreateTool {
                 .clone()
         };
 
-        let send_and_wait = |cmd: SchedulerCommand,
-                             reply_rx: tokio::sync::oneshot::Receiver<
-            Result<ScheduledTask, super::types::SchedulerError>,
-        >| async move {
-            sender.send(cmd).map_err(|_| {
-                xai_tool_runtime::ToolError::custom("process_manager", "Scheduler actor stopped")
-            })?;
-            reply_rx
-                .await
-                .map_err(|_| {
-                    xai_tool_runtime::ToolError::custom(
-                        "process_manager",
-                        "Scheduler actor dropped reply",
-                    )
-                })?
-                .map_err(scheduler_tool_error)
-        };
-
-        if let Some(task_id) = input.task_id {
-            if input.prompt.is_none() && interval_secs.is_none() {
-                return Err(xai_tool_runtime::ToolError::invalid_arguments(
-                    "nothing to update: provide interval and/or prompt alongside task_id",
-                ));
-            }
-            let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-            let updated = send_and_wait(
-                SchedulerCommand::Update {
-                    id: task_id,
-                    prompt: input.prompt,
-                    interval_secs,
-                    reply: reply_tx,
-                },
-                reply_rx,
-            )
-            .await?;
-
-            return Ok(SchedulerCreateOutput {
-                id: updated.id,
-                human_schedule: interval_to_human(updated.interval_secs),
-                updated: true,
-            });
-        }
-
-        if !input.recurring {
-            return Err(xai_tool_runtime::ToolError::invalid_arguments(
-                "one-shot tasks are not supported; run a background terminal command instead \
-                 (`sleep <secs> && <command>`, background: true) or do the work now",
-            ));
-        }
-
-        let interval_secs = interval_secs.ok_or_else(|| {
-            xai_tool_runtime::ToolError::invalid_arguments(
-                "interval is required when creating a task",
-            )
-        })?;
-        let prompt = input.prompt.ok_or_else(|| {
-            xai_tool_runtime::ToolError::invalid_arguments(
-                "prompt is required when creating a task",
-            )
-        })?;
-
-        let durable = input.durable.unwrap_or(false);
-        let mut task = ScheduledTask::with_fire_immediately(
-            interval_secs,
-            prompt,
-            true,
-            durable,
-            input.fire_immediately,
-        );
-        task.foreground = input.foreground.unwrap_or(false);
-
-        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-        let created = send_and_wait(
-            SchedulerCommand::Create {
-                task,
-                reply: reply_tx,
-            },
-            reply_rx,
-        )
-        .await?;
-
+        let (created, updated) = upsert_with_sender(sender, input).await?;
         Ok(SchedulerCreateOutput {
+            human_schedule: interval_to_human(created.interval_secs),
             id: created.id,
-            human_schedule: interval_to_human(interval_secs),
-            updated: false,
+            updated,
         })
     }
 }

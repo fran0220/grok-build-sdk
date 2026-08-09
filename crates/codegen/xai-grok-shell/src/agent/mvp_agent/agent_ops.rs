@@ -2630,6 +2630,7 @@ impl MvpAgent {
             resident_roster_titles: RefCell::new(HashMap::new()),
             initialize_request: OnceLock::new(),
             gateway,
+            embedded_mcp: RefCell::new(None),
             launch_cwd: std::env::current_dir()
                 .unwrap_or_else(|_| std::path::PathBuf::from(".")),
             launch_dir_trust: std::cell::OnceCell::new(),
@@ -3080,6 +3081,27 @@ impl MvpAgent {
             handle.delete_scheduled_task(task_id).await
         } else {
             Err("session not found".to_string())
+        }
+    }
+    pub(crate) async fn upsert_scheduled_task(
+        &self,
+        session_id: &str,
+        request: xai_grok_tools::implementations::grok_build::scheduler::create::SchedulerCreateInput,
+    ) -> Result<(xai_grok_tools::implementations::grok_build::scheduler::types::ScheduledTask, bool), String> {
+        let sid = acp::SessionId::new(session_id);
+        match self.get_session_handle(&sid) {
+            Some(handle) => handle.upsert_scheduled_task(request).await,
+            None => Err("session not found".into()),
+        }
+    }
+    pub(crate) async fn list_scheduled_tasks(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<xai_grok_tools::implementations::grok_build::scheduler::types::ScheduledTask>, String> {
+        let sid = acp::SessionId::new(session_id);
+        match self.get_session_handle(&sid) {
+            Some(handle) => handle.list_scheduled_tasks().await,
+            None => Err("session not found".into()),
         }
     }
     /// Cancel a subagent by id, returning a typed outcome that backs the pager's
@@ -4811,9 +4833,15 @@ impl MvpAgent {
                     agent_name: Some(agent_definition.name.clone()),
                     reasoning_effort: initial_reasoning_effort,
                 });
-            let acp_mcp_servers = crate::session::acp_mcp::parse_acp_mcp_servers(
-                session_meta,
-            );
+            let (acp_mcp_servers, embedded_mcp_invoker) =
+                if let Some((servers, invoker)) = self.embedded_mcp_servers() {
+                    (servers, Some(invoker))
+                } else {
+                    (
+                        crate::session::acp_mcp::parse_acp_mcp_servers(session_meta),
+                        None,
+                    )
+                };
             let git_head_changed = init
                 .client_capabilities
                 .meta
@@ -4841,6 +4869,7 @@ impl MvpAgent {
                     mcp_meta_config_map,
                     None,
                     acp_mcp_servers,
+                    embedded_mcp_invoker,
                     support_permission,
                     telemetry_enabled,
                     auto_update,
@@ -5038,6 +5067,41 @@ impl MvpAgent {
         session_id: &acp::SessionId,
     ) -> Vec<PermissionEvent> {
         self.session_registry.drain_permission_events(session_id)
+    }
+
+    /// Direct headless-SDK entrypoint for MCP 2026 single-round MRTR and
+    /// generation-bound Task operations. This bypasses ACP extension DTOs;
+    /// the ACP-compatible surface remains an unrelated transport adapter.
+    pub async fn sdk_mcp_modern_operation(
+        &self,
+        session_id: &str,
+        server_name: String,
+        operation: crate::extensions::mcp::McpModernOperation,
+    ) -> Result<serde_json::Value, String> {
+        let session_id = acp::SessionId::new(session_id);
+        let handle = self
+            .session_handle_waiting_for_load(&session_id)
+            .await
+            .ok_or_else(|| "session not found".to_owned())?;
+        handle.mcp_modern_operation(server_name, operation).await
+    }
+
+    #[doc(hidden)]
+    pub async fn sdk_mcp_modern_subscribe(
+        &self,
+        session_id: &str,
+        server_name: String,
+        filter: crate::extensions::mcp::McpModernSubscriptionFilter,
+        capacity: std::num::NonZeroUsize,
+    ) -> Result<crate::extensions::mcp::McpModernSubscription, String> {
+        let session_id = acp::SessionId::new(session_id);
+        let handle = self
+            .session_handle_waiting_for_load(&session_id)
+            .await
+            .ok_or_else(|| "session not found".to_owned())?;
+        handle
+            .mcp_modern_subscribe(server_name, filter, capacity)
+            .await
     }
 }
 /// Rollback guard for mid-session bind reservation.

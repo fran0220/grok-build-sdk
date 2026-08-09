@@ -60,11 +60,15 @@ pub(crate) fn parse_acp_mcp_servers(meta: Option<&acp::Meta>) -> Vec<AcpServerEn
 /// run concurrently — the gateway serializes them onto the session's message channel.
 pub(crate) struct GatewayAcpInvoker {
     gateway: AcpAgentGatewaySender,
+    session_id: acp::SessionId,
 }
 
 impl GatewayAcpInvoker {
-    pub(crate) fn new(gateway: AcpAgentGatewaySender) -> Self {
-        Self { gateway }
+    pub(crate) fn new(gateway: AcpAgentGatewaySender, session_id: acp::SessionId) -> Self {
+        Self {
+            gateway,
+            session_id,
+        }
     }
 }
 
@@ -72,6 +76,8 @@ impl GatewayAcpInvoker {
 /// the forward side's typed `McpCallRequest`) so the `serverId` literal isn't hand-spelled.
 #[derive(serde::Serialize)]
 struct SdkCallParams<'a> {
+    #[serde(rename = "sessionId")]
+    session_id: &'a str,
     #[serde(rename = "serverId")]
     server_id: &'a str,
     message: serde_json::Value,
@@ -85,8 +91,12 @@ impl AcpReverseInvoker for GatewayAcpInvoker {
         message: serde_json::Value,
         timeout: Duration,
     ) -> Result<serde_json::Value, String> {
-        let params = serde_json::value::to_raw_value(&SdkCallParams { server_id, message })
-            .map_err(|err| err.to_string())?;
+        let params = serde_json::value::to_raw_value(&SdkCallParams {
+            session_id: self.session_id.0.as_ref(),
+            server_id,
+            message,
+        })
+        .map_err(|err| err.to_string())?;
         let request = acp::ExtRequest::new(wire::MCP_SDK_CALL, params.into());
         // Bound the round trip so a missing or hung client fails this reverse call at
         // the configured per-server tool timeout rather than stalling the tool loop.

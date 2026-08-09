@@ -586,6 +586,30 @@ impl ToolBridge {
             .unwrap_or_default()
     }
 
+    pub async fn upsert_scheduled_task(
+        &self,
+        input: crate::implementations::grok_build::scheduler::create::SchedulerCreateInput,
+    ) -> Result<
+        (
+            crate::implementations::grok_build::scheduler::types::ScheduledTask,
+            bool,
+        ),
+        xai_tool_runtime::ToolError,
+    > {
+        use crate::implementations::grok_build::scheduler::types::SchedulerHandle;
+        let sender = {
+            let res = self.registry.resources.lock().await;
+            res.get::<SchedulerHandle>()
+                .ok_or_else(|| {
+                    xai_tool_runtime::ToolError::custom("missing_resource", "SchedulerHandle")
+                })?
+                .0
+                .clone()
+        };
+        crate::implementations::grok_build::scheduler::create::upsert_with_sender(sender, input)
+            .await
+    }
+
     pub async fn delete_scheduled_task(
         &self,
         task_id: &str,
