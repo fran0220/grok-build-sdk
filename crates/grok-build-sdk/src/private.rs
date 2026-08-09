@@ -1,8 +1,8 @@
 use crate::{
-    ConversationRewindReceipt, ConversationRewindStatus, Error, Event, EventUpdate,
-    ExtensionNotification, ExtensionRequest, ExtensionResponse, LedgerTurnState, Prompt,
-    PromptBlock, PromptReceipt, RewindPoint, RuntimeCapabilities, RuntimeConfig, RuntimeOptions,
-    SessionConfig, SessionId, SessionLedger, SessionLedgerEntry, TurnOutcome,
+    AvailableModel, ConversationRewindReceipt, ConversationRewindStatus, Error, Event, EventUpdate,
+    ExtensionNotification, ExtensionRequest, ExtensionResponse, LedgerTurnState, ModelCatalog,
+    Prompt, PromptBlock, PromptReceipt, RewindPoint, RuntimeCapabilities, RuntimeConfig,
+    RuntimeOptions, SessionConfig, SessionId, SessionLedger, SessionLedgerEntry, TurnOutcome,
 };
 use agent_client_protocol as acp;
 use agent_client_protocol::Agent as _;
@@ -39,6 +39,7 @@ enum Command {
     Resume(SessionId, SessionConfig, Reply<()>),
     Prompt(SessionId, String, String, Reply<PromptReceipt>),
     PromptContent(SessionId, String, Prompt, Reply<PromptReceipt>),
+    ListModels(Reply<ModelCatalog>),
     Extension(ExtensionRequest, Reply<ExtensionResponse>),
     ExtensionNotification(ExtensionNotification, Reply<()>),
     SetMode(SessionId, String, Reply<()>),
@@ -144,6 +145,9 @@ impl Runtime {
     }
     pub fn capabilities(&self) -> RuntimeCapabilities {
         self.shared.capabilities.clone()
+    }
+    pub async fn list_models(&self) -> Result<ModelCatalog, Error> {
+        self.call(Command::ListModels).await
     }
     async fn call<T>(&self, build: impl FnOnce(Reply<T>) -> Command) -> Result<T, Error> {
         let (tx, rx) = oneshot::channel();
@@ -1070,6 +1074,9 @@ impl Core {
                         .borrow_mut()
                         .insert(task_key, task.abort_handle());
                 }
+                Command::ListModels(r) => {
+                    let _ = r.send(self.list_models().await);
+                }
                 Command::Extension(x, r) => {
                     let _ = r.send(self.extension_raw(x).await);
                 }
@@ -1648,6 +1655,37 @@ impl Core {
             .await
             .map_err(|error| protocol(method, error))?;
         serde_json::from_str(response.0.get()).map_err(op)
+    }
+    async fn list_models(&self) -> Result<ModelCatalog, Error> {
+        #[derive(serde::Deserialize)]
+        struct ModelsListResult {
+            result: Option<acp::SessionModelState>,
+            error: Option<serde_json::Value>,
+        }
+
+        let response: ModelsListResult = self
+            .extension("x.ai/models/list", serde_json::json!({}))
+            .await?;
+        if let Some(error) = response.error {
+            return Err(Error::Operation(format!("models/list failed: {error}")));
+        }
+        let state = response
+            .result
+            .ok_or_else(|| Error::Operation("models/list response missing result".into()))?;
+        Ok(ModelCatalog {
+            current_model_id: state.current_model_id.0.to_string(),
+            available_models: state
+                .available_models
+                .into_iter()
+                .map(|model| AvailableModel {
+                    id: model.model_id.0.to_string(),
+                    name: model.name,
+                    description: model.description,
+                    metadata: model.meta,
+                })
+                .collect(),
+            metadata: state.meta,
+        })
     }
     async fn extension_raw(&self, request: ExtensionRequest) -> Result<ExtensionResponse, Error> {
         if request.method.trim().is_empty() {
@@ -2516,6 +2554,13 @@ fn capabilities_for(
             host_requirement: None,
         })
         .collect::<Vec<_>>();
+    descriptors.push(crate::CapabilityDescriptor {
+        namespace: "x.ai/models/list".into(),
+        enabled: true,
+        disabled_reason: None,
+        effect_class: "read".into(),
+        host_requirement: None,
+    });
     descriptors.extend(OPTIONAL_FEATURES.iter().map(|(name, effect, host)| {
         let enabled = match *name {
             "host:filesystem" => {
@@ -2577,7 +2622,7 @@ fn capabilities_for(
                         "web-search model service not configured".into()
                     }
                 } else if *name == "feature:managed_mcp" {
-                    "managed MCP is an account-product service; configure explicit MCP transports instead".into()
+                    "managed MCP is an account-product service gateway, not a client transport or credential-injection facility; configure explicit MCP transports instead".into()
                 } else if *name == "feature:app_deployment" {
                     "App Builder deployment is not implemented in this source checkout".into()
                 } else if matches!(*name, "feature:web_fetch" | "feature:memory" | "feature:lsp") {

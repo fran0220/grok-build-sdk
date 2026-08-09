@@ -80,7 +80,19 @@ fn configure(config: RuntimeConfig) -> grok_build_sdk::RuntimeBuilder {
         .host_delegate(std::sync::Arc::new(DesktopHost))
 }
 
+// After `RuntimeBuilder::start`, hosts can discover the fixed SDK catalog
+// without enabling or exposing the generic Desktop extension bridge.
+async fn inspect_catalog(runtime: &Runtime) -> Result<(), grok_build_sdk::Error> {
+    let catalog = runtime.list_models().await?;
+    println!("current model: {}", catalog.current_model_id);
+    for model in catalog.available_models {
+        println!("available model: {} ({})", model.name, model.id);
+    }
+    Ok(())
+}
+
 fn main() {
     let _host: std::sync::Arc<dyn HostDelegate> = std::sync::Arc::new(DesktopHost);
     let _configure = configure;
+    let _inspect_catalog = inspect_catalog;
 }

@@ -215,6 +215,26 @@ pub struct RuntimeCapabilities {
     pub extension_families: Vec<CapabilityDescriptor>,
 }
 
+/// Current host-owned model catalog. This is available in both runtime
+/// profiles and never consults Grok login, disk cache, or a remote catalog.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ModelCatalog {
+    pub current_model_id: String,
+    pub available_models: Vec<AvailableModel>,
+    /// Forward-compatible catalog metadata from the ACP contract.
+    pub metadata: Option<serde_json::Map<String, serde_json::Value>>,
+}
+
+/// One selectable model, including the upstream capability metadata used for
+/// context-window, agent-harness, and reasoning-effort discovery.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct AvailableModel {
+    pub id: String,
+    pub name: String,
+    pub description: Option<String>,
+    pub metadata: Option<serde_json::Map<String, serde_json::Value>>,
+}
+
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Prompt {
     pub blocks: Vec<PromptBlock>,
@@ -513,6 +533,12 @@ impl Runtime {
     }
     pub fn capabilities(&self) -> RuntimeCapabilities {
         self.inner.capabilities()
+    }
+    /// Returns the live fixed model catalog through Grok Build's
+    /// `x.ai/models/list` contract. Unlike generic extension requests, this
+    /// typed, read-only operation is also available in Restricted runtimes.
+    pub async fn list_models(&self) -> Result<ModelCatalog, Error> {
+        self.inner.list_models().await
     }
     pub async fn extension_request(
         &self,
@@ -2614,6 +2640,75 @@ done
             })
         );
         desktop.shutdown().await.expect("desktop shuts down");
+    }
+
+    #[tokio::test]
+    async fn fixed_model_catalog_is_typed_and_available_in_restricted_profile() {
+        let root = TempDir::new().expect("temp root");
+        let (runtime, _) = Runtime::start(runtime_config(&root, "http://127.0.0.1:9/v1".into()))
+            .await
+            .expect("fixed catalog does not require a reachable catalog service");
+
+        let models = runtime.list_models().await.expect("model catalog");
+        assert_eq!(models.current_model_id, "test-model");
+        assert_eq!(models.available_models.len(), 1);
+        assert_eq!(models.available_models[0].id, "test-model");
+        let metadata = models.available_models[0]
+            .metadata
+            .as_ref()
+            .expect("model capability metadata");
+        assert_eq!(
+            metadata.get("totalContextTokens"),
+            Some(&serde_json::json!(131_072))
+        );
+        assert_eq!(
+            metadata.get("agentType"),
+            Some(&serde_json::json!("grok-build"))
+        );
+        assert!(
+            runtime
+                .capabilities()
+                .extension_families
+                .iter()
+                .any(|capability| {
+                    capability.namespace == "x.ai/models/list"
+                        && capability.enabled
+                        && capability.effect_class == "read"
+                })
+        );
+
+        runtime.shutdown().await.expect("runtime shuts down");
+    }
+
+    #[tokio::test]
+    async fn restricted_session_creation_never_evaluates_workspace_envrc() {
+        let root = TempDir::new().expect("temp root");
+        let workspace = root.path().join("workspace");
+        std::fs::create_dir(&workspace).expect("workspace");
+        let marker = root.path().join("envrc-was-evaluated");
+        std::fs::write(
+            workspace.join(".envrc"),
+            format!("printf evaluated > '{}'\n", marker.display()),
+        )
+        .expect("hostile envrc");
+
+        let (runtime, _) = Runtime::start(runtime_config(&root, "http://127.0.0.1:9/v1".into()))
+            .await
+            .expect("restricted runtime starts");
+        let session = runtime
+            .create_session(session_config(workspace))
+            .await
+            .expect("restricted session starts");
+
+        assert!(
+            !marker.exists(),
+            "Restricted must not execute a workspace .envrc"
+        );
+        runtime
+            .close_session(session)
+            .await
+            .expect("session closes");
+        runtime.shutdown().await.expect("runtime shuts down");
     }
 
     #[tokio::test]
