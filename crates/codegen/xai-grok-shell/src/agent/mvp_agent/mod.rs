@@ -729,7 +729,7 @@ pub struct MvpAgent {
     /// Feature policy, independent from the embedded persistence/process boundary.
     pub(crate) origin_profile: crate::agent::config::OriginEmbeddedProfile,
     /// Origin embedded boundary: explicit persistence root, independent of GROK_HOME.
-    storage_root: Option<PathBuf>,
+    pub(crate) storage_root: Option<PathBuf>,
     /// Host-injected semantic native-session authority. When present, the
     /// same runtime-wide instance is shared by every embedded session.
     pub(crate) session_state_authority:

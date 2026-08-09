@@ -280,6 +280,71 @@ fn copy_updates_streaming(
 }
 
 impl JsonlStorageAdapter {
+    /// Copies only non-canonical fork metadata and sidecars. Host-authority
+    /// mode must never project transcript, rewind, or checkpoint state here.
+    pub(crate) fn copy_fork_sidecars_sync(
+        &self,
+        source_info: &Info,
+        target_info: &Info,
+        options: CopySessionOptions,
+        updates_copied: usize,
+        chat_messages_copied: usize,
+    ) -> io::Result<CopySessionResult> {
+        std::fs::create_dir_all(self.session_dir(target_info))?;
+        let source_summary = self.read_summary_sync(source_info)?;
+        let target_summary = fork_summary(
+            source_summary,
+            target_info,
+            &options,
+            ForkCounters {
+                num_messages: updates_copied,
+                num_chat_messages: chat_messages_copied,
+                cwd_switch_bookkeeping_generation: 0,
+                inherited_prefix_len: None,
+            },
+        );
+        std::fs::write(
+            self.summary_file(target_info),
+            serde_json::to_vec_pretty(&target_summary).map_err(invalid_data)?,
+        )?;
+        let plan_state_copied = copy_sidecar_file(
+            options.copy_plan_state,
+            &self.plan_file(source_info),
+            &self.plan_file(target_info),
+        )?;
+        let plan_mode_state_copied = copy_sidecar_file(
+            options.copy_plan_mode_state,
+            &self.plan_mode_state_file(source_info),
+            &self.plan_mode_state_file(target_info),
+        )?;
+        let signals_copied = copy_sidecar_file(
+            options.copy_signals,
+            &self.signals_file(source_info),
+            &self.signals_file(target_info),
+        )?;
+        let tool_state_copied = copy_sidecar_file(
+            options.copy_tool_state,
+            &self.session_dir(source_info).join("tool_state.json"),
+            &self.session_dir(target_info).join("tool_state.json"),
+        )?;
+        let announcement_state_copied = copy_sidecar_file(
+            options.copy_announcement_state,
+            &self.announcement_state_file(source_info),
+            &self.announcement_state_file(target_info),
+        )?;
+        Ok(CopySessionResult {
+            chat_messages_copied,
+            updates_copied,
+            plan_state_copied,
+            plan_mode_state_copied,
+            signals_copied,
+            tool_state_copied,
+            announcement_state_copied,
+            compaction_segments_copied: 0,
+            compaction_checkpoints_copied: 0,
+        })
+    }
+
     /// Fully synchronous implementation of `copy_session_data`, for use on a
     /// blocking thread; every caller reaches it through `spawn_blocking`.
     pub(crate) fn copy_session_data_sync(

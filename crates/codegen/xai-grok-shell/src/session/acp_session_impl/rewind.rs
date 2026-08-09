@@ -348,6 +348,11 @@ impl SessionActor {
             let mut replay_compaction_marker: Option<Option<usize>> = None;
 
             if needs_replay {
+                if !self.projects_chat_history {
+                    return Err(anyhow::anyhow!(
+                        "cross-compaction rewind requires canonical authority replay"
+                    ));
+                }
                 // Cross-compaction rewind: reconstruct conversation from updates.jsonl.
                 // Run on the blocking pool since replay does synchronous file I/O
                 // (reading checkpoint files + scanning updates.jsonl).

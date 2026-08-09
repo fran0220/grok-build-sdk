@@ -7758,6 +7758,76 @@ done
         runtime.shutdown().await.expect("runtime shuts down");
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn host_session_state_store_replaces_covered_jsonl_and_restarts() {
+        fn assert_no_covered_files(root: &std::path::Path) {
+            let Ok(entries) = std::fs::read_dir(root) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    assert_ne!(
+                        path.file_name().and_then(|name| name.to_str()),
+                        Some("compaction_checkpoints"),
+                        "Host mode must not create covered checkpoint directories"
+                    );
+                    assert_no_covered_files(&path);
+                } else {
+                    assert!(
+                        !matches!(
+                            path.file_name().and_then(|name| name.to_str()),
+                            Some("updates.jsonl" | "chat_history.jsonl" | "rewind_points.jsonl")
+                        ),
+                        "Host mode created covered file {}",
+                        path.display()
+                    );
+                }
+            }
+        }
+
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let server = MockInferenceServer::start().await.expect("mock server");
+        let root = TempDir::new().expect("temp root");
+        let workspace = root.path().join("workspace");
+        std::fs::create_dir(&workspace).expect("workspace");
+        let config = runtime_config(&root, server.url());
+        let store = Arc::new(
+            LocalSessionStateStore::new(root.path().join("host-native-sessions"))
+                .expect("Host Session store"),
+        );
+        let (runtime, _) = Runtime::builder(config.clone())
+            .session_state_store(store.clone())
+            .start()
+            .await
+            .expect("runtime starts with Host Session authority");
+        let session = runtime
+            .create_session(session_config(workspace.clone()))
+            .await
+            .expect("session starts");
+        runtime
+            .prompt(&session, "host-session-state-turn", "state")
+            .await
+            .expect("turn settles");
+        runtime.shutdown().await.expect("runtime shuts down");
+        assert_no_covered_files(&config.session_storage);
+
+        let (runtime, _) = Runtime::builder(config.clone())
+            .session_state_store(store)
+            .start()
+            .await
+            .expect("runtime restarts with Host Session authority");
+        runtime
+            .load_session(session.clone(), session_config(workspace))
+            .await
+            .expect("session reloads from Host authority without JSONL fallback");
+        runtime
+            .shutdown()
+            .await
+            .expect("restarted runtime shuts down");
+        assert_no_covered_files(&config.session_storage);
+    }
+
     async fn claim_test_session_turn(
         runtime: &Runtime,
         created: &run::RunCommandResult,

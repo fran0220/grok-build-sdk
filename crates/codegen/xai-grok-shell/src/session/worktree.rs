@@ -174,6 +174,10 @@ pub(crate) async fn resume_session_in_worktree(
     registry_client: Option<&crate::agent::session_registry_client::SessionRegistryClient>,
     auth_manager: Option<std::sync::Arc<crate::auth::AuthManager>>,
     agent_id: &str,
+    storage_root: Option<std::path::PathBuf>,
+    authority: Option<
+        std::sync::Arc<dyn crate::session::state_authority::NativeSessionStateAuthority>,
+    >,
 ) -> Result<ResumeSessionInWorktreeResponse> {
     use xai_grok_workspace::session::git::effective_worktree_path;
     tracing::info!(
@@ -204,6 +208,8 @@ pub(crate) async fn resume_session_in_worktree(
             registry_client,
             auth_manager,
             agent_id,
+            storage_root,
+            authority,
         )
         .await;
     }
@@ -308,6 +314,10 @@ async fn resume_local_session_in_worktree(
     registry_client: Option<&crate::agent::session_registry_client::SessionRegistryClient>,
     auth_manager: Option<std::sync::Arc<crate::auth::AuthManager>>,
     agent_id: &str,
+    storage_root: Option<std::path::PathBuf>,
+    authority: Option<
+        std::sync::Arc<dyn crate::session::state_authority::NativeSessionStateAuthority>,
+    >,
 ) -> Result<ResumeSessionInWorktreeResponse> {
     use crate::session::fork::{ForkSessionRequest, fork_session};
     use xai_grok_workspace::session::git::effective_worktree_path;
@@ -407,13 +417,14 @@ async fn resume_local_session_in_worktree(
         source_workspace_dir: Some(resolved_source_cwd.to_owned()),
         ..Default::default()
     };
-    let fork_resp = match fork_session(fork_req, agent_id, auth_manager).await {
-        Ok(r) => r,
-        Err(e) => {
-            cleanup_worktree_on_failure(resolved_source_cwd, &wt_resp.worktree_path).await;
-            return Err(anyhow::anyhow!("Failed to fork session into worktree: {e}"));
-        }
-    };
+    let fork_resp =
+        match fork_session(fork_req, agent_id, auth_manager, storage_root, authority).await {
+            Ok(r) => r,
+            Err(e) => {
+                cleanup_worktree_on_failure(resolved_source_cwd, &wt_resp.worktree_path).await;
+                return Err(anyhow::anyhow!("Failed to fork session into worktree: {e}"));
+            }
+        };
     Ok(ResumeSessionInWorktreeResponse {
         session_id: fork_resp.new_session_id,
         worktree_path: wt_resp.worktree_path,
@@ -933,6 +944,8 @@ mod tests {
             None,
             None,
             "test-agent",
+            None,
+            None,
         )
         .await;
         let err = result.expect_err("should fail when session not found and no registry");

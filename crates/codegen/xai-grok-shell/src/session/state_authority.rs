@@ -94,5 +94,13 @@ pub trait NativeSessionStateAuthority: Send + Sync + 'static {
     fn inspect(&self, identity: &str) -> Result<SessionInspection, AuthorityError>;
     fn create(&self, id: SessionIdentity) -> Result<Arc<dyn NativeSession>, AuthorityError>;
     fn open(&self, id: SessionIdentity) -> Result<Arc<dyn NativeSession>, AuthorityError>;
+    /// Atomically publishes a fully prepared fork. The target identity must be
+    /// vacant and use a fresh generation; no partially copied target becomes
+    /// visible if publication fails.
+    fn publish_fork(
+        &self,
+        id: SessionIdentity,
+        records: Vec<ReplayRecord>,
+    ) -> Result<Arc<dyn NativeSession>, AuthorityError>;
     fn tombstone(&self, id: SessionIdentity) -> Result<(), AuthorityError>;
 }

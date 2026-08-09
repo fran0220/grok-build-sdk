@@ -599,6 +599,7 @@ pub(crate) struct ModelAuthMemo {
 /// Phase 3: Post-flight handling after dispatch (inline in execute_tool_calls for now).
 pub(crate) struct SessionActor {
     pub(crate) session_info: SessionInfo,
+    pub(crate) projects_chat_history: bool,
     /// Shared live handle to the current ACP auth method. Normal sessions hold a
     /// clone of `MvpAgent::auth_method_id`, so a mid-session `/login` is picked
     /// up by the per-turn auth gate without re-spawning; subagents instead get a
@@ -1355,7 +1356,14 @@ const SYSTEM_PROMPT_FILENAME: &str = "system_prompt.txt";
 /// distinct temp suffix (`.sync.tmp`) avoids clobbering the persistence actor's
 /// own `chat_history.jsonl.tmp`; whichever atomic `rename` lands last wins and
 /// the content is identical, so the two writers can never produce a torn file.
-fn persist_chat_history_jsonl_sync(session_info: &SessionInfo, conversation: &[ConversationItem]) {
+fn persist_chat_history_jsonl_sync(
+    enabled: bool,
+    session_info: &SessionInfo,
+    conversation: &[ConversationItem],
+) {
+    if !enabled {
+        return;
+    }
     let dir = crate::session::persistence::session_dir(session_info);
     if let Err(e) = std::fs::create_dir_all(&dir) {
         tracing::warn!(session_id = %session_info.id.0, ?e,

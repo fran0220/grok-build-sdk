@@ -66,10 +66,14 @@ pub async fn fork_session(
     request: ForkSessionRequest,
     agent_id: &str,
     auth_manager: Option<std::sync::Arc<crate::auth::AuthManager>>,
+    storage_root: Option<std::path::PathBuf>,
+    authority: Option<
+        std::sync::Arc<dyn crate::session::state_authority::NativeSessionStateAuthority>,
+    >,
 ) -> io::Result<ForkSessionResponse> {
     let t0 = std::time::Instant::now();
 
-    let root_dir = grok_home();
+    let root_dir = storage_root.unwrap_or_else(grok_home);
     let storage = JsonlStorageAdapter::with_root(root_dir.clone());
 
     // Build source and target Info
@@ -107,7 +111,17 @@ pub async fn fork_session(
     };
 
     let result = tokio::task::spawn_blocking(move || {
-        storage.copy_session_data_sync(&source_info, &target_info, options)
+        if let Some(authority) = authority {
+            copy_authority_fork(
+                authority.as_ref(),
+                &storage,
+                &source_info,
+                &target_info,
+                options,
+            )
+        } else {
+            storage.copy_session_data_sync(&source_info, &target_info, options)
+        }
     })
     .await
     .map_err(|e| io::Error::other(format!("spawn_blocking panicked: {e}")))??;
@@ -161,6 +175,180 @@ pub async fn fork_session(
         parent_session_id: request.source_session_id,
         new_model_id: request.new_model_id,
     })
+}
+
+fn copy_authority_fork(
+    authority: &dyn crate::session::state_authority::NativeSessionStateAuthority,
+    storage: &JsonlStorageAdapter,
+    source_info: &Info,
+    target_info: &Info,
+    options: CopySessionOptions,
+) -> io::Result<crate::session::storage::CopySessionResult> {
+    use crate::session::state_authority::{
+        ReplayRecord, RewindOperation, SessionIdentity, SessionInspection,
+    };
+    use crate::session::storage::{
+        filter_rewind_by, rewind_step_for_update, truncate_for_prompt_by,
+    };
+
+    let generation = match authority
+        .inspect(source_info.id.0.as_ref())
+        .map_err(|e| io::Error::other(e.to_string()))?
+    {
+        SessionInspection::Live { generation } => generation,
+        _ => return Err(io::Error::other("fork source is not live")),
+    };
+    let source = authority
+        .open(SessionIdentity {
+            identity: source_info.id.0.to_string(),
+            generation,
+        })
+        .map_err(|e| io::Error::other(e.to_string()))?;
+    let mut records = Vec::new();
+    let mut cursor = None;
+    loop {
+        let page = source
+            .replay_page(cursor, 4096)
+            .map_err(|e| io::Error::other(e.to_string()))?;
+        records.extend(page.records);
+        match page.next {
+            Some(next) => cursor = Some(next),
+            None => break,
+        }
+        if records.len() > 1_000_000 {
+            return Err(io::Error::other("fork traversal limit exceeded"));
+        }
+    }
+
+    #[derive(Clone)]
+    struct Candidate {
+        record: usize,
+        update: crate::session::storage::SessionUpdate,
+    }
+    let mut candidates = Vec::new();
+    for (record, value) in records.iter().enumerate() {
+        let bytes = match value {
+            ReplayRecord::Update(bytes) => Some(bytes),
+            ReplayRecord::Checkpoint { marker, .. } | ReplayRecord::Rewind { marker, .. }
+                if !marker.is_empty() =>
+            {
+                Some(marker)
+            }
+            _ => None,
+        };
+        if let Some(bytes) = bytes {
+            candidates.push(Candidate {
+                record,
+                update: serde_json::from_slice(bytes)
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?,
+            });
+        }
+    }
+    let retained = if let Some(target) = options.target_prompt_index {
+        let mut values = filter_rewind_by(candidates, |x| rewind_step_for_update(&x.update));
+        let keep = truncate_for_prompt_by(&values, target, |x| rewind_step_for_update(&x.update));
+        values.truncate(keep);
+        values
+            .into_iter()
+            .map(|x| x.record)
+            .collect::<std::collections::HashSet<_>>()
+    } else {
+        candidates.into_iter().map(|x| x.record).collect()
+    };
+    let target_id = target_info.id.clone();
+    let mut prepared = Vec::new();
+    let mut updates_copied = 0usize;
+    for (index, record) in records.into_iter().enumerate() {
+        let rewrite = |bytes: Vec<u8>| -> io::Result<Vec<u8>> {
+            let update: crate::session::storage::SessionUpdate = serde_json::from_slice(&bytes)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            serde_json::to_vec(
+                &crate::session::storage::jsonl::transform_session_id_in_update(update, &target_id),
+            )
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+        };
+        match record {
+            ReplayRecord::Update(bytes) if retained.contains(&index) => {
+                prepared.push(ReplayRecord::Update(rewrite(bytes)?));
+                updates_copied += 1;
+            }
+            ReplayRecord::Checkpoint {
+                name,
+                payload,
+                marker,
+            } if retained.contains(&index) => {
+                prepared.push(ReplayRecord::Checkpoint {
+                    name,
+                    payload,
+                    marker: rewrite(marker)?,
+                });
+                updates_copied += 1;
+            }
+            ReplayRecord::Rewind { operation, marker } if retained.contains(&index) => {
+                prepared.push(ReplayRecord::Rewind {
+                    operation,
+                    marker: rewrite(marker)?,
+                });
+                updates_copied += 1;
+            }
+            ReplayRecord::Rewind {
+                operation:
+                    RewindOperation::AppendPoint {
+                        index: point,
+                        payload,
+                    },
+                marker,
+            } if marker.is_empty()
+                && options
+                    .target_prompt_index
+                    .is_none_or(|target| point <= target as u64) =>
+            {
+                prepared.push(ReplayRecord::Rewind {
+                    operation: RewindOperation::AppendPoint {
+                        index: point,
+                        payload,
+                    },
+                    marker,
+                });
+            }
+            _ => {}
+        }
+    }
+    let chat_messages_copied =
+        crate::session::storage::chat_rebuild::rebuild_chat_history_in_memory(
+            &prepared
+                .iter()
+                .filter_map(|record| match record {
+                    ReplayRecord::Update(bytes) => serde_json::from_slice(bytes).ok(),
+                    ReplayRecord::Checkpoint { marker, .. }
+                    | ReplayRecord::Rewind { marker, .. }
+                        if !marker.is_empty() =>
+                    {
+                        serde_json::from_slice(marker).ok()
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+        )
+        .len();
+    let sidecars = storage.copy_fork_sidecars_sync(
+        source_info,
+        target_info,
+        options,
+        updates_copied,
+        chat_messages_copied,
+    )?;
+    if let Err(error) = authority.publish_fork(
+        SessionIdentity {
+            identity: target_info.id.0.to_string(),
+            generation: uuid::Uuid::now_v7().to_string(),
+        },
+        prepared,
+    ) {
+        let _ = std::fs::remove_dir_all(storage.session_dir(target_info));
+        return Err(io::Error::other(error.to_string()));
+    }
+    Ok(sidecars)
 }
 
 /// Sync a forked session to the backend (for writeback mode).

@@ -1532,6 +1532,7 @@ pub struct PersistenceHandle {
     pub tx: mpsc::UnboundedSender<PersistenceMsg>,
     noop: bool,
     disk_full_rx: watch::Receiver<bool>,
+    projects_chat_history: bool,
 }
 
 fn actor_channel() -> (
@@ -1547,6 +1548,7 @@ fn actor_channel() -> (
         tx,
         noop: false,
         disk_full_rx,
+        projects_chat_history: true,
     };
     (handle, rx, weak, disk_full_tx)
 }
@@ -1595,6 +1597,7 @@ impl PersistenceHandle {
             tx,
             noop: false,
             disk_full_rx,
+            projects_chat_history: true,
         }
     }
 
@@ -1604,11 +1607,16 @@ impl PersistenceHandle {
             tx,
             noop: true,
             disk_full_rx: watch::channel(false).1,
+            projects_chat_history: false,
         }
     }
 
     pub fn is_noop(&self) -> bool {
         self.noop
+    }
+
+    pub(crate) fn projects_chat_history(&self) -> bool {
+        self.projects_chat_history
     }
 
     #[cfg(test)]
@@ -2692,6 +2700,8 @@ pub(crate) async fn new(
         registry_title_sync,
         true,
         None,
+        None,
+        None,
     )
     .await
 }
@@ -2709,10 +2719,26 @@ pub(crate) async fn new_with_storage_root(
     registry_title_sync: Option<RegistryGeneratedTitleSync>,
     generate_session_title: bool,
     storage_root: Option<PathBuf>,
+    session_state_authority: Option<
+        Arc<dyn crate::session::state_authority::NativeSessionStateAuthority>,
+    >,
+    native_session: Option<Arc<dyn crate::session::state_authority::NativeSession>>,
 ) -> io::Result<PersistenceHandle> {
     // Origin embedded boundary: an injected root never consults process GROK_HOME.
     let root_dir = storage_root.unwrap_or_else(grok_home);
-    let storage: Box<dyn StorageAdapter> = Box::new(JsonlStorageAdapter::with_root(root_dir));
+    let projects_chat_history = native_session.is_none();
+    let storage: Box<dyn StorageAdapter> = match (session_state_authority, native_session) {
+        (Some(authority), Some(session)) => Box::new(JsonlStorageAdapter::with_root_and_authority(
+            root_dir, authority, session,
+        )),
+        (None, None) => Box::new(JsonlStorageAdapter::with_root(root_dir)),
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "native session authority and session must be supplied together",
+            ));
+        }
+    };
 
     // Initialize session in storage
     let mut summary = storage.init_session(info, model_id.clone()).await?;
@@ -2724,7 +2750,8 @@ pub(crate) async fn new_with_storage_root(
         summary.current_model_id = model_id;
     }
 
-    let (handle, rx, summary_tx, disk_full_tx) = actor_channel();
+    let (mut handle, rx, summary_tx, disk_full_tx) = actor_channel();
+    handle.projects_chat_history = projects_chat_history;
 
     let info_clone = info.clone();
     let storage: Arc<dyn StorageAdapter> = Arc::from(storage);
@@ -2858,6 +2885,7 @@ pub struct PersistedInfoLight {
     /// Persisted goal mode orchestration state (None for sessions without goal mode)
     pub goal_mode_state: Option<crate::session::goal_tracker::GoalOrchestration>,
     pub workflow_runs: Vec<crate::session::workflow::store::RestoredWorkflowRun>,
+    pub canonical_updates: Option<Vec<SessionUpdate>>,
 }
 
 /// On NotFound, try pulling from backend. Returns pulled info or the original error.
@@ -2964,10 +2992,26 @@ pub(crate) async fn load_light(
     registry_title_sync: Option<RegistryGeneratedTitleSync>,
     generate_session_title: bool,
     storage_root: Option<PathBuf>,
+    session_state_authority: Option<
+        Arc<dyn crate::session::state_authority::NativeSessionStateAuthority>,
+    >,
+    native_session: Option<Arc<dyn crate::session::state_authority::NativeSession>>,
 ) -> io::Result<(PersistedInfoLight, PersistenceHandle)> {
     let root_dir = storage_root.unwrap_or_else(grok_home);
+    let projects_chat_history = native_session.is_none();
     let storage: Box<dyn StorageAdapter> =
-        Box::new(JsonlStorageAdapter::with_root(root_dir.clone()));
+        match (session_state_authority, native_session) {
+            (Some(authority), Some(session)) => Box::new(
+                JsonlStorageAdapter::with_root_and_authority(root_dir.clone(), authority, session),
+            ),
+            (None, None) => Box::new(JsonlStorageAdapter::with_root(root_dir.clone())),
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "native session authority and session must be supplied together",
+                ));
+            }
+        };
 
     let (persisted, loaded_info) = match storage.load_session_without_updates(info).await {
         Ok(p) => (p, info.clone()),
@@ -2997,9 +3041,11 @@ pub(crate) async fn load_light(
         announcement_state: persisted.announcement_state,
         goal_mode_state: persisted.goal_mode_state,
         workflow_runs: persisted.workflow_runs,
+        canonical_updates: persisted.canonical_updates,
     };
 
-    let (handle, rx, summary_tx, disk_full_tx) = actor_channel();
+    let (mut handle, rx, summary_tx, disk_full_tx) = actor_channel();
+    handle.projects_chat_history = projects_chat_history;
 
     let storage: Arc<dyn StorageAdapter> = Arc::from(storage);
     let remote_sync = init_remote_sync(&persisted_info.summary, storage_mode, auth_manager)?;

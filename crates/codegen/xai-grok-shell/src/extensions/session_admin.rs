@@ -793,9 +793,15 @@ async fn handle_session_fork(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtRes
     let request: ForkSessionRequest = parse_params(args)?;
 
     let agent_id = agent_id();
-    let response = fork_session(request, &agent_id, Some(agent.auth_manager.clone()))
-        .await
-        .map_err(|e| acp::Error::internal_error().data(e.to_string()))?;
+    let response = fork_session(
+        request,
+        &agent_id,
+        Some(agent.auth_manager.clone()),
+        agent.storage_root.clone(),
+        agent.session_state_authority.clone(),
+    )
+    .await
+    .map_err(|e| acp::Error::internal_error().data(e.to_string()))?;
 
     to_raw_response(&response)
 }

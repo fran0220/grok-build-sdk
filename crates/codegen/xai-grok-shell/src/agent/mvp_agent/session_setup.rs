@@ -517,6 +517,17 @@ impl MvpAgent {
         let persistence = if is_chat_kind {
             crate::session::persistence::PersistenceHandle::noop()
         } else {
+            let native_session = match &self.session_state_authority {
+                Some(authority) => Some(
+                    authority
+                        .create(crate::session::state_authority::SessionIdentity {
+                            identity: session_id.0.to_string(),
+                            generation: uuid::Uuid::now_v7().to_string(),
+                        })
+                        .map_err(|error| acp::Error::internal_error().data(error.to_string()))?,
+                ),
+                None => None,
+            };
             let _timer = crate::instrumentation_timer!("session.persistence_init");
             let registry_title_sync = self.registry_title_sync();
             crate::session::persistence::new_with_storage_root(
@@ -531,6 +542,8 @@ impl MvpAgent {
                 registry_title_sync,
                 !self.origin_restricted(),
                 self.storage_root.clone(),
+                self.session_state_authority.clone(),
+                native_session,
             )
             .await
             .map_err(|e| crate::session::persistence::io_error_to_acp(&e))?
@@ -888,6 +901,34 @@ impl MvpAgent {
             None
         };
         let registry_title_sync = self.registry_title_sync();
+        let native_session = match &self.session_state_authority {
+            Some(authority) => {
+                use crate::session::state_authority::SessionInspection;
+                let generation = match authority
+                    .inspect(&session_id.0)
+                    .map_err(|error| acp::Error::internal_error().data(error.to_string()))?
+                {
+                    SessionInspection::Live { generation } => generation,
+                    SessionInspection::Vacant => {
+                        return Err(acp::Error::invalid_params()
+                            .data("native session does not exist in Host authority"));
+                    }
+                    SessionInspection::Tombstoned { .. } => {
+                        return Err(acp::Error::invalid_params()
+                            .data("native session is tombstoned in Host authority"));
+                    }
+                };
+                Some(
+                    authority
+                        .open(crate::session::state_authority::SessionIdentity {
+                            identity: session_id.0.to_string(),
+                            generation,
+                        })
+                        .map_err(|error| acp::Error::internal_error().data(error.to_string()))?,
+                )
+            }
+            None => None,
+        };
         let (persistence_info, persistence) = crate::session::persistence::load_light(
             &session_info,
             summary_client,
@@ -900,6 +941,8 @@ impl MvpAgent {
             registry_title_sync,
             !self.origin_restricted(),
             self.storage_root.clone(),
+            self.session_state_authority.clone(),
+            native_session,
         )
         .await
         .map_err(|e| crate::session::persistence::io_error_to_acp(&e))?;
@@ -915,6 +958,7 @@ impl MvpAgent {
             announcement_state: persisted_announcement_state,
             goal_mode_state: _persisted_goal_mode,
             workflow_runs: persisted_workflow_runs,
+            canonical_updates,
         } = persistence_info;
         let restored =
             RestoredSignals::read(persisted_signals.as_ref(), persisted_plan_mode.as_ref());
@@ -977,6 +1021,7 @@ impl MvpAgent {
                 &session_id,
                 &cwd,
                 &updates_file_path,
+                canonical_updates.as_deref(),
                 ReplayRouting {
                     persist_data: persist_data.as_ref(),
                     target_client_id: target_client_id.as_ref(),
@@ -1237,6 +1282,7 @@ impl MvpAgent {
         session_id: &acp::SessionId,
         cwd: &AbsPathBuf,
         updates_file_path: &Option<PathBuf>,
+        canonical_updates: Option<&[crate::session::storage::SessionUpdate]>,
         routing: ReplayRouting<'_>,
         no_replay: bool,
     ) -> Result<(u64, Vec<(String, String)>), acp::Error> {
@@ -1256,6 +1302,23 @@ impl MvpAgent {
                 Vec::new(),
                 Vec::new(),
             )
+        } else if let Some(updates) = canonical_updates {
+            let (tokens, unfinished_subagents) = self
+                .replay_canonical_updates(
+                    updates,
+                    persist_data.as_ref(),
+                    target_client_id.as_ref(),
+                    cursor.as_deref(),
+                )
+                .await?;
+            if let Err(reason) = self.flush_session(&session_id).await {
+                tracing::warn!(
+                    session_id = %session_id.0,
+                    reason,
+                    "Post-replay canonical flush failed"
+                );
+            }
+            (tokens, Vec::new(), unfinished_subagents)
         } else {
             let (tokens, replay_end_offset, unfinished_subagents) = self
                 .replay_session_updates(

@@ -54,6 +54,42 @@ impl ReplayCompletionDrain {
 }
 
 impl MvpAgent {
+    pub(super) async fn replay_canonical_updates(
+        &self,
+        updates: &[crate::session::storage::SessionUpdate],
+        persist_data: Option<&serde_json::Value>,
+        target_client_id: Option<&serde_json::Value>,
+        cursor: Option<&str>,
+    ) -> Result<(u64, Vec<(String, String)>), acp::Error> {
+        let mut raw = String::new();
+        for update in updates {
+            let line = serde_json::to_string(update).map_err(|error| {
+                acp::Error::internal_error().data(format!(
+                    "canonical replay record could not be serialized: {error}"
+                ))
+            })?;
+            raw.push_str(&line);
+            raw.push('\n');
+        }
+        let mut prepared = crate::session::storage::prepare_replay_lines(&raw, cursor);
+        let unfinished = std::mem::take(&mut prepared.unfinished_subagents);
+        let mut drain = ReplayCompletionDrain::new();
+        let mut collapser = ReplayToolCollapser::new();
+        for line in &prepared.lines {
+            if let Some(rx) = self.forward_raw_replay_line(
+                line,
+                persist_data,
+                target_client_id,
+                prepared.mark_replay,
+                &mut collapser,
+            ) {
+                drain.push(rx).await;
+            }
+        }
+        drain.drain_all().await;
+        Ok((prepared.last_tokens, unfinished))
+    }
+
     /// Records written before completions were bounded can still be too long
     /// for a client to read. `None` drops one that cannot be shrunk, which
     /// costs a completion event but keeps the connection.

@@ -521,6 +521,9 @@ impl SessionActor {
     /// nested sub-agent) never wrote one -- the hint is simply omitted rather
     /// than dangling.
     pub(crate) fn get_transcript_path(&self) -> Option<String> {
+        if !self.projects_chat_history {
+            return None;
+        }
         let path =
             crate::session::persistence::session_dir(&self.session_info).join("updates.jsonl");
         if path.exists() {
@@ -2311,6 +2314,7 @@ mod inline_auto_compact_flow_tests {
         chat_state_handle.record_token_usage(total_tokens);
         SessionActor {
             unattributed_background_usage: std::sync::atomic::AtomicBool::new(false),
+            projects_chat_history: true,
             session_info: SessionInfo {
                 id: acp::SessionId::new("test-auto-compact"),
                 cwd: cwd.as_str().to_string(),

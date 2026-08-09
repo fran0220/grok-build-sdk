@@ -10,6 +10,7 @@ use fs2::FileExt;
 use std::fs::OpenOptions;
 use std::io::{self, Read, Seek, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use xai_chat_state::StrictAppendAck;
 use xai_grok_workspace::session::file_state::RewindPoint;
 mod copy;
@@ -27,6 +28,9 @@ pub(crate) enum AppendDurability {
 #[derive(Clone)]
 pub struct JsonlStorageAdapter {
     dir_mode: SessionDirMode,
+    authority: Option<Arc<dyn crate::session::state_authority::NativeSessionStateAuthority>>,
+    native_session: Option<Arc<dyn crate::session::state_authority::NativeSession>>,
+    pending_checkpoints: Arc<Mutex<std::collections::HashMap<String, Vec<u8>>>>,
     #[cfg(test)]
     update_append_probe: Option<std::sync::Arc<AppendProbe>>,
 }
@@ -41,6 +45,9 @@ impl JsonlStorageAdapter {
     pub fn new() -> Self {
         Self {
             dir_mode: SessionDirMode::FromRoot(crate::util::grok_home::grok_home()),
+            authority: None,
+            native_session: None,
+            pending_checkpoints: Arc::new(Mutex::new(std::collections::HashMap::new())),
             #[cfg(test)]
             update_append_probe: None,
         }
@@ -48,6 +55,25 @@ impl JsonlStorageAdapter {
     pub fn with_root(root_dir: PathBuf) -> Self {
         Self {
             dir_mode: SessionDirMode::FromRoot(root_dir),
+            authority: None,
+            native_session: None,
+            pending_checkpoints: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            #[cfg(test)]
+            update_append_probe: None,
+        }
+    }
+    /// Use the normal JSON sidecar layout while routing canonical native
+    /// session state exclusively through the Host authority.
+    pub(crate) fn with_root_and_authority(
+        root_dir: PathBuf,
+        authority: Arc<dyn crate::session::state_authority::NativeSessionStateAuthority>,
+        native_session: Arc<dyn crate::session::state_authority::NativeSession>,
+    ) -> Self {
+        Self {
+            dir_mode: SessionDirMode::FromRoot(root_dir),
+            authority: Some(authority),
+            native_session: Some(native_session),
+            pending_checkpoints: Arc::new(Mutex::new(std::collections::HashMap::new())),
             #[cfg(test)]
             update_append_probe: None,
         }
@@ -60,6 +86,9 @@ impl JsonlStorageAdapter {
     pub fn with_explicit_session_dir(session_dir: PathBuf) -> Self {
         Self {
             dir_mode: SessionDirMode::Explicit(session_dir),
+            authority: None,
+            native_session: None,
+            pending_checkpoints: Arc::new(Mutex::new(std::collections::HashMap::new())),
             #[cfg(test)]
             update_append_probe: None,
         }
@@ -71,6 +100,9 @@ impl JsonlStorageAdapter {
     ) -> Self {
         Self {
             dir_mode: SessionDirMode::Explicit(session_dir),
+            authority: None,
+            native_session: None,
+            pending_checkpoints: Arc::new(Mutex::new(std::collections::HashMap::new())),
             update_append_probe: Some(std::sync::Arc::new(append_probe)),
         }
     }
@@ -83,7 +115,7 @@ impl JsonlStorageAdapter {
         let chat_file = dir.join(super::CHAT_HISTORY_FILE);
         self.read_chat_history_sync(chat_file, CHAT_FORMAT_VERSION)
     }
-    fn session_dir(&self, info: &Info) -> PathBuf {
+    pub(crate) fn session_dir(&self, info: &Info) -> PathBuf {
         match &self.dir_mode {
             SessionDirMode::FromRoot(root) => root
                 .join("sessions")
@@ -940,7 +972,7 @@ impl JsonlStorageAdapter {
     }
 }
 /// Rewrite the session id an update carries. Shared by the fork copy and the
-fn transform_session_id_in_update(
+pub(crate) fn transform_session_id_in_update(
     update: super::SessionUpdate,
     new_id: &acp::SessionId,
 ) -> super::SessionUpdate {
@@ -973,6 +1005,154 @@ async fn next_compaction_segment_index(compaction_dir: &std::path::Path) -> u64 
     }
     next
 }
+
+impl JsonlStorageAdapter {
+    fn authority_error(error: impl ToString) -> io::Error {
+        io::Error::other(error.to_string())
+    }
+
+    fn canonical_state(
+        &self,
+    ) -> io::Result<(
+        Vec<super::SessionUpdate>,
+        Vec<RewindPoint>,
+        std::collections::HashMap<String, Vec<u8>>,
+    )> {
+        use crate::session::state_authority::{ReplayRecord, RewindOperation};
+        let session = self
+            .native_session
+            .as_ref()
+            .ok_or_else(|| Self::authority_error("native session authority is not configured"))?;
+        let mut cursor = None;
+        let mut updates = Vec::new();
+        let mut rewind_points: Vec<RewindPoint> = Vec::new();
+        let mut checkpoints = std::collections::HashMap::new();
+        loop {
+            let page = session
+                .replay_page(cursor, 4096)
+                .map_err(Self::authority_error)?;
+            for record in page.records {
+                match record {
+                    ReplayRecord::Update(bytes) => updates.push(
+                        serde_json::from_slice(&bytes)
+                            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?,
+                    ),
+                    ReplayRecord::Checkpoint {
+                        name,
+                        payload,
+                        marker,
+                    } => {
+                        checkpoints.insert(name, payload);
+                        if !marker.is_empty() {
+                            updates.push(serde_json::from_slice(&marker).map_err(|error| {
+                                io::Error::new(io::ErrorKind::InvalidData, error)
+                            })?);
+                        }
+                    }
+                    ReplayRecord::Rewind { operation, marker } => {
+                        match operation {
+                            RewindOperation::AppendPoint { payload, .. } => {
+                                rewind_points.push(serde_json::from_slice(&payload).map_err(
+                                    |error| io::Error::new(io::ErrorKind::InvalidData, error),
+                                )?)
+                            }
+                            RewindOperation::Truncate { index, .. } => {
+                                rewind_points.retain(|point| point.prompt_index < index as usize)
+                            }
+                            RewindOperation::Merge { index, .. } => {
+                                rewind_points =
+                                    xai_grok_workspace::session::file_state::merge_rewind_points_from(
+                                        rewind_points,
+                                        index as usize,
+                                    );
+                            }
+                        }
+                        if !marker.is_empty() {
+                            updates.push(serde_json::from_slice(&marker).map_err(|error| {
+                                io::Error::new(io::ErrorKind::InvalidData, error)
+                            })?);
+                        }
+                    }
+                }
+            }
+            match page.next {
+                Some(next) => cursor = Some(next),
+                None => break,
+            }
+        }
+        Ok((updates, rewind_points, checkpoints))
+    }
+
+    async fn append_authority_update(
+        &self,
+        info: &Info,
+        update: &super::SessionUpdate,
+        durable: bool,
+    ) -> Result<(), super::AppendUpdateError> {
+        let session = self
+            .native_session
+            .as_ref()
+            .expect("checked authority mode");
+        let bytes = serde_json::to_vec(update).map_err(|error| {
+            super::AppendUpdateError::NotCommitted(io::Error::new(
+                io::ErrorKind::InvalidData,
+                error,
+            ))
+        })?;
+        let mut compound_committed = false;
+        if let super::SessionUpdate::Xai(notification) = update
+            && let crate::extensions::notification::SessionUpdate::CompactionCheckpoint(marker) =
+                &notification.update
+        {
+            let payload = self
+                .pending_checkpoints
+                .lock()
+                .map_err(|error| {
+                    super::AppendUpdateError::NotCommitted(Self::authority_error(error))
+                })?
+                .remove(&marker.checkpoint_file)
+                .ok_or_else(|| {
+                    super::AppendUpdateError::NotCommitted(Self::authority_error(
+                        "compaction marker has no staged checkpoint",
+                    ))
+                })?;
+            session
+                .publish_checkpoint(marker.checkpoint_file.clone(), payload, bytes.clone())
+                .map_err(|error| {
+                    super::AppendUpdateError::NotCommitted(Self::authority_error(error))
+                })?;
+            compound_committed = true;
+        }
+        if !compound_committed {
+            session.stage_update(bytes).map_err(|error| {
+                super::AppendUpdateError::NotCommitted(Self::authority_error(error))
+            })?;
+            if durable {
+                session.flush().map_err(|error| {
+                    super::AppendUpdateError::NotCommitted(Self::authority_error(error))
+                })?;
+                compound_committed = true;
+            }
+        }
+        self.apply_summary_patch(
+            info,
+            super::summary_write::SummaryPatch {
+                record_activity: true,
+                messages: Some(super::summary_write::CounterOp::Increment(1)),
+                ..Default::default()
+            },
+        )
+        .await
+        .map_err(|error| {
+            if compound_committed {
+                super::AppendUpdateError::Committed(error)
+            } else {
+                super::AppendUpdateError::NotCommitted(error)
+            }
+        })
+    }
+}
+
 #[async_trait]
 impl StorageAdapter for JsonlStorageAdapter {
     async fn init_session(&self, info: &Info, model_id: acp::ModelId) -> io::Result<Summary> {
@@ -1040,6 +1220,9 @@ impl StorageAdapter for JsonlStorageAdapter {
         info: &Info,
         update: &super::SessionUpdate,
     ) -> Result<(), super::AppendUpdateError> {
+        if self.native_session.is_some() {
+            return self.append_authority_update(info, update, false).await;
+        }
         self.append_update_with_bookkeeping(info, update, AppendDurability::Buffered)
             .await
     }
@@ -1048,11 +1231,16 @@ impl StorageAdapter for JsonlStorageAdapter {
         info: &Info,
         update: &super::SessionUpdate,
     ) -> Result<(), super::AppendUpdateError> {
+        if self.native_session.is_some() {
+            return self.append_authority_update(info, update, true).await;
+        }
         self.append_update_with_bookkeeping(info, update, AppendDurability::Durable)
             .await
     }
     async fn append_chat_message(&self, info: &Info, message: &ConversationItem) -> io::Result<()> {
-        self.append_jsonl(self.chat_file(info), message).await?;
+        if self.native_session.is_none() {
+            self.append_jsonl(self.chat_file(info), message).await?;
+        }
         self.apply_summary_patch(
             info,
             super::summary_write::SummaryPatch {
@@ -1069,6 +1257,34 @@ impl StorageAdapter for JsonlStorageAdapter {
         info: &Info,
         message: &ConversationItem,
     ) -> Result<StrictAppendAck, super::AppendCwdSwitchError> {
+        if self.native_session.is_some() {
+            let generation = message
+                .working_directory_switch_generation()
+                .filter(|generation| *generation > 0)
+                .ok_or_else(|| {
+                    super::AppendCwdSwitchError::NotCommitted(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "working-directory switch item must carry a nonzero generation",
+                    ))
+                })?;
+            let acknowledgement = StrictAppendAck::Appended;
+            self.apply_summary_patch(
+                info,
+                super::summary_write::SummaryPatch {
+                    record_activity: true,
+                    chat_messages: Some(super::summary_write::CounterOp::Increment(1)),
+                    chat_format_version: Some(CHAT_FORMAT_VERSION),
+                    cwd_switch_bookkeeping_generation: Some(generation),
+                    ..Default::default()
+                },
+            )
+            .await
+            .map_err(|source| super::AppendCwdSwitchError::Committed {
+                acknowledgement: acknowledgement.clone(),
+                source,
+            })?;
+            return Ok(acknowledgement);
+        }
         self.append_cwd_switch_with_bookkeeping(info, message).await
     }
     async fn update_current_model_and_agent(
@@ -1254,10 +1470,19 @@ impl StorageAdapter for JsonlStorageAdapter {
     }
     async fn load_session(&self, info: &Info) -> io::Result<PersistedData> {
         let summary = self.read_summary_sync(info)?;
-        let chat_file = self.chat_file(info);
-        self.ensure_chat_history(info, summary.chat_format_version)?;
-        let chat_history = self.read_chat_history_sync(chat_file, summary.chat_format_version)?;
-        let updates = self.read_updates_jsonl(self.updates_file(info))?;
+        let (chat_history, updates, rewind_points) = if self.native_session.is_some() {
+            let (updates, rewind_points, _) = self.canonical_state()?;
+            let chat_history = super::chat_rebuild::rebuild_chat_history_in_memory(&updates);
+            (chat_history, updates, rewind_points)
+        } else {
+            let chat_file = self.chat_file(info);
+            self.ensure_chat_history(info, summary.chat_format_version)?;
+            (
+                self.read_chat_history_sync(chat_file, summary.chat_format_version)?,
+                self.read_updates_jsonl(self.updates_file(info))?,
+                self.read_jsonl::<RewindPoint>(self.rewind_points_file(info))?,
+            )
+        };
         let plan_state = self.read_optional_json_sync::<TodoState>(&self.plan_file(info))?;
         let plan_mode_state = self
             .read_optional_json_sync::<crate::session::plan_mode::PlanModeSnapshot>(
@@ -1275,7 +1500,6 @@ impl StorageAdapter for JsonlStorageAdapter {
                 &self.goal_mode_state_file(info),
             )?;
         let workflow_runs = self.load_workflow_runs_sync(info)?;
-        let rewind_points = self.read_jsonl::<RewindPoint>(self.rewind_points_file(info))?;
         let result = PersistedData {
             summary,
             chat_history,
@@ -1309,9 +1533,20 @@ impl StorageAdapter for JsonlStorageAdapter {
     ) -> io::Result<super::PersistedDataLight> {
         tracing::info!("Loading session data (without updates) from JSONL");
         let summary = self.read_summary_sync(info)?;
-        let chat_file = self.chat_file(info);
-        self.ensure_chat_history(info, summary.chat_format_version)?;
-        let chat_history = self.read_chat_history_sync(chat_file, summary.chat_format_version)?;
+        let (chat_history, canonical_updates) = if self.native_session.is_some() {
+            let (updates, _, _) = self.canonical_state()?;
+            (
+                super::chat_rebuild::rebuild_chat_history_in_memory(&updates),
+                Some(updates),
+            )
+        } else {
+            let chat_file = self.chat_file(info);
+            self.ensure_chat_history(info, summary.chat_format_version)?;
+            (
+                self.read_chat_history_sync(chat_file, summary.chat_format_version)?,
+                None,
+            )
+        };
         let plan_state = self.read_optional_json_sync::<TodoState>(&self.plan_file(info))?;
         let plan_mode_state = self
             .read_optional_json_sync::<crate::session::plan_mode::PlanModeSnapshot>(
@@ -1338,6 +1573,7 @@ impl StorageAdapter for JsonlStorageAdapter {
             announcement_state,
             goal_mode_state,
             workflow_runs,
+            canonical_updates,
         };
         tracing::info!(
             session_id = %info.id,
@@ -1370,6 +1606,11 @@ impl StorageAdapter for JsonlStorageAdapter {
             .map_err(io::Error::other)?
     }
     async fn delete_session(&self, info: &Info) -> io::Result<()> {
+        if let (Some(authority), Some(session)) = (&self.authority, &self.native_session) {
+            authority
+                .tombstone(session.identity().clone())
+                .map_err(Self::authority_error)?;
+        }
         let dir = self.session_dir(info);
         match tokio::fs::remove_dir_all(&dir).await {
             Ok(()) => Ok(()),
@@ -1378,10 +1619,27 @@ impl StorageAdapter for JsonlStorageAdapter {
         }
     }
     async fn append_rewind_point(&self, info: &Info, point: &RewindPoint) -> io::Result<()> {
+        if let Some(session) = &self.native_session {
+            let payload = serde_json::to_vec(point)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+            session
+                .publish_rewind(
+                    crate::session::state_authority::RewindOperation::AppendPoint {
+                        index: point.prompt_index as u64,
+                        payload,
+                    },
+                    Vec::new(),
+                )
+                .map_err(Self::authority_error)?;
+            return Ok(());
+        }
         self.append_jsonl(self.rewind_points_file(info), point)
             .await
     }
     async fn load_rewind_points(&self, info: &Info) -> io::Result<Vec<RewindPoint>> {
+        if self.native_session.is_some() {
+            return self.canonical_state().map(|(_, points, _)| points);
+        }
         let info_clone = info.clone();
         let adapter_clone = self.clone();
         tokio::task::spawn_blocking(move || {
@@ -1393,6 +1651,18 @@ impl StorageAdapter for JsonlStorageAdapter {
         .map_err(io::Error::other)?
     }
     async fn truncate_rewind_points_from(&self, info: &Info, from_index: usize) -> io::Result<()> {
+        if let Some(session) = &self.native_session {
+            session
+                .publish_rewind(
+                    crate::session::state_authority::RewindOperation::Truncate {
+                        index: from_index as u64,
+                        payload: Vec::new(),
+                    },
+                    Vec::new(),
+                )
+                .map_err(Self::authority_error)?;
+            return Ok(());
+        }
         let points = self.load_rewind_points(info).await?;
         let filtered: Vec<RewindPoint> = points
             .into_iter()
@@ -1402,6 +1672,18 @@ impl StorageAdapter for JsonlStorageAdapter {
             .await
     }
     async fn merge_rewind_points_from(&self, info: &Info, target_index: usize) -> io::Result<()> {
+        if let Some(session) = &self.native_session {
+            session
+                .publish_rewind(
+                    crate::session::state_authority::RewindOperation::Merge {
+                        index: target_index as u64,
+                        payload: Vec::new(),
+                    },
+                    Vec::new(),
+                )
+                .map_err(Self::authority_error)?;
+            return Ok(());
+        }
         let points = self.load_rewind_points(info).await?;
         let merged =
             xai_grok_workspace::session::file_state::merge_rewind_points_from(points, target_index);
@@ -1409,18 +1691,25 @@ impl StorageAdapter for JsonlStorageAdapter {
             .await
     }
     async fn sync_session_files(&self, info: &Info) -> io::Result<()> {
+        if let Some(session) = &self.native_session {
+            session.flush().map_err(Self::authority_error)?;
+        }
         let info_clone = info.clone();
         let adapter_clone = self.clone();
         tokio::task::spawn_blocking(move || -> io::Result<()> {
             use std::fs::OpenOptions;
             let adapter = adapter_clone;
-            let files_to_sync = [
-                adapter.updates_file(&info_clone),
-                adapter.chat_file(&info_clone),
+            let mut files_to_sync = vec![
                 adapter.summary_file(&info_clone),
                 adapter.plan_file(&info_clone),
-                adapter.rewind_points_file(&info_clone),
             ];
+            if adapter.native_session.is_none() {
+                files_to_sync.extend([
+                    adapter.updates_file(&info_clone),
+                    adapter.chat_file(&info_clone),
+                    adapter.rewind_points_file(&info_clone),
+                ]);
+            }
             for file_path in &files_to_sync {
                 if file_path.exists()
                     && let Ok(file) = OpenOptions::new().write(true).open(file_path)
@@ -1438,7 +1727,9 @@ impl StorageAdapter for JsonlStorageAdapter {
         info: &Info,
         messages: &[ConversationItem],
     ) -> io::Result<()> {
-        self.write_jsonl(self.chat_file(info), messages).await?;
+        if self.native_session.is_none() {
+            self.write_jsonl(self.chat_file(info), messages).await?;
+        }
         let new_count = messages.len();
         let cwd_switch_bookkeeping_generation = messages
             .iter()
@@ -1462,6 +1753,12 @@ impl StorageAdapter for JsonlStorageAdapter {
         target_info: &Info,
         options: super::CopySessionOptions,
     ) -> io::Result<super::CopySessionResult> {
+        if self.native_session.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "authority-backed session copy requires the canonical fork API",
+            ));
+        }
         let storage = self.clone();
         let source = source_info.clone();
         let target = target_info.clone();
@@ -1472,6 +1769,14 @@ impl StorageAdapter for JsonlStorageAdapter {
         .map_err(|e| io::Error::other(format!("spawn_blocking panicked: {e}")))?
     }
     async fn load_prompts_only(&self, info: &Info) -> io::Result<Vec<String>> {
+        if self.native_session.is_some() {
+            let (updates, _, _) = self.canonical_state()?;
+            let events = updates.iter().map(|update| {
+                let line = serde_json::to_string(update).unwrap_or_default();
+                super::parse_prompt_extract_event(&line)
+            });
+            return Ok(super::collect_prompts_from_events(events));
+        }
         let updates_path = self.updates_file(info);
         if !updates_path.exists() {
             return Ok(Vec::new());
@@ -1487,6 +1792,10 @@ impl StorageAdapter for JsonlStorageAdapter {
     }
     #[tracing::instrument(skip_all, fields(session_id = %info.id))]
     async fn load_assistant_text(&self, info: &Info) -> io::Result<Vec<String>> {
+        if self.native_session.is_some() {
+            let (updates, _, _) = self.canonical_state()?;
+            return Ok(super::collect_assistant_text(updates.into_iter().map(Ok)));
+        }
         let updates_path = self.updates_file(info);
         if !updates_path.exists() {
             return Ok(Vec::new());
@@ -1502,6 +1811,10 @@ impl StorageAdapter for JsonlStorageAdapter {
     }
     #[tracing::instrument(skip_all, fields(session_id = %info.id))]
     async fn load_tool_metadata(&self, info: &Info) -> io::Result<Vec<String>> {
+        if self.native_session.is_some() {
+            let (updates, _, _) = self.canonical_state()?;
+            return Ok(super::collect_tool_metadata(updates.into_iter().map(Ok)));
+        }
         let updates_path = self.updates_file(info);
         if !updates_path.exists() {
             return Ok(Vec::new());
@@ -1516,10 +1829,14 @@ impl StorageAdapter for JsonlStorageAdapter {
         .map_err(io::Error::other)?
     }
     fn updates_file_path(&self, info: &Info) -> Option<std::path::PathBuf> {
-        Some(self.updates_file(info))
+        self.native_session
+            .is_none()
+            .then(|| self.updates_file(info))
     }
     fn rewind_points_file_path(&self, info: &Info) -> Option<std::path::PathBuf> {
-        Some(self.rewind_points_file(info))
+        self.native_session
+            .is_none()
+            .then(|| self.rewind_points_file(info))
     }
     async fn append_feedback(
         &self,
@@ -1542,6 +1859,16 @@ impl StorageAdapter for JsonlStorageAdapter {
         info: &Info,
         checkpoint: &crate::extensions::notification::CompactionCheckpointFile,
     ) -> io::Result<()> {
+        if self.native_session.is_some() {
+            let name = format!("compaction_checkpoints/{}.json", checkpoint.checkpoint_id);
+            let payload = serde_json::to_vec(checkpoint)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+            self.pending_checkpoints
+                .lock()
+                .map_err(Self::authority_error)?
+                .insert(name, payload);
+            return Ok(());
+        }
         let dir = self.session_dir(info).join("compaction_checkpoints");
         tokio::fs::create_dir_all(&dir).await?;
         let path = dir.join(format!("{}.json", checkpoint.checkpoint_id));
@@ -1615,6 +1942,14 @@ impl StorageAdapter for JsonlStorageAdapter {
         info: &Info,
         checkpoint_file: &str,
     ) -> io::Result<crate::extensions::notification::CompactionCheckpointFile> {
+        if self.native_session.is_some() {
+            let (_, _, checkpoints) = self.canonical_state()?;
+            let bytes = checkpoints.get(checkpoint_file).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotFound, "canonical checkpoint not found")
+            })?;
+            return serde_json::from_slice(bytes)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error));
+        }
         let path = self.session_dir(info).join(checkpoint_file);
         let bytes = tokio::fs::read(&path).await?;
         serde_json::from_slice(&bytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))

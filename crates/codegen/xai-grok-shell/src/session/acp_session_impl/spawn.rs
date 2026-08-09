@@ -1174,7 +1174,8 @@ pub(crate) async fn spawn_session_actor(
             .surfaces_local_date(),
         &conversation,
     );
-    persist_chat_history_jsonl_sync(&session_info, &conversation);
+    let projects_chat_history = persistence.projects_chat_history();
+    persist_chat_history_jsonl_sync(projects_chat_history, &session_info, &conversation);
     chat_state_handle.replace_conversation(conversation);
     let feedback_client = feedback_proxy_url.map(|base_url| {
         let mut client =
@@ -1586,6 +1587,7 @@ pub(crate) async fn spawn_session_actor(
     > = std::sync::Arc::new(arc_swap::ArcSwapOption::empty());
     let session = Arc::new_cyclic(|weak: &std::sync::Weak<SessionActor>| SessionActor {
         session_info: session_info.clone(),
+        projects_chat_history,
         auth_method_id,
         model_auth_memo: std::cell::RefCell::new(None),
         attribution_callback,
@@ -2328,12 +2330,13 @@ pub(crate) async fn spawn_session_on_thread(
     >();
     let sid = session_info.id.0.to_string();
     let thread_name = format!("ses-{}", &sid[..sid.len().min(8)]);
+    let projects_chat_history = persistence.projects_chat_history();
     const SESSION_THREAD_STACK_SIZE: usize = 8 * 1024 * 1024;
     let join_handle = std::thread::Builder::new()
         .name(thread_name)
         .stack_size(SESSION_THREAD_STACK_SIZE)
         .spawn(move || {
-            let (initial_last_compaction, initial_prompt_texts) = {
+            let (initial_last_compaction, initial_prompt_texts) = if projects_chat_history {
                 let session_dir = crate::session::persistence::session_dir(&session_info);
                 let updates_path = session_dir.join("updates.jsonl");
                 let initial_last_compaction = {
@@ -2353,6 +2356,10 @@ pub(crate) async fn spawn_session_on_thread(
                     SessionActor::load_user_prompts_from_updates(&updates_path).unwrap_or_default()
                 };
                 (initial_last_compaction, initial_prompt_texts)
+            } else {
+                // Host-authority sessions are replayed before spawn. Never
+                // consult a stale or absent local transcript projection.
+                (None, Vec::new())
             };
             let rt = match build_session_runtime() {
                 Ok(rt) => rt,

@@ -287,7 +287,7 @@ impl SessionActor {
         save_prompt_context(&self.session_info, &new_prompt_context);
         save_system_prompt(&self.session_info, &new_system_prompt);
         let snapshot = self.chat_state_handle.get_conversation().await;
-        persist_chat_history_jsonl_sync(&self.session_info, &snapshot);
+        persist_chat_history_jsonl_sync(self.projects_chat_history, &self.session_info, &snapshot);
         self.mcp_reminder_dirty
             .store(true, std::sync::atomic::Ordering::Relaxed);
         self.send_available_commands_update().await;

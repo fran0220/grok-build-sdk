@@ -2180,6 +2180,19 @@ impl xai_grok_shell::session::state_authority::NativeSessionStateAuthority
         Ok(Arc::new(session))
     }
 
+    fn publish_fork(
+        &self,
+        id: xai_grok_shell::session::state_authority::SessionIdentity,
+        records: Vec<xai_grok_shell::session::state_authority::ReplayRecord>,
+    ) -> Result<
+        Arc<dyn xai_grok_shell::session::state_authority::NativeSession>,
+        xai_grok_shell::session::state_authority::AuthorityError,
+    > {
+        let session = self.session(id)?;
+        session.publish_prepared(records)?;
+        Ok(Arc::new(session))
+    }
+
     fn tombstone(
         &self,
         id: xai_grok_shell::session::state_authority::SessionIdentity,
@@ -2228,6 +2241,95 @@ impl SessionStateAuthorityBridge {
 }
 
 impl SessionStateSessionBridge {
+    fn publish_prepared(
+        &self,
+        records: Vec<xai_grok_shell::session::state_authority::ReplayRecord>,
+    ) -> Result<(), xai_grok_shell::session::state_authority::AuthorityError> {
+        use xai_grok_shell::session::state_authority::{ReplayRecord, RewindOperation};
+        if self.current()?.is_some() {
+            return Err(authority_error("fork target already exists"));
+        }
+        let mut previous = None;
+        let mut sequence = 0u64;
+        let mut objects = Vec::with_capacity(records.len());
+        for record in records {
+            match record {
+                ReplayRecord::Update(bytes) => {
+                    objects.extend(self.update_objects(&[bytes], &mut previous, &mut sequence)?);
+                }
+                ReplayRecord::Checkpoint {
+                    name,
+                    payload,
+                    marker,
+                } => {
+                    let checkpoint = crate::SessionObject::checkpoint(
+                        self.key.clone(),
+                        self.generation.clone(),
+                        name,
+                        payload,
+                    )
+                    .map_err(authority_error)?;
+                    self.put_exact(&checkpoint)?;
+                    sequence = sequence
+                        .checked_add(1)
+                        .ok_or_else(|| authority_error("sequence overflow"))?;
+                    let publication = crate::SessionObject::publish_checkpoint(
+                        self.key.clone(),
+                        self.generation.clone(),
+                        previous.clone(),
+                        sequence,
+                        marker,
+                        checkpoint.id().clone(),
+                    )
+                    .map_err(authority_error)?;
+                    previous = Some(publication.id().clone());
+                    objects.push(publication);
+                }
+                ReplayRecord::Rewind { operation, marker } => {
+                    let (kind, index, payload) = match operation {
+                        RewindOperation::AppendPoint { index, payload } => {
+                            (crate::RewindKind::AppendPoint, index, payload)
+                        }
+                        RewindOperation::Truncate { index, payload } => {
+                            (crate::RewindKind::Truncate, index, payload)
+                        }
+                        RewindOperation::Merge { index, payload } => {
+                            (crate::RewindKind::Merge, index, payload)
+                        }
+                    };
+                    let rewind = crate::SessionObject::rewind(
+                        self.key.clone(),
+                        self.generation.clone(),
+                        kind,
+                        index,
+                        payload,
+                    )
+                    .map_err(authority_error)?;
+                    self.put_exact(&rewind)?;
+                    sequence = sequence
+                        .checked_add(1)
+                        .ok_or_else(|| authority_error("sequence overflow"))?;
+                    let publication = crate::SessionObject::publish_rewind(
+                        self.key.clone(),
+                        self.generation.clone(),
+                        previous.clone(),
+                        sequence,
+                        marker,
+                        rewind.id().clone(),
+                    )
+                    .map_err(authority_error)?;
+                    previous = Some(publication.id().clone());
+                    objects.push(publication);
+                }
+            }
+        }
+        if objects.is_empty() {
+            self.create_empty()
+        } else {
+            self.commit(objects).map(|_| ())
+        }
+    }
+
     fn create_empty(&self) -> Result<(), xai_grok_shell::session::state_authority::AuthorityError> {
         let manifest =
             crate::SessionManifest::new(self.key.clone(), self.generation.clone(), None, 0, 0)
@@ -5207,6 +5309,21 @@ mod tests {
         );
         assert!(
             matches!(&all.records[3], ReplayRecord::Rewind { marker, .. } if marker == b"rw-marker")
+        );
+        let fork_id = SessionIdentity {
+            identity: "session-2".into(),
+            generation: "fresh-generation".into(),
+        };
+        let fork = authority
+            .publish_fork(fork_id.clone(), all.records.clone())
+            .unwrap();
+        assert_eq!(fork.identity(), &fork_id);
+        assert_eq!(fork.replay_page(None, 10).unwrap().records, all.records);
+        assert!(
+            authority
+                .publish_fork(fork_id, vec![ReplayRecord::Update(b"replacement".to_vec())])
+                .is_err(),
+            "prepared fork publication must not replace a live generation"
         );
         authority.tombstone(id.clone()).unwrap();
         assert!(matches!(

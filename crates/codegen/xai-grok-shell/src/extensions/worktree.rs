@@ -330,6 +330,8 @@ pub async fn handle(
                     registry_client.as_ref(),
                     Some(agent.auth_manager.clone()),
                     &agent_id,
+                    agent.storage_root.clone(),
+                    agent.session_state_authority.clone(),
                 )
                 .await,
             )
