@@ -1,8 +1,9 @@
 use crate::{
     AvailableModel, ConversationRewindReceipt, ConversationRewindStatus, Error, Event, EventUpdate,
-    ExtensionNotification, ExtensionRequest, ExtensionResponse, LedgerTurnState, ModelCatalog,
-    Prompt, PromptBlock, PromptReceipt, RewindPoint, RuntimeCapabilities, RuntimeConfig,
-    RuntimeOptions, SessionConfig, SessionId, SessionLedger, SessionLedgerEntry, TurnOutcome,
+    ExtensionNotification, ExtensionRequest, ExtensionResponse, HarnessDigest, HarnessError,
+    LedgerTurnState, ModelCatalog, Prompt, PromptBlock, PromptReceipt, RewindPoint,
+    RuntimeCapabilities, RuntimeConfig, RuntimeOptions, SessionConfig, SessionId, SessionLedger,
+    SessionLedgerEntry, TurnBindingReceipt, TurnOutcome,
 };
 use agent_client_protocol as acp;
 use agent_client_protocol::Agent as _;
@@ -75,11 +76,18 @@ enum CapturedTurnUsage {
 
 type TurnUsageMap = Rc<RefCell<HashMap<(String, String), CapturedTurnUsage>>>;
 enum Command {
-    Create(SessionConfig, Reply<SessionId>),
-    Load(SessionId, SessionConfig, Reply<()>),
-    Resume(SessionId, SessionConfig, Reply<()>),
+    Create(SessionConfig, Option<HarnessDigest>, Reply<SessionId>),
+    Load(SessionId, SessionConfig, Option<HarnessDigest>, Reply<()>),
+    Resume(SessionId, SessionConfig, Option<HarnessDigest>, Reply<()>),
     Prompt(SessionId, String, String, Reply<PromptReceipt>),
     PromptContent(SessionId, String, Prompt, Reply<PromptReceipt>),
+    PromptBound(
+        SessionId,
+        String,
+        Prompt,
+        HarnessDigest,
+        Reply<TurnBindingReceipt>,
+    ),
     ListModels(Reply<ModelCatalog>),
     Extension(ExtensionRequest, Reply<ExtensionResponse>),
     ExtensionNotification(ExtensionNotification, Reply<()>),
@@ -445,13 +453,36 @@ impl Runtime {
         rx.await.map_err(|_| Error::Shutdown)?
     }
     pub async fn create_session(&self, c: SessionConfig) -> Result<SessionId, Error> {
-        self.call(|r| Command::Create(c, r)).await
+        self.call(|r| Command::Create(c, None, r)).await
+    }
+    pub async fn create_session_with_harness(
+        &self,
+        c: SessionConfig,
+        digest: HarnessDigest,
+    ) -> Result<SessionId, Error> {
+        self.call(|r| Command::Create(c, Some(digest), r)).await
     }
     pub async fn load_session(&self, id: SessionId, c: SessionConfig) -> Result<(), Error> {
-        self.call(|r| Command::Load(id, c, r)).await
+        self.call(|r| Command::Load(id, c, None, r)).await
+    }
+    pub async fn load_session_with_harness(
+        &self,
+        id: SessionId,
+        c: SessionConfig,
+        digest: HarnessDigest,
+    ) -> Result<(), Error> {
+        self.call(|r| Command::Load(id, c, Some(digest), r)).await
     }
     pub async fn resume_session(&self, id: SessionId, c: SessionConfig) -> Result<(), Error> {
-        self.call(|r| Command::Resume(id, c, r)).await
+        self.call(|r| Command::Resume(id, c, None, r)).await
+    }
+    pub async fn resume_session_with_harness(
+        &self,
+        id: SessionId,
+        c: SessionConfig,
+        digest: HarnessDigest,
+    ) -> Result<(), Error> {
+        self.call(|r| Command::Resume(id, c, Some(digest), r)).await
     }
     pub async fn prompt(
         &self,
@@ -468,6 +499,16 @@ impl Runtime {
         p: Prompt,
     ) -> Result<PromptReceipt, Error> {
         self.call(|r| Command::PromptContent(id.clone(), t, p, r))
+            .await
+    }
+    pub async fn prompt_content_with_harness(
+        &self,
+        id: &SessionId,
+        t: String,
+        p: Prompt,
+        digest: HarnessDigest,
+    ) -> Result<TurnBindingReceipt, Error> {
+        self.call(|reply| Command::PromptBound(id.clone(), t, p, digest, reply))
             .await
     }
     pub async fn extension_request(&self, x: ExtensionRequest) -> Result<ExtensionResponse, Error> {
@@ -1145,7 +1186,7 @@ fn validate_session_ledger(id: &SessionId, ledger: &SessionLedger) -> Result<(),
     Ok(())
 }
 
-fn ledger_settlement_id(
+pub(crate) fn ledger_settlement_id(
     session_id: &str,
     turn_id: &str,
     prompt_digest: &str,
@@ -1786,6 +1827,35 @@ impl Drop for TurnReservation {
     }
 }
 
+#[derive(Clone)]
+struct SessionBinding {
+    model: String,
+    reasoning: Option<String>,
+    harness_digest: Option<HarnessDigest>,
+}
+
+impl SessionBinding {
+    fn new(
+        config: &SessionConfig,
+        effective_reasoning: Option<String>,
+        harness_digest: Option<HarnessDigest>,
+    ) -> Self {
+        Self {
+            model: config.model.clone(),
+            reasoning: effective_reasoning,
+            harness_digest,
+        }
+    }
+}
+
+struct PreparedHarnessTurn {
+    prompt_digest: String,
+    snapshot_digest: HarnessDigest,
+    model: String,
+    reasoning: Option<String>,
+    after_sequence: u64,
+}
+
 struct Core {
     agent: Rc<MvpAgent>,
     events: mpsc::UnboundedSender<Event>,
@@ -1795,6 +1865,7 @@ struct Core {
     capacity: usize,
     options: RuntimeOptions,
     resident: RefCell<HashSet<String>>,
+    session_bindings: RefCell<HashMap<String, SessionBinding>>,
     mcp_bindings: Arc<McpBindingRegistry>,
     turns: Rc<RefCell<HashMap<String, String>>>,
     turn_usages: TurnUsageMap,
@@ -2072,6 +2143,7 @@ impl Core {
                 capacity: options.event_journal_capacity,
                 options,
                 resident: RefCell::new(HashSet::new()),
+                session_bindings: RefCell::new(HashMap::new()),
                 mcp_bindings,
                 turns,
                 turn_usages,
@@ -2086,14 +2158,14 @@ impl Core {
     async fn run(self: Rc<Self>, mut rx: mpsc::UnboundedReceiver<Command>) {
         while let Some(c) = rx.recv().await {
             match c {
-                Command::Create(x, r) => {
-                    let _ = r.send(self.create(x).await);
+                Command::Create(x, harness_digest, r) => {
+                    let _ = r.send(self.create(x, harness_digest).await);
                 }
-                Command::Load(i, x, r) => {
-                    let _ = r.send(self.load(i, x).await);
+                Command::Load(i, x, harness_digest, r) => {
+                    let _ = r.send(self.load(i, x, harness_digest).await);
                 }
-                Command::Resume(i, x, r) => {
-                    let _ = r.send(self.resume(i, x).await);
+                Command::Resume(i, x, harness_digest, r) => {
+                    let _ = r.send(self.resume(i, x, harness_digest).await);
                 }
                 Command::Prompt(i, t, x, r) => {
                     if t.trim().is_empty() {
@@ -2152,6 +2224,46 @@ impl Core {
                         let result = this.prompt_content(i, t, x).await;
                         this.prompt_tasks.borrow_mut().remove(&task_session_id);
                         let _ = r.send(result);
+                    });
+                    self.prompt_tasks
+                        .borrow_mut()
+                        .insert(task_key, task.abort_handle());
+                }
+                Command::PromptBound(i, t, prompt, harness_digest, reply) => {
+                    if t.trim().is_empty() {
+                        let _ = reply.send(Err(Error::InvalidConfig("turn id is required".into())));
+                        continue;
+                    }
+                    if self.turns.borrow().contains_key(&i.0) {
+                        let _ = reply.send(Err(Error::Operation(
+                            "session already has an active prompt".into(),
+                        )));
+                        continue;
+                    }
+                    let prepared = match self.prepare_harness_turn(&i, &prompt, &harness_digest) {
+                        Ok(prepared) => prepared,
+                        Err(error) => {
+                            let _ = reply.send(Err(error));
+                            continue;
+                        }
+                    };
+                    self.turns.borrow_mut().insert(i.0.clone(), t.clone());
+                    let this = self.clone();
+                    let task_key = i.0.clone();
+                    let task_session_id = task_key.clone();
+                    let reservation = TurnReservation {
+                        turns: self.turns.clone(),
+                        turn_usages: self.turn_usages.clone(),
+                        session_id: task_session_id.clone(),
+                        turn_id: t.clone(),
+                    };
+                    let task = tokio::task::spawn_local(async move {
+                        let _reservation = reservation;
+                        let result = this
+                            .prompt_content_with_harness(i, t, prompt, prepared)
+                            .await;
+                        this.prompt_tasks.borrow_mut().remove(&task_session_id);
+                        let _ = reply.send(result);
                     });
                     self.prompt_tasks
                         .borrow_mut()
@@ -2332,6 +2444,18 @@ impl Core {
         }
         Ok(())
     }
+    fn effective_reasoning(
+        &self,
+        model_id: &str,
+        reasoning: Option<&str>,
+    ) -> Result<Option<String>, Error> {
+        self.check_model(model_id, reasoning)?;
+        Ok(reasoning.map(str::to_owned).or_else(|| {
+            self.catalog
+                .get(model_id)
+                .and_then(|model| model.default_reasoning.clone())
+        }))
+    }
     fn check(&self, config: &SessionConfig) -> Result<(), Error> {
         self.check_model(&config.model, config.reasoning.as_deref())?;
         if !config.cwd.is_absolute() || !config.cwd.is_dir() {
@@ -2351,10 +2475,14 @@ impl Core {
         }
         Ok(())
     }
-    fn session_meta(&self, config: &SessionConfig) -> Result<SessionMeta, Error> {
+    fn session_meta(
+        &self,
+        config: &SessionConfig,
+        effective_reasoning: Option<&str>,
+    ) -> Result<SessionMeta, Error> {
         let mut meta = serde_json::json!({
             "modelId": config.model,
-            "reasoningEffort": config.reasoning,
+            "reasoningEffort": effective_reasoning,
             "clientIdentifier": self.options.client_identifier,
             "yoloMode": self.options.yolo_mode,
         })
@@ -2390,6 +2518,32 @@ impl Core {
         }
         Ok(meta)
     }
+
+    async fn apply_native_route(
+        &self,
+        id: &SessionId,
+        model: &str,
+        effective_reasoning: Option<&str>,
+    ) -> Result<(), Error> {
+        let meta = serde_json::json!({
+            "reasoningEffort": effective_reasoning,
+            "originRouteOnly": true,
+        })
+        .as_object()
+        .cloned();
+        self.agent
+            .set_session_model(
+                acp::SetSessionModelRequest::new(
+                    acp::SessionId::new(id.0.clone()),
+                    acp::ModelId::new(model.to_owned()),
+                )
+                .meta(meta),
+            )
+            .await
+            .map(|_| ())
+            .map_err(|error| protocol("session/set_model", error))
+    }
+
     fn mcp_servers(&self) -> Vec<acp::McpServer> {
         if self.options.profile == crate::RuntimeProfile::Restricted {
             return Vec::new();
@@ -2469,19 +2623,40 @@ impl Core {
         }
     }
 
-    async fn create(&self, config: SessionConfig) -> Result<SessionId, Error> {
+    async fn create(
+        &self,
+        config: SessionConfig,
+        harness_digest: Option<HarnessDigest>,
+    ) -> Result<SessionId, Error> {
         self.check(&config)?;
-        let meta = self.session_meta(&config)?;
+        let effective_reasoning =
+            self.effective_reasoning(&config.model, config.reasoning.as_deref())?;
+        let binding = SessionBinding::new(&config, effective_reasoning.clone(), harness_digest);
+        let meta = self.session_meta(&config, effective_reasoning.as_deref())?;
         let x = self
             .agent
             .new_session(
-                acp::NewSessionRequest::new(config.cwd)
+                acp::NewSessionRequest::new(config.cwd.clone())
                     .mcp_servers(self.mcp_servers())
                     .meta(meta),
             )
             .await
             .map_err(|error| protocol("session/new", error))?;
         let id = SessionId(x.session_id.0.to_string());
+        // `session/new` selects the catalog model but historically does not
+        // consume its reasoning override. Apply the same normalized route
+        // before exposing the Session so native sampling and receipts agree.
+        if let Err(error) = self
+            .apply_native_route(&id, &config.model, effective_reasoning.as_deref())
+            .await
+        {
+            return match self.detach_unregistered_session(&id).await {
+                Ok(()) => Err(error),
+                Err(cleanup_error) => Err(Error::Operation(format!(
+                    "{error}; native session cleanup failed: {cleanup_error}"
+                ))),
+            };
+        }
         let active_guard = ActiveMcpBindingGuard::new(self.mcp_bindings.clone(), id.0.clone());
         if let Err(error) = self.save_ledger(&id, &SessionLedger::default()) {
             return match self.detach_unregistered_session(&id).await {
@@ -2505,22 +2680,36 @@ impl Core {
             return Err(Error::Operation(detail));
         }
         self.resident.borrow_mut().insert(id.0.clone());
+        self.session_bindings
+            .borrow_mut()
+            .insert(id.0.clone(), binding);
         active_guard.commit();
         self.emit(&id, EventUpdate::SessionStarted, None);
         Ok(id)
     }
-    async fn load(&self, id: SessionId, config: SessionConfig) -> Result<(), Error> {
-        self.attach(id, config, false).await
+    async fn load(
+        &self,
+        id: SessionId,
+        config: SessionConfig,
+        harness_digest: Option<HarnessDigest>,
+    ) -> Result<(), Error> {
+        self.attach(id, config, harness_digest, false).await
     }
 
-    async fn resume(&self, id: SessionId, config: SessionConfig) -> Result<(), Error> {
-        self.attach(id, config, true).await
+    async fn resume(
+        &self,
+        id: SessionId,
+        config: SessionConfig,
+        harness_digest: Option<HarnessDigest>,
+    ) -> Result<(), Error> {
+        self.attach(id, config, harness_digest, true).await
     }
 
     async fn attach(
         &self,
         id: SessionId,
         config: SessionConfig,
+        harness_digest: Option<HarnessDigest>,
         resume: bool,
     ) -> Result<(), Error> {
         self.check(&config)?;
@@ -2528,8 +2717,11 @@ impl Core {
             return Err(Error::Operation("session is already resident".into()));
         }
         self.load_ledger(&id)?;
+        let effective_reasoning =
+            self.effective_reasoning(&config.model, config.reasoning.as_deref())?;
+        let binding = SessionBinding::new(&config, effective_reasoning.clone(), harness_digest);
         let active_guard = ActiveMcpBindingGuard::new(self.mcp_bindings.clone(), id.0.clone());
-        let meta = self.session_meta(&config)?;
+        let meta = self.session_meta(&config, effective_reasoning.as_deref())?;
         struct ReplayGuard<'a>(&'a RefCell<HashMap<String, ReplayMode>>, String);
         impl Drop for ReplayGuard<'_> {
             fn drop(&mut self) {
@@ -2576,6 +2768,9 @@ impl Core {
             };
         }
         self.resident.borrow_mut().insert(id.0.clone());
+        self.session_bindings
+            .borrow_mut()
+            .insert(id.0.clone(), binding);
         active_guard.commit();
         Ok(())
     }
@@ -2609,6 +2804,68 @@ impl Core {
         let digest = crate::prompt_digest_content(&prompt)?;
         self.prompt_wire(id, t, blocks, digest, prompt.metadata)
             .await
+    }
+    async fn prompt_content_with_harness(
+        &self,
+        id: SessionId,
+        turn_id: String,
+        prompt: Prompt,
+        prepared: PreparedHarnessTurn,
+    ) -> Result<TurnBindingReceipt, Error> {
+        let receipt = self
+            .prompt_content(id.clone(), turn_id.clone(), prompt)
+            .await?;
+        let events = self.events_after(&id, prepared.after_sequence)?;
+        TurnBindingReceipt::complete(
+            id,
+            turn_id,
+            prepared.prompt_digest,
+            prepared.snapshot_digest,
+            prepared.model,
+            prepared.reasoning,
+            prepared.after_sequence,
+            receipt,
+            &events,
+        )
+        .map_err(Error::Harness)
+    }
+
+    fn prepare_harness_turn(
+        &self,
+        id: &SessionId,
+        prompt: &Prompt,
+        requested_digest: &HarnessDigest,
+    ) -> Result<PreparedHarnessTurn, Error> {
+        self.require_resident(id)?;
+        let binding = self
+            .session_bindings
+            .borrow()
+            .get(&id.0)
+            .cloned()
+            .ok_or_else(|| Error::Operation("session binding is unavailable".into()))?;
+        let bound_digest = binding
+            .harness_digest
+            .ok_or_else(|| Error::Harness(HarnessError::UnboundSession))?;
+        if &bound_digest != requested_digest {
+            return Err(Error::Harness(HarnessError::BindingMismatch {
+                bound: bound_digest,
+                requested: requested_digest.clone(),
+            }));
+        }
+        let after_sequence = self
+            .sequences
+            .borrow()
+            .get(&id.0)
+            .copied()
+            .unwrap_or_default();
+        let prompt_digest = crate::prompt_digest_content(&prompt)?;
+        Ok(PreparedHarnessTurn {
+            prompt_digest,
+            snapshot_digest: bound_digest,
+            model: binding.model,
+            reasoning: binding.reasoning,
+            after_sequence,
+        })
     }
     async fn prompt_wire(
         &self,
@@ -2979,28 +3236,20 @@ impl Core {
         model: String,
         reasoning: Option<String>,
     ) -> Result<(), Error> {
-        self.check_model(&model, reasoning.as_deref())?;
+        let effective_reasoning = self.effective_reasoning(&model, reasoning.as_deref())?;
         if self.turns.borrow().contains_key(&id.0) {
             return Err(Error::Operation(
                 "cannot change model during an active prompt".into(),
             ));
         }
-        let meta = serde_json::json!({
-            "reasoningEffort": reasoning,
-            "originRouteOnly": true,
-        })
-        .as_object()
-        .cloned();
-        self.agent
-            .set_session_model(
-                acp::SetSessionModelRequest::new(
-                    acp::SessionId::new(id.0),
-                    acp::ModelId::new(model),
-                )
-                .meta(meta),
-            )
-            .await
-            .map_err(|error| protocol("session/set_model", error))?;
+        self.apply_native_route(&id, &model, effective_reasoning.as_deref())
+            .await?;
+        let mut bindings = self.session_bindings.borrow_mut();
+        let binding = bindings
+            .get_mut(&id.0)
+            .ok_or_else(|| Error::Operation("session binding is unavailable".into()))?;
+        binding.model = model;
+        binding.reasoning = effective_reasoning;
         Ok(())
     }
     async fn rewind_points(&self, id: SessionId) -> Result<Vec<RewindPoint>, Error> {
@@ -3480,6 +3729,7 @@ impl Core {
     fn finish_close(&self, id: &SessionId) {
         self.emit(id, EventUpdate::SessionClosed, None);
         self.resident.borrow_mut().remove(&id.0);
+        self.session_bindings.borrow_mut().remove(&id.0);
         self.mcp_bindings.revoke_session(&id.0);
         self.turns.borrow_mut().remove(&id.0);
         self.replay.borrow_mut().remove(&id.0);
@@ -3496,6 +3746,24 @@ fn validate(c: &RuntimeConfig, options: &RuntimeOptions) -> Result<(), Error> {
     {
         return Err(Error::InvalidConfig(
             "model id and non-zero context window are required".into(),
+        ));
+    }
+    if c.models.iter().any(|model| {
+        let options_valid = model
+            .reasoning_options
+            .iter()
+            .all(|option| !option.trim().is_empty())
+            && model.reasoning_options.iter().collect::<HashSet<_>>().len()
+                == model.reasoning_options.len();
+        !options_valid
+            || (!model.supports_reasoning
+                && (model.default_reasoning.is_some() || !model.reasoning_options.is_empty()))
+            || model.default_reasoning.as_ref().is_some_and(|default| {
+                !model.supports_reasoning || !model.reasoning_options.contains(default)
+            })
+    }) {
+        return Err(Error::InvalidConfig(
+            "model reasoning defaults and options must be unique, non-empty, and consistent".into(),
         ));
     }
     let model_ids: HashSet<&str> = c.models.iter().map(|model| model.id.as_str()).collect();

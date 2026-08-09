@@ -1,8 +1,11 @@
 use grok_build_sdk::{
-    HarnessContent, HarnessError, HarnessRefinement, HarnessRefinementPatch, HarnessSnapshot,
-    SessionConfig,
+    ApiBackend, Error, HarnessContent, HarnessError, HarnessRefinement, HarnessRefinementPatch,
+    HarnessSnapshot, LedgerTurnState, ModelSpec, Runtime, RuntimeConfig, SessionConfig,
+    TurnOutcome,
 };
 use std::path::PathBuf;
+use tempfile::TempDir;
+use xai_grok_test_support::MockInferenceServer;
 
 #[test]
 fn immutable_snapshot_is_content_addressed_validated_and_materialized() {
@@ -35,9 +38,11 @@ fn immutable_snapshot_is_content_addressed_validated_and_materialized() {
     assert_eq!(session.reasoning.as_deref(), Some("high"));
     assert_eq!(
         session.system_prompt.as_deref(),
-        Some("You are the desktop coding agent.")
+        Some(
+            "You are the desktop coding agent.\n\n<human_rules>\nKeep changes reviewable.\n</human_rules>"
+        )
     );
-    assert_eq!(session.rules.as_deref(), Some("Keep changes reviewable."));
+    assert_eq!(session.rules, None);
 
     let bytes = snapshot.to_json_vec().expect("snapshot serialization");
     assert_eq!(
@@ -50,6 +55,10 @@ fn immutable_snapshot_is_content_addressed_validated_and_materialized() {
     let error = HarnessSnapshot::from_json_slice(&serde_json::to_vec(&tampered).unwrap())
         .expect_err("content tampering must invalidate the address");
     assert!(matches!(error, HarnessError::DigestMismatch { .. }));
+    assert!(matches!(
+        HarnessSnapshot::new(HarnessContent::new().rules("rules without a complete prompt")),
+        Err(HarnessError::Invalid(_))
+    ));
 }
 
 #[test]
@@ -90,4 +99,345 @@ fn typed_refinement_is_optimistic_and_returns_an_uncommitted_snapshot() {
     )
     .expect_err("one typed target may be changed only once");
     assert!(matches!(duplicate, HarnessError::Invalid(_)));
+}
+
+fn runtime_config(root: &TempDir, endpoint: String) -> RuntimeConfig {
+    RuntimeConfig {
+        endpoint,
+        api_key: "host-relay-bearer".into(),
+        grok_home: root.path().join("grok"),
+        session_storage: root.path().join("sessions"),
+        models: vec![
+            ModelSpec {
+                id: "fast".into(),
+                context_window: 131_072,
+                api_backend: ApiBackend::ChatCompletions,
+                supports_reasoning: true,
+                default_reasoning: Some("high".into()),
+                reasoning_options: vec!["low".into(), "high".into()],
+            },
+            ModelSpec {
+                id: "deep".into(),
+                context_window: 131_072,
+                api_backend: ApiBackend::ChatCompletions,
+                supports_reasoning: true,
+                default_reasoning: Some("xhigh".into()),
+                reasoning_options: vec!["xhigh".into()],
+            },
+        ],
+    }
+}
+
+fn session_config(cwd: PathBuf, model: &str, reasoning: Option<&str>) -> SessionConfig {
+    SessionConfig {
+        cwd,
+        model: model.into(),
+        reasoning: reasoning.map(str::to_owned),
+        system_prompt: None,
+        rules: None,
+    }
+}
+
+fn foreground_request(server: &MockInferenceServer, marker: &str) -> serde_json::Value {
+    server
+        .requests()
+        .into_iter()
+        .filter(|entry| entry.path.contains("chat/completions") || entry.path.contains("responses"))
+        .filter_map(|entry| entry.body)
+        .find(|body| {
+            body.get("tools")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|tools| !tools.is_empty())
+                && body.get("tool_choice").is_none()
+                && body
+                    .get("messages")
+                    .and_then(serde_json::Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|message| message.get("content"))
+                    .any(|content| content.as_str().is_some_and(|text| text.contains(marker)))
+        })
+        .unwrap_or_else(|| panic!("foreground provider request containing {marker}"))
+}
+
+fn assert_provider_binding(
+    server: &MockInferenceServer,
+    marker: &str,
+    expected_system_prompt: &str,
+    expected_model: &str,
+    expected_reasoning: &str,
+    receipt: &grok_build_sdk::TurnBindingReceipt,
+    snapshot: &HarnessSnapshot,
+) -> serde_json::Value {
+    let request = foreground_request(server, marker);
+    assert_eq!(
+        request["messages"][0]["content"].as_str(),
+        Some(expected_system_prompt),
+        "provider wire must use exactly the materialized snapshot"
+    );
+    assert_eq!(request["model"], expected_model);
+    assert_eq!(request["reasoning_effort"], expected_reasoning);
+    assert_eq!(receipt.snapshot_digest(), snapshot.digest());
+    assert_eq!(receipt.model(), expected_model);
+    assert_eq!(receipt.reasoning(), Some(expected_reasoning));
+    request
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn provider_wire_and_receipt_bind_complete_harness_and_effective_route_across_reattach() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let server = MockInferenceServer::start().await.expect("mock provider");
+    let root = TempDir::new().expect("temp root");
+    let workspace = root.path().join("workspace");
+    std::fs::create_dir(&workspace).expect("workspace");
+    let config = runtime_config(&root, server.url());
+    let mut invalid_catalog = config.clone();
+    invalid_catalog.models[0].default_reasoning = Some("not-an-option".into());
+    assert!(matches!(
+        Runtime::start(invalid_catalog).await,
+        Err(Error::InvalidConfig(_))
+    ));
+    let created_snapshot = HarnessSnapshot::new(
+        HarnessContent::new()
+            .system_prompt("create-system-v1")
+            .rules("create-rules-v1"),
+    )
+    .unwrap();
+    let loaded_snapshot = HarnessRefinementPatch::new(
+        created_snapshot.digest().clone(),
+        [
+            HarnessRefinement::SetSystemPrompt("load-system-v2".into()),
+            HarnessRefinement::SetRules("load-rules-v2".into()),
+        ],
+    )
+    .unwrap()
+    .apply(&created_snapshot)
+    .unwrap();
+    let resumed_snapshot = HarnessRefinementPatch::new(
+        loaded_snapshot.digest().clone(),
+        [
+            HarnessRefinement::SetSystemPrompt("resume-system-v3".into()),
+            HarnessRefinement::ClearRules,
+        ],
+    )
+    .unwrap()
+    .apply(&loaded_snapshot)
+    .unwrap();
+
+    let (runtime, _) = Runtime::start(config.clone())
+        .await
+        .expect("runtime starts");
+    let session = runtime
+        .create_session_with_harness(
+            session_config(workspace.clone(), "fast", Some("low")),
+            &created_snapshot,
+        )
+        .await
+        .expect("bound session");
+    let first = runtime
+        .prompt_with_harness(
+            &session,
+            "bound-turn-create",
+            "provider-marker-create",
+            &created_snapshot,
+        )
+        .await
+        .expect("complete binding receipt");
+    assert_eq!(first.session_id(), &session);
+    assert_eq!(first.turn_id(), "bound-turn-create");
+    let create_request = assert_provider_binding(
+        &server,
+        "provider-marker-create",
+        "create-system-v1\n\n<human_rules>\ncreate-rules-v1\n</human_rules>",
+        "fast",
+        "low",
+        &first,
+        &created_snapshot,
+    );
+    assert!(create_request.to_string().contains("create-rules-v1"));
+    assert_eq!(first.outcome(), TurnOutcome::End);
+    assert_eq!(
+        first.complete_cursor().event_count() as usize,
+        runtime
+            .events_after(&session, first.complete_cursor().after_sequence())
+            .await
+            .unwrap()
+            .len()
+    );
+    assert_eq!(
+        first.complete_cursor().final_sequence(),
+        runtime
+            .events_after(&session, first.complete_cursor().after_sequence())
+            .await
+            .unwrap()
+            .last()
+            .unwrap()
+            .sequence
+    );
+    assert_eq!(first.sdk_provenance().facade_version(), "0.2.0");
+    assert!(first.binding_id().starts_with("sha256:"));
+    let encoded = serde_json::to_vec(&first).unwrap();
+    assert_eq!(
+        serde_json::from_slice::<grok_build_sdk::TurnBindingReceipt>(&encoded).unwrap(),
+        first
+    );
+    let mut tampered: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+    tampered["model"] = serde_json::json!("tampered-model");
+    assert!(
+        serde_json::from_value::<grok_build_sdk::TurnBindingReceipt>(tampered).is_err(),
+        "binding identity must cover the selected model"
+    );
+
+    runtime
+        .set_route(&session, "deep", None)
+        .await
+        .expect("route changes to the validated catalog default");
+    let second = runtime
+        .prompt_with_harness(
+            &session,
+            "bound-turn-route-default",
+            "provider-marker-route-default",
+            &created_snapshot,
+        )
+        .await
+        .expect("route-bound receipt");
+    assert_provider_binding(
+        &server,
+        "provider-marker-route-default",
+        "create-system-v1\n\n<human_rules>\ncreate-rules-v1\n</human_rules>",
+        "deep",
+        "xhigh",
+        &second,
+        &created_snapshot,
+    );
+    runtime
+        .unload_session(session.clone())
+        .await
+        .expect("session unloads");
+
+    runtime
+        .load_session_with_harness(
+            session.clone(),
+            session_config(workspace.clone(), "fast", None),
+            &loaded_snapshot,
+        )
+        .await
+        .expect("session cold-loads with a replacement snapshot");
+    let loaded = runtime
+        .prompt_with_harness(
+            &session,
+            "bound-turn-load",
+            "provider-marker-load",
+            &loaded_snapshot,
+        )
+        .await
+        .expect("receipt after cold load");
+    let load_request = assert_provider_binding(
+        &server,
+        "provider-marker-load",
+        "load-system-v2\n\n<human_rules>\nload-rules-v2\n</human_rules>",
+        "fast",
+        "high",
+        &loaded,
+        &loaded_snapshot,
+    );
+    let load_wire = load_request.to_string();
+    assert!(!load_wire.contains("create-system-v1"));
+    assert!(!load_wire.contains("create-rules-v1"));
+    runtime
+        .unload_session(session.clone())
+        .await
+        .expect("loaded session unloads");
+    runtime.shutdown().await.expect("runtime shuts down");
+
+    let (restarted, _) = Runtime::start(config).await.expect("runtime restarts");
+    restarted
+        .resume_session_with_harness(
+            session.clone(),
+            session_config(workspace, "deep", None),
+            &resumed_snapshot,
+        )
+        .await
+        .expect("bound session resumes without replay");
+    let recovered = restarted
+        .prompt_with_harness(
+            &session,
+            "bound-turn-after-restart",
+            "provider-marker-resume-restart",
+            &resumed_snapshot,
+        )
+        .await
+        .expect("receipt after restart");
+    assert_eq!(recovered.runtime_prompt_index(), 3);
+    let resumed_request = assert_provider_binding(
+        &server,
+        "provider-marker-resume-restart",
+        "resume-system-v3",
+        "deep",
+        "xhigh",
+        &recovered,
+        &resumed_snapshot,
+    );
+    let resumed_wire = resumed_request.to_string();
+    assert!(!resumed_wire.contains("load-system-v2"));
+    assert!(!resumed_wire.contains("load-rules-v2"));
+    assert!(!resumed_wire.contains("<human_rules>"));
+    restarted.shutdown().await.expect("runtime shuts down");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn binding_rejects_snapshot_mismatch_before_dispatch_and_cursor_gap_after_dispatch() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let server = MockInferenceServer::start().await.expect("mock provider");
+    let root = TempDir::new().expect("temp root");
+    let workspace = root.path().join("workspace");
+    std::fs::create_dir(&workspace).expect("workspace");
+    let bound = HarnessSnapshot::new(
+        HarnessContent::new()
+            .system_prompt("bound prompt")
+            .rules("bound"),
+    )
+    .unwrap();
+    let stale = HarnessSnapshot::new(
+        HarnessContent::new()
+            .system_prompt("stale prompt")
+            .rules("stale"),
+    )
+    .unwrap();
+    let (runtime, _) = Runtime::builder(runtime_config(&root, server.url()))
+        .event_journal_capacity(1)
+        .start()
+        .await
+        .expect("runtime starts");
+    let session = runtime
+        .create_session_with_harness(session_config(workspace, "fast", Some("high")), &bound)
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        runtime
+            .prompt_with_harness(&session, "stale-turn", "must not dispatch", &stale)
+            .await,
+        Err(Error::Harness(HarnessError::BindingMismatch { .. }))
+    ));
+    assert!(
+        runtime
+            .session_ledger(&session)
+            .await
+            .unwrap()
+            .entries
+            .is_empty()
+    );
+
+    assert!(matches!(
+        runtime
+            .prompt_with_harness(&session, "gap-turn", "dispatch then detect gap", &bound)
+            .await,
+        Err(Error::EventGap { .. })
+    ));
+    assert!(matches!(
+        runtime.session_ledger(&session).await.unwrap().entries[0].state,
+        LedgerTurnState::Completed { .. }
+    ));
+    runtime.shutdown().await.expect("runtime shuts down");
 }
