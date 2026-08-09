@@ -5,7 +5,10 @@
 //! The public API is a typed SDK; protocol adapters used by the shell remain
 //! private implementation details.
 
+mod autonomous;
 mod private;
+
+pub use autonomous::{AutonomousActivation, AutonomousActivationResult, AutonomousTurnLoop};
 
 use std::{collections::BTreeMap, path::PathBuf, sync::Arc};
 use tokio::sync::mpsc;
@@ -24,6 +27,31 @@ pub mod mcp_model {
     pub use xai_grok_mcp::rmcp::model::{
         CreateMessageRequestParams, CreateMessageResult, ElicitRequestParams, ElicitResult,
         ElicitationAction, ListRootsResult, Root,
+    };
+}
+
+/// Durable Run domain and provider contracts. Run IDs, Run event cursors and
+/// revisions are deliberately distinct from [`SessionId`] and session event
+/// sequences; hosts cannot accidentally cross the two namespaces.
+pub mod run {
+    pub use xai_agent_lifecycle::run::{
+        ApprovalDecision, ApprovalHandler, ApprovalRequest, ArtifactMetadata, ArtifactRef,
+        ArtifactStore, CapabilityPolicy, CommandId, ControllerEpoch, CreateRunRequest,
+        DenyApprovalHandler, EffectClass, EffectReceipt, FailClosedGateProvider,
+        FailClosedGoalVerifier, FinishedOutcome, GateEvaluation, GateProvider, GateRequest,
+        GoalSpec, GoalVerdict, GoalVerification, GoalVerificationRequest, GoalVerifier,
+        IterationId, LocalArtifactStore, LocalRunStore, MessageId, MutationRequest,
+        NoopTelemetrySink, OperationId, OperationState, ProviderSet, RUN_SCHEMA_VERSION,
+        ReconcileDecision, ReconcileEffect, RecoveryNeed, RecoveryPlan, RecoveryResolution,
+        ResourceVector, RunAction, RunAttach, RunCommandResult, RunDriverSpec, RunEnvelope,
+        RunError, RunEvent, RunEventCursor, RunEventKind, RunId, RunLifecycle, RunRevision,
+        RunStage, RunStatus, RunStore, SessionRef, SessionTurnOutcome, StoreCommit,
+        StoreCommitResult, TelemetryRecord, TelemetrySink, WaitingReason, migrate_legacy_goal,
+    };
+    #[cfg(test)]
+    pub use xai_agent_lifecycle::run::{
+        BeginIteration, ClaimEffect, EffectSpec, FinishIteration, IterationContextManifest,
+        PrepareOperation,
     };
 }
 
@@ -1924,6 +1952,7 @@ pub struct RewindPoint {
     pub prompt_preview: Option<String>,
 }
 
+#[non_exhaustive]
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("invalid runtime configuration: {0}")]
@@ -1948,6 +1977,44 @@ pub enum Error {
         oldest_available: u64,
         newest: u64,
     },
+    #[error(transparent)]
+    DurableRun(#[from] run::RunError),
+}
+
+fn run_reconcile_command_id(
+    parent: &run::CommandId,
+    operation: &run::OperationId,
+) -> Result<run::CommandId, Error> {
+    use sha2::Digest as _;
+    let digest = sha2::Sha256::digest(format!("{}\0{}", parent.as_str(), operation.as_str()));
+    run::CommandId::new(format!("reconcile_{digest:x}")).map_err(|error| {
+        Error::Operation(format!(
+            "could not derive durable reconciliation command: {error}"
+        ))
+    })
+}
+
+fn durable_turn_outcome(outcome: TurnOutcome) -> run::SessionTurnOutcome {
+    match outcome {
+        TurnOutcome::End => run::SessionTurnOutcome::End,
+        TurnOutcome::Cancelled => run::SessionTurnOutcome::Cancelled,
+        TurnOutcome::MaxTokens => run::SessionTurnOutcome::MaxTokens,
+        TurnOutcome::MaxTurnRequests => run::SessionTurnOutcome::MaxTurnRequests,
+        TurnOutcome::Refusal => run::SessionTurnOutcome::Refusal,
+    }
+}
+
+fn rewind_receipt_proves_turn_not_applied(
+    receipt: &ConversationRewindReceipt,
+    entry: &SessionLedgerEntry,
+    turn_id: &str,
+    prompt_digest: &str,
+) -> bool {
+    receipt.target_prompt_index == entry.runtime_prompt_index
+        && receipt.target_turn_id == turn_id
+        && receipt.target_prompt_digest == prompt_digest
+        && receipt.recovery_turn_id.as_deref() == Some(turn_id)
+        && receipt.recovery_prompt_digest.as_deref() == Some(prompt_digest)
 }
 
 #[derive(Clone)]
@@ -1959,6 +2026,7 @@ impl Runtime {
         RuntimeBuilder {
             config,
             options: RuntimeOptions::default(),
+            run_store: None,
         }
     }
     pub async fn start(
@@ -1968,8 +2036,180 @@ impl Runtime {
             .await
             .map(|(inner, events)| (Self { inner }, events))
     }
+    /// Starts the SDK with one Host-provided Run authority. The supplied store
+    /// replaces (rather than mirrors) the standalone SQLite store, so snapshot,
+    /// journal, outbox and command receipts still have exactly one writer.
+    pub async fn start_with_run_store(
+        config: RuntimeConfig,
+        store: Arc<dyn run::RunStore>,
+    ) -> Result<(Self, mpsc::UnboundedReceiver<Event>), Error> {
+        private::Runtime::start_with_run_store(config, RuntimeOptions::default(), Some(store))
+            .await
+            .map(|(inner, events)| (Self { inner }, events))
+    }
     pub fn capabilities(&self) -> RuntimeCapabilities {
         self.inner.capabilities()
+    }
+    /// Creates a durable Run. GoalSpec defines the desired outcome; the Run is
+    /// the sole lifecycle authority that executes a selected bounded driver.
+    pub async fn create_run(
+        &self,
+        request: run::CreateRunRequest,
+    ) -> Result<run::RunCommandResult, Error> {
+        self.inner.create_run(request).await
+    }
+    pub async fn get_run(&self, run_id: &run::RunId) -> Result<Option<run::RunEnvelope>, Error> {
+        self.inner.get_run(run_id).await
+    }
+    pub async fn list_runs(&self) -> Result<Vec<run::RunEnvelope>, Error> {
+        self.inner.list_runs().await
+    }
+    pub async fn list_recoverable_runs(&self) -> Result<Vec<run::RunEnvelope>, Error> {
+        self.inner.list_recoverable_runs().await
+    }
+    pub async fn control_run(
+        &self,
+        request: run::MutationRequest<run::RunAction>,
+    ) -> Result<run::RunCommandResult, Error> {
+        self.inner.control_run(request).await
+    }
+    pub async fn wake_run(
+        &self,
+        request: run::MutationRequest<run::RunAction>,
+    ) -> Result<run::RunCommandResult, Error> {
+        self.inner.wake_run(request).await
+    }
+    /// Attaches to the independent Run journal. A pruned or invalid cursor
+    /// returns a full Snapshot fallback instead of a lossy gap error.
+    pub async fn attach_run(
+        &self,
+        run_id: &run::RunId,
+        after: run::RunEventCursor,
+    ) -> Result<run::RunAttach, Error> {
+        self.inner.attach_run(run_id, after).await
+    }
+    /// Fences the previous controller epoch, enters Recovering, then resolves
+    /// Session-turn operations from the existing SessionLedger and rewind
+    /// receipts. Non-session effects and active child/iteration state remain
+    /// explicit needs for the host; this method never guesses an outcome.
+    pub async fn reconcile_run(
+        &self,
+        request: run::MutationRequest<()>,
+    ) -> Result<run::RecoveryPlan, Error> {
+        let parent_command = request.command_id.clone();
+        let run_id = request.run_id.clone();
+        let mut plan = self.inner.begin_run_recovery(request).await?;
+        let needs = plan.needs.clone();
+        for need in needs {
+            let run::RecoveryNeed::SessionTurnLedger {
+                operation_id,
+                session,
+                turn_id,
+                prompt_digest,
+            } = need
+            else {
+                continue;
+            };
+            let session_id = SessionId::from_stored(session.as_str());
+            let ledger = self.session_ledger(&session_id).await?;
+            let conflicting_identity = ledger
+                .entries
+                .iter()
+                .any(|entry| entry.turn_id == turn_id && entry.prompt_digest != prompt_digest);
+            let matching: Vec<_> = ledger
+                .entries
+                .iter()
+                .filter(|entry| entry.turn_id == turn_id && entry.prompt_digest == prompt_digest)
+                .collect();
+            let decision = match matching.as_slice() {
+                [entry] => match &entry.state {
+                    LedgerTurnState::Completed {
+                        outcome,
+                        settlement_id,
+                    } => {
+                        let receipt = run::EffectReceipt::for_session_turn(
+                            &session,
+                            &turn_id,
+                            &prompt_digest,
+                            entry.runtime_prompt_index,
+                            durable_turn_outcome(*outcome),
+                        );
+                        if receipt.settlement_id.as_deref() == Some(settlement_id.as_str()) {
+                            run::ReconcileDecision::Applied { receipt }
+                        } else {
+                            run::ReconcileDecision::Unknown {
+                                message: "SessionLedger settlement identity failed validation"
+                                    .into(),
+                            }
+                        }
+                    }
+                    LedgerTurnState::Pending | LedgerTurnState::Discarded => {
+                        match self.rewind_status(&session_id, operation_id.as_str()).await {
+                            Ok(ConversationRewindStatus::Applied { receipt })
+                                if rewind_receipt_proves_turn_not_applied(
+                                    &receipt,
+                                    entry,
+                                    &turn_id,
+                                    &prompt_digest,
+                                ) =>
+                            {
+                                run::ReconcileDecision::NotApplied
+                            }
+                            Ok(ConversationRewindStatus::Pending { .. }) => {
+                                run::ReconcileDecision::Unknown {
+                                    message: "Session turn rewind remains pending".into(),
+                                }
+                            }
+                            Ok(ConversationRewindStatus::Absent)
+                            | Ok(ConversationRewindStatus::Applied { .. }) => {
+                                run::ReconcileDecision::Unknown {
+                                    message: "Session turn lacks an exact applied rewind receipt"
+                                        .into(),
+                                }
+                            }
+                            Err(error) => run::ReconcileDecision::Unknown {
+                                message: format!("rewind evidence unavailable: {error}"),
+                            },
+                        }
+                    }
+                },
+                [] if conflicting_identity => run::ReconcileDecision::Unknown {
+                    message: "SessionLedger reused the turn id with a different prompt digest"
+                        .into(),
+                },
+                // Runtime::prompt durably writes the Pending ledger entry before
+                // native dispatch. Absence of both the exact tuple and a
+                // conflicting turn id therefore proves this committed Run intent
+                // was never dispatched.
+                [] => run::ReconcileDecision::NotApplied,
+                _ => run::ReconcileDecision::Unknown {
+                    message: "SessionLedger contains conflicting turn evidence".into(),
+                },
+            };
+            let command_id = run_reconcile_command_id(&parent_command, &operation_id)?;
+            let result = self
+                .inner
+                .reconcile_effect(run::MutationRequest::new(
+                    run_id.clone(),
+                    plan.snapshot.run.revision,
+                    command_id,
+                    run::ReconcileEffect::new(operation_id, decision),
+                ))
+                .await?;
+            plan.snapshot = result.snapshot;
+        }
+        self.inner.run_recovery_plan(&run_id).await
+    }
+    /// Resolves the remaining high-level recovery needs after
+    /// [`Self::reconcile_run`]. Applied work requires observed usage; the SDK
+    /// never invents zero-cost usage. A persisted paused/waiting/terminal state
+    /// is restored even when `resume` is requested, so only a later explicit
+    /// Resume command can reactivate it.
+    pub async fn resolve_run_recovery(
+        &self,
+        request: run::MutationRequest<run::RecoveryResolution>,
+    ) -> Result<run::RunCommandResult, Error> {
+        self.inner.finish_run_recovery(request).await
     }
     /// Returns the live fixed model catalog through Grok Build's
     /// `x.ai/models/list` contract. Unlike generic extension requests, this
@@ -2872,6 +3112,7 @@ impl Runtime {
 pub struct RuntimeBuilder {
     config: RuntimeConfig,
     options: RuntimeOptions,
+    run_store: Option<Arc<dyn run::RunStore>>,
 }
 impl RuntimeBuilder {
     pub fn profile(mut self, value: RuntimeProfile) -> Self {
@@ -2971,8 +3212,15 @@ impl RuntimeBuilder {
         self.options.tool_permission_handler = Some(value);
         self
     }
+    /// Replaces the standalone SQLite Run store with the Host's single
+    /// acknowledged Run authority. This is not an event mirror or write-through
+    /// cache: the SDK reducer commits only to this store.
+    pub fn run_store(mut self, value: Arc<dyn run::RunStore>) -> Self {
+        self.run_store = Some(value);
+        self
+    }
     pub async fn start(self) -> Result<(Runtime, mpsc::UnboundedReceiver<Event>), Error> {
-        private::Runtime::start(self.config, self.options)
+        private::Runtime::start_with_run_store(self.config, self.options, self.run_store)
             .await
             .map(|(inner, events)| (Runtime { inner }, events))
     }
@@ -6296,6 +6544,12 @@ done
                 && capability.disabled_reason.as_deref() == Some("restricted profile")
         }));
         assert!(restricted_caps.features.iter().any(|capability| {
+            capability.namespace == "sdk:autonomous-runs"
+                && capability.enabled
+                && capability.effect_class == "state-agent"
+                && capability.host_requirement.is_none()
+        }));
+        assert!(restricted_caps.features.iter().any(|capability| {
             capability.namespace == "feature:plugins"
                 && !capability.enabled
                 && capability.disabled_reason.as_deref() == Some("restricted profile")
@@ -7183,5 +7437,739 @@ done
             runtime.create_session(session_config(workspace)).await,
             Err(Error::Shutdown)
         ));
+    }
+
+    struct SequenceVerifier {
+        remaining_failures: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl run::GoalVerifier for SequenceVerifier {
+        async fn verify(
+            &self,
+            _request: run::GoalVerificationRequest,
+        ) -> Result<run::GoalVerification, run::RunError> {
+            let previous = self
+                .remaining_failures
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+                    value.checked_sub(1)
+                })
+                .unwrap_or(0);
+            let verdict = if previous == 0 {
+                run::GoalVerdict::Achieved
+            } else {
+                run::GoalVerdict::NotAchieved
+            };
+            Ok(run::GoalVerification::new(
+                verdict,
+                "test-verifier",
+                "deterministic test verifier",
+            ))
+        }
+    }
+
+    fn autonomous_providers(root: &std::path::Path, remaining_failures: usize) -> run::ProviderSet {
+        run::ProviderSet::new(
+            Arc::new(run::LocalArtifactStore::new(root, 1024 * 1024).unwrap()),
+            Arc::new(run::FailClosedGateProvider),
+            Arc::new(SequenceVerifier {
+                remaining_failures: std::sync::atomic::AtomicUsize::new(remaining_failures),
+            }),
+            Arc::new(run::DenyApprovalHandler),
+            Arc::new(run::NoopTelemetrySink),
+        )
+    }
+
+    fn autonomous_run_request(
+        run_id: &str,
+        session: &SessionId,
+        iteration_budget: u64,
+    ) -> run::CreateRunRequest {
+        let capability = "session.turn".to_owned();
+        run::CreateRunRequest::new(
+            run::CommandId::new(format!("create_{run_id}")).unwrap(),
+            run::SessionRef::new(session.as_str()).unwrap(),
+            run::GoalSpec::new("produce a verified durable result"),
+            run::RunDriverSpec::AutonomousTurnLoop {
+                session: run::SessionRef::new(session.as_str()).unwrap(),
+                strategy_revision: 0,
+            },
+            run::CapabilityPolicy::new([capability.clone()], [capability.clone()], [capability]),
+            run::ResourceVector::default()
+                .iterations(iteration_budget)
+                .agent_calls(iteration_budget)
+                .agent_concurrency(1)
+                .active_ms(1_000_000)
+                .wall_ms(1_000_000)
+                .tokens(1_000_000)
+                .cost_micros(1_000_000)
+                .artifact_bytes(10_000_000),
+        )
+        .run_id(run::RunId::new(run_id).unwrap())
+        .verifier_policy_digest("test-verifier")
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn host_run_store_replaces_the_default_run_authority() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let server = MockInferenceServer::start().await.expect("mock server");
+        let root = TempDir::new().expect("temp root");
+        let workspace = root.path().join("workspace");
+        std::fs::create_dir(&workspace).expect("workspace");
+        let config = runtime_config(&root, server.url());
+        let default_store_path = config
+            .session_storage
+            .join("durable-runs")
+            .join("runs.sqlite3");
+        let host_store = run::LocalRunStore::new(root.path().join("host-run-authority"))
+            .expect("Host store opens");
+        let (runtime, _) = Runtime::start_with_run_store(config, Arc::new(host_store.clone()))
+            .await
+            .expect("runtime starts with Host authority");
+        let session = runtime
+            .create_session(session_config(workspace))
+            .await
+            .expect("session starts");
+        let created = runtime
+            .create_run(autonomous_run_request("host_store_run", &session, 1))
+            .await
+            .expect("Run commits to Host store");
+        assert_eq!(
+            run::RunStore::load(&host_store, &created.snapshot.run.id)
+                .unwrap()
+                .unwrap()
+                .run
+                .revision,
+            created.snapshot.run.revision
+        );
+        assert!(
+            !default_store_path.exists(),
+            "an injected Host store must replace, not mirror, LocalRunStore"
+        );
+        runtime.shutdown().await.expect("runtime shuts down");
+    }
+
+    async fn claim_test_session_turn(
+        runtime: &Runtime,
+        created: &run::RunCommandResult,
+        command_prefix: &str,
+        turn_id: &str,
+        prompt_digest: String,
+    ) -> (run::OperationId, run::RunEnvelope) {
+        let context = run::IterationContextManifest::new(
+            created.snapshot.run.revision,
+            0,
+            "test-verifier",
+            "test-model-v1",
+            "workspace-v1",
+        );
+        let iteration = runtime
+            .inner
+            .begin_iteration(run::MutationRequest::new(
+                created.snapshot.run.id.clone(),
+                created.snapshot.run.revision,
+                run::CommandId::new(format!("{command_prefix}_begin")).unwrap(),
+                run::BeginIteration::new(context),
+            ))
+            .await
+            .unwrap();
+        let operation_id =
+            run::OperationId::new(format!("{}_operation", command_prefix.replace('-', "_")))
+                .unwrap();
+        let prepared = runtime
+            .inner
+            .prepare_operation(run::MutationRequest::new(
+                created.snapshot.run.id.clone(),
+                iteration.command.snapshot.run.revision,
+                run::CommandId::new(format!("{command_prefix}_prepare")).unwrap(),
+                run::PrepareOperation::new(
+                    operation_id.clone(),
+                    iteration.output.iteration_id,
+                    run::EffectClass::Reconcilable,
+                    run::EffectSpec::SessionTurn {
+                        session: created.snapshot.run.session.clone(),
+                        turn_id: turn_id.into(),
+                        prompt_digest,
+                        input: run::ArtifactRef::new(
+                            "a".repeat(64),
+                            "text/plain",
+                            1,
+                            "test",
+                            created.snapshot.run.id.as_str(),
+                        ),
+                    },
+                ),
+            ))
+            .await
+            .unwrap();
+        let claimed = runtime
+            .inner
+            .claim_effect(run::MutationRequest::new(
+                created.snapshot.run.id.clone(),
+                prepared.snapshot.run.revision,
+                run::CommandId::new(format!("{command_prefix}_claim")).unwrap(),
+                run::ClaimEffect::new(operation_id.clone()),
+            ))
+            .await
+            .unwrap();
+        (operation_id, claimed.command.snapshot)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn autonomous_turn_loop_runs_multiple_ledgered_turns_and_budget_is_not_success() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let server = MockInferenceServer::start().await.expect("mock server");
+        server.set_response("durable progress with evidence");
+        let root = TempDir::new().expect("temp root");
+        let workspace = root.path().join("workspace");
+        std::fs::create_dir(&workspace).expect("workspace");
+        let (runtime, _) = Runtime::start(runtime_config(&root, server.url()))
+            .await
+            .expect("runtime starts");
+
+        let session = runtime
+            .create_session(session_config(workspace.clone()))
+            .await
+            .expect("session starts");
+        let created = runtime
+            .create_run(autonomous_run_request("vertical_run", &session, 4))
+            .await
+            .expect("Run created");
+        let result = runtime
+            .autonomous_turn_loop(autonomous_providers(&root.path().join("artifacts"), 1))
+            .activate(
+                AutonomousActivation::new(
+                    created.snapshot.run.id.clone(),
+                    "test-model-v1",
+                    "workspace-v1",
+                )
+                .max_iterations(3),
+            )
+            .await
+            .expect("autonomous loop succeeds");
+        assert_eq!(
+            result.snapshot.run.lifecycle(),
+            run::RunLifecycle::Finished(run::FinishedOutcome::Succeeded)
+        );
+        assert_eq!(result.iterations_executed, 2);
+        assert_eq!(
+            runtime
+                .session_ledger(&session)
+                .await
+                .unwrap()
+                .entries
+                .len(),
+            2
+        );
+
+        let budget_session = runtime
+            .create_session(session_config(workspace))
+            .await
+            .expect("budget session starts");
+        let budget_run = runtime
+            .create_run(autonomous_run_request("budget_run", &budget_session, 1))
+            .await
+            .expect("budget Run created");
+        let budget_result = runtime
+            .autonomous_turn_loop(autonomous_providers(
+                &root.path().join("budget-artifacts"),
+                usize::MAX,
+            ))
+            .activate(
+                AutonomousActivation::new(
+                    budget_run.snapshot.run.id.clone(),
+                    "test-model-v1",
+                    "workspace-v1",
+                )
+                .max_iterations(2),
+            )
+            .await
+            .expect("budget exhaustion is a normal wait");
+        assert_eq!(
+            budget_result.snapshot.run.lifecycle(),
+            run::RunLifecycle::Waiting(run::WaitingReason::BudgetExhausted)
+        );
+        assert_ne!(budget_result.snapshot.run.status, run::RunStatus::Complete);
+        runtime.shutdown().await.expect("runtime shuts down");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn autonomous_restart_preserves_pause_until_explicit_resume() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let server = MockInferenceServer::start().await.expect("mock server");
+        let root = TempDir::new().expect("temp root");
+        let workspace = root.path().join("workspace");
+        std::fs::create_dir(&workspace).expect("workspace");
+        let config = runtime_config(&root, server.url());
+        let session_config_value = session_config(workspace);
+        let (first, _) = Runtime::start(config.clone()).await.expect("first runtime");
+        let session = first
+            .create_session(session_config_value.clone())
+            .await
+            .expect("session starts");
+        let created = first
+            .create_run(autonomous_run_request("paused_restart_run", &session, 4))
+            .await
+            .expect("Run created");
+        let paused = first
+            .control_run(run::MutationRequest::new(
+                created.snapshot.run.id.clone(),
+                created.snapshot.run.revision,
+                run::CommandId::new("pause_before_restart").unwrap(),
+                run::RunAction::Pause,
+            ))
+            .await
+            .expect("Run pauses");
+        assert_eq!(
+            paused.snapshot.run.lifecycle(),
+            run::RunLifecycle::Waiting(run::WaitingReason::User)
+        );
+        first.shutdown().await.expect("first runtime stops");
+
+        let (restarted, _) = Runtime::start(config).await.expect("runtime restarts");
+        restarted
+            .resume_session(session, session_config_value)
+            .await
+            .expect("session resumes");
+        let result = restarted
+            .autonomous_turn_loop(autonomous_providers(
+                &root.path().join("paused-restart-artifacts"),
+                0,
+            ))
+            .activate(AutonomousActivation::new(
+                created.snapshot.run.id,
+                "test-model-v1",
+                "workspace-v1",
+            ))
+            .await
+            .expect("paused Run reconciles without resuming");
+        assert_eq!(
+            result.snapshot.run.lifecycle(),
+            run::RunLifecycle::Waiting(run::WaitingReason::User)
+        );
+        assert_eq!(result.iterations_executed, 0);
+        assert!(
+            server.requests().is_empty(),
+            "restart recovery must not reactivate a paused Run"
+        );
+        restarted.shutdown().await.expect("runtime shuts down");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn autonomous_restart_reconciles_pre_dispatch_intent_without_replaying_claim() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let server = MockInferenceServer::start().await.expect("mock server");
+        server.set_response("recovered once");
+        let root = TempDir::new().expect("temp root");
+        let workspace = root.path().join("workspace");
+        std::fs::create_dir(&workspace).expect("workspace");
+        let config = runtime_config(&root, server.url());
+        let session_config_value = session_config(workspace.clone());
+        let (first, _) = Runtime::start(config.clone()).await.expect("first runtime");
+        let session = first
+            .create_session(session_config_value.clone())
+            .await
+            .expect("session starts");
+        let created = first
+            .create_run(autonomous_run_request("pre_dispatch_run", &session, 4))
+            .await
+            .expect("Run created");
+        let context = run::IterationContextManifest::new(
+            created.snapshot.run.revision,
+            0,
+            "test-verifier",
+            "test-model-v1",
+            "workspace-v1",
+        );
+        let iteration = first
+            .inner
+            .begin_iteration(run::MutationRequest::new(
+                created.snapshot.run.id.clone(),
+                created.snapshot.run.revision,
+                run::CommandId::new("crash_begin").unwrap(),
+                run::BeginIteration::new(context),
+            ))
+            .await
+            .unwrap();
+        let operation_id = run::OperationId::new("turn_1").unwrap();
+        let prepared = first
+            .inner
+            .prepare_operation(run::MutationRequest::new(
+                created.snapshot.run.id.clone(),
+                iteration.command.snapshot.run.revision,
+                run::CommandId::new("crash_prepare").unwrap(),
+                run::PrepareOperation::new(
+                    operation_id.clone(),
+                    iteration.output.iteration_id,
+                    run::EffectClass::Reconcilable,
+                    run::EffectSpec::SessionTurn {
+                        session: created.snapshot.run.session.clone(),
+                        turn_id: "pre_dispatch_run_turn_1".into(),
+                        prompt_digest: "b".repeat(64),
+                        input: run::ArtifactRef::new(
+                            "a".repeat(64),
+                            "text/plain",
+                            1,
+                            "test",
+                            "pre_dispatch_run",
+                        ),
+                    },
+                ),
+            ))
+            .await
+            .unwrap();
+        first
+            .inner
+            .claim_effect(run::MutationRequest::new(
+                created.snapshot.run.id.clone(),
+                prepared.snapshot.run.revision,
+                run::CommandId::new("crash_claim").unwrap(),
+                run::ClaimEffect::new(operation_id.clone()),
+            ))
+            .await
+            .unwrap();
+        first.shutdown().await.expect("first runtime stops");
+
+        let (restarted, _) = Runtime::start(config).await.expect("runtime restarts");
+        restarted
+            .resume_session(session.clone(), session_config_value)
+            .await
+            .expect("session resumes");
+        let result = restarted
+            .autonomous_turn_loop(autonomous_providers(
+                &root.path().join("restart-artifacts"),
+                0,
+            ))
+            .activate(AutonomousActivation::new(
+                created.snapshot.run.id,
+                "test-model-v1",
+                "workspace-v1",
+            ))
+            .await
+            .expect("pre-dispatch crash recovers");
+        assert_eq!(
+            result.snapshot.run.lifecycle(),
+            run::RunLifecycle::Finished(run::FinishedOutcome::Succeeded)
+        );
+        assert_eq!(
+            result.snapshot.run.operations[&operation_id].state,
+            run::OperationState::Abandoned
+        );
+        assert_eq!(
+            restarted
+                .session_ledger(&session)
+                .await
+                .unwrap()
+                .entries
+                .len(),
+            1,
+            "the uncertain claim was not dispatched or replayed"
+        );
+        restarted.shutdown().await.expect("runtime shuts down");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn autonomous_restart_uses_completed_ledger_evidence_without_repeating_turn() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let server = MockInferenceServer::start().await.expect("mock server");
+        server.set_response("completed ledger evidence");
+        let root = TempDir::new().expect("temp root");
+        let workspace = root.path().join("workspace");
+        std::fs::create_dir(&workspace).expect("workspace");
+        let config = runtime_config(&root, server.url());
+        let session_config_value = session_config(workspace);
+        let (first, _) = Runtime::start(config.clone()).await.expect("first runtime");
+        let session = first
+            .create_session(session_config_value.clone())
+            .await
+            .expect("session starts");
+        let created = first
+            .create_run(autonomous_run_request("completed_ledger_run", &session, 4))
+            .await
+            .expect("Run created");
+        let turn_id = "completed_ledger_run_turn_1";
+        let prompt = "durable prompt completed before Run acknowledgement";
+        let prompt_digest = crate::prompt_digest(prompt);
+        let (operation_id, _claimed) =
+            claim_test_session_turn(&first, &created, "completed_ledger", turn_id, prompt_digest)
+                .await;
+        first
+            .prompt(&session, turn_id, prompt)
+            .await
+            .expect("SessionLedger settlement commits");
+        // Simulate process loss before the Run callback is persisted.
+        first.shutdown().await.expect("first runtime stops");
+
+        let (restarted, _) = Runtime::start(config).await.expect("runtime restarts");
+        restarted
+            .resume_session(session.clone(), session_config_value)
+            .await
+            .expect("session resumes");
+        let result = restarted
+            .autonomous_turn_loop(autonomous_providers(
+                &root.path().join("completed-ledger-artifacts"),
+                0,
+            ))
+            .activate(AutonomousActivation::new(
+                created.snapshot.run.id,
+                "test-model-v1",
+                "workspace-v1",
+            ))
+            .await
+            .expect("completed ledger recovers");
+        assert_eq!(
+            result.snapshot.run.operations[&operation_id].state,
+            run::OperationState::Reconciled
+        );
+        assert_eq!(
+            result.snapshot.run.lifecycle(),
+            run::RunLifecycle::Recovering
+        );
+        assert!(
+            result
+                .recovery_needs
+                .iter()
+                .any(|need| matches!(need, run::RecoveryNeed::ActiveIteration { .. }))
+        );
+        let resolved = restarted
+            .resolve_run_recovery(run::MutationRequest::new(
+                result.snapshot.run.id.clone(),
+                result.snapshot.run.revision,
+                run::CommandId::new("resolve_completed_ledger_iteration").unwrap(),
+                run::RecoveryResolution::new(true, true).recovered_usage(
+                    run::ResourceVector::default()
+                        .iterations(1)
+                        .agent_calls(1)
+                        .agent_concurrency(1),
+                ),
+            ))
+            .await
+            .expect("Host supplies observed usage and abandons the uncertain iteration");
+        assert_eq!(resolved.snapshot.run.lifecycle(), run::RunLifecycle::Active);
+        let continued = restarted
+            .autonomous_turn_loop(autonomous_providers(
+                &root.path().join("completed-ledger-continuation-artifacts"),
+                0,
+            ))
+            .activate(AutonomousActivation::new(
+                resolved.snapshot.run.id,
+                "test-model-v1",
+                "workspace-v1",
+            ))
+            .await
+            .expect("recovered Run continues with a new iteration");
+        assert_eq!(
+            continued.snapshot.run.lifecycle(),
+            run::RunLifecycle::Finished(run::FinishedOutcome::Succeeded)
+        );
+        let ledger = restarted.session_ledger(&session).await.unwrap();
+        assert_eq!(ledger.entries.len(), 2);
+        assert_eq!(
+            ledger
+                .entries
+                .iter()
+                .filter(|entry| entry.turn_id == turn_id)
+                .count(),
+            1,
+            "the settled Turn identity must never be replayed"
+        );
+        restarted.shutdown().await.expect("runtime shuts down");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_reconciliation_fails_closed_on_ledger_identity_conflict() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let server = MockInferenceServer::start().await.expect("mock server");
+        server.set_response("existing conflicting Turn");
+        let root = TempDir::new().expect("temp root");
+        let workspace = root.path().join("workspace");
+        std::fs::create_dir(&workspace).expect("workspace");
+        let (runtime, _) = Runtime::start(runtime_config(&root, server.url()))
+            .await
+            .expect("runtime starts");
+        let session = runtime
+            .create_session(session_config(workspace))
+            .await
+            .expect("session starts");
+        let conflicting_turn_id = "identity_conflict_turn";
+        runtime
+            .prompt(&session, conflicting_turn_id, "first prompt identity")
+            .await
+            .expect("existing Turn settles");
+        let created = runtime
+            .create_run(autonomous_run_request("ledger_conflict_run", &session, 4))
+            .await
+            .expect("Run created");
+        let (operation_id, claimed) = claim_test_session_turn(
+            &runtime,
+            &created,
+            "ledger_conflict",
+            conflicting_turn_id,
+            "b".repeat(64),
+        )
+        .await;
+        let plan = runtime
+            .reconcile_run(run::MutationRequest::new(
+                created.snapshot.run.id,
+                claimed.run.revision,
+                run::CommandId::new("ledger_conflict_recovery").unwrap(),
+                (),
+            ))
+            .await
+            .expect("reconciliation remains explicit");
+        assert_eq!(plan.snapshot.run.lifecycle(), run::RunLifecycle::Recovering);
+        assert!(plan.needs.iter().any(|need| matches!(
+            need,
+            run::RecoveryNeed::SessionTurnLedger {
+                operation_id: candidate,
+                ..
+            } if candidate == &operation_id
+        )));
+        assert_eq!(
+            plan.snapshot.run.operations[&operation_id].state,
+            run::OperationState::Uncertain
+        );
+        runtime.shutdown().await.expect("runtime shuts down");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn discarded_ledger_entry_without_exact_rewind_receipt_stays_uncertain() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let server = MockInferenceServer::start().await.expect("mock server");
+        let root = TempDir::new().expect("temp root");
+        let workspace = root.path().join("workspace");
+        std::fs::create_dir(&workspace).expect("workspace");
+        let (runtime, _) = Runtime::start(runtime_config(&root, server.url()))
+            .await
+            .expect("runtime starts");
+        let session = runtime
+            .create_session(session_config(workspace))
+            .await
+            .expect("session starts");
+        let created = runtime
+            .create_run(autonomous_run_request(
+                "discarded_without_rewind_run",
+                &session,
+                4,
+            ))
+            .await
+            .expect("Run created");
+        let turn_id = "discarded_without_rewind_turn";
+        let prompt_digest = crate::prompt_digest("possibly dispatched prompt");
+        let (operation_id, claimed) = claim_test_session_turn(
+            &runtime,
+            &created,
+            "discarded_without_rewind",
+            turn_id,
+            prompt_digest.clone(),
+        )
+        .await;
+        runtime
+            .mark_turn_discarded(&session, turn_id, &prompt_digest, 0)
+            .await
+            .expect("simulate ledger-only discard without native rewind evidence");
+
+        let plan = runtime
+            .reconcile_run(run::MutationRequest::new(
+                created.snapshot.run.id,
+                claimed.run.revision,
+                run::CommandId::new("recover_discarded_without_rewind").unwrap(),
+                (),
+            ))
+            .await
+            .expect("recovery remains explicit");
+        assert_eq!(plan.snapshot.run.lifecycle(), run::RunLifecycle::Recovering);
+        assert_eq!(
+            plan.snapshot.run.operations[&operation_id].state,
+            run::OperationState::Uncertain
+        );
+        assert!(plan.needs.iter().any(|need| matches!(
+            need,
+            run::RecoveryNeed::SessionTurnLedger {
+                operation_id: candidate,
+                ..
+            } if candidate == &operation_id
+        )));
+        assert!(
+            server.requests().is_empty(),
+            "a ledger-only discard must never authorize replay"
+        );
+        runtime.shutdown().await.expect("runtime shuts down");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn autonomous_restart_advances_finished_iteration_without_another_turn() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let server = MockInferenceServer::start().await.expect("mock server");
+        let root = TempDir::new().expect("temp root");
+        let workspace = root.path().join("workspace");
+        std::fs::create_dir(&workspace).expect("workspace");
+        let config = runtime_config(&root, server.url());
+        let session_config_value = session_config(workspace);
+        let (first, _) = Runtime::start(config.clone()).await.expect("first runtime");
+        let session = first
+            .create_session(session_config_value.clone())
+            .await
+            .expect("session starts");
+        let created = first
+            .create_run(autonomous_run_request("finished_boundary_run", &session, 4))
+            .await
+            .expect("Run created");
+        let context = run::IterationContextManifest::new(
+            created.snapshot.run.revision,
+            0,
+            "test-verifier",
+            "test-model-v1",
+            "workspace-v1",
+        );
+        let iteration = first
+            .inner
+            .begin_iteration(run::MutationRequest::new(
+                created.snapshot.run.id.clone(),
+                created.snapshot.run.revision,
+                run::CommandId::new("finished_boundary_begin").unwrap(),
+                run::BeginIteration::new(context),
+            ))
+            .await
+            .unwrap();
+        first
+            .inner
+            .finish_iteration(run::FinishIteration::new(
+                &iteration.output,
+                true,
+                "verified before crash",
+                run::GoalVerdict::Achieved,
+                run::ResourceVector::default().iterations(1).agent_calls(1),
+            ))
+            .await
+            .unwrap();
+        first.shutdown().await.expect("first runtime stops");
+
+        let (restarted, _) = Runtime::start(config).await.expect("runtime restarts");
+        restarted
+            .resume_session(session, session_config_value)
+            .await
+            .expect("session resumes");
+        let result = restarted
+            .autonomous_turn_loop(autonomous_providers(
+                &root.path().join("finished-boundary-artifacts"),
+                0,
+            ))
+            .activate(AutonomousActivation::new(
+                created.snapshot.run.id,
+                "test-model-v1",
+                "workspace-v1",
+            ))
+            .await
+            .expect("finished boundary advances");
+        assert_eq!(
+            result.snapshot.run.lifecycle(),
+            run::RunLifecycle::Finished(run::FinishedOutcome::Succeeded)
+        );
+        assert!(
+            server.requests().is_empty(),
+            "a durable finished iteration must advance without another model Turn"
+        );
+        restarted.shutdown().await.expect("runtime shuts down");
     }
 }

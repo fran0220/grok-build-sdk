@@ -3,7 +3,10 @@
 //! capability injected at install time, and they never own loop control.
 
 pub mod local;
+pub mod run;
 pub mod send;
+
+pub use run::{GoalVerdict, RunStage, RunStatus};
 
 pub use local::{
     LocalCommandContributor, LocalExtensionRegistry, LocalExtensionRegistryBuilder,

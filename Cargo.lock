@@ -4815,6 +4815,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "xai-acp-lib",
+ "xai-agent-lifecycle",
  "xai-file-utils",
  "xai-grok-mcp",
  "xai-grok-shell",
@@ -13078,8 +13079,14 @@ name = "xai-agent-lifecycle"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
  "tokio",
  "tracing",
+ "uuid",
 ]
 
 [[package]]

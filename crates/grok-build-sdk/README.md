@@ -32,6 +32,37 @@ Screenshots, accessibility trees (AX/UIA/AT-SPI), OCR, and mouse/keyboard automa
 
 The event receiver provides push delivery. `events_after` reads the same bounded per-session journal and reports `Error::EventGap` when a cursor was evicted.
 
+## Durable autonomous Runs: first vertical slice
+
+`GoalSpec` is immutable goal input: objective, acceptance criteria, constraints, and required evidence. It is not another lifecycle state machine. `run::RunRecord` is the sole authority for long-running work, while the existing Session Turn ledger remains the sole prompt-settlement and rewind-evidence ledger. The Run stores a typed reference and receipt for each Turn; it does not copy conversation history into a second writable ledger.
+
+This revision implements one executable driver, `AutonomousTurnLoop`, end to end:
+
+1. A Host creates a Run and invokes a bounded `AutonomousActivation`. The SDK freezes the iteration context and builds the next goal prompt.
+2. The SDK commits the Session Turn intent and fenced outbox claim before calling `Runtime::prompt`. Effect class is fixed by the capability implementation, not selected by model output.
+3. `Runtime::prompt` durably writes Pending and Completed SessionLedger entries around native dispatch. The Run accepts only an exact typed receipt bound to Session, Turn ID, prompt digest, prompt index, outcome, and settlement ID.
+4. Gates and the skeptic `GoalVerifier` decide whether an iteration may complete the Run. Reaching an iteration/agent budget produces `Waiting(BudgetExhausted)`, never success.
+5. On restart, the previous controller epoch is fenced before SessionLedger/rewind reconciliation. Missing, conflicting, merely Discarded, or otherwise uncertain evidence remains `Recovering`; an uncertain Turn is never guessed or silently repeated. Paused, waiting, cancelled, and failed states survive reconciliation and require an explicit Resume where applicable.
+
+The public façade exposes `create_run`, `get_run`, `list_runs`, `list_recoverable_runs`, `control_run`, `wake_run`, `attach_run`, `reconcile_run`, `resolve_run_recovery`, and `autonomous_turn_loop(...).activate(...)`. Low-level prepare/claim/acknowledge/iteration choreography is intentionally not part of the normal SDK façade. `RunId`, `RunRevision`, `RunEventCursor`, `ControllerEpoch`, `OperationId`, and `IterationId` use distinct Rust types and namespaces; Session `Event.sequence` is not a Run cursor. `attach_run` falls back to `RunAttach::Snapshot` when bounded journal replay is not contiguous.
+
+The default `LocalRunStore` is a standalone SQLite authority with transactional revision CAS. `Runtime::start_with_run_store` and `RuntimeBuilder::run_store` replace it with one Host-provided authority; they do not mirror or write through to a second store. A custom store must atomically commit snapshot, event journal, command receipt, and outbox state, and must report acknowledgement uncertainty as `CommitUnknown`.
+
+| SDK owns | Embedding Host owns |
+|---|---|
+| Run reducer and lifecycle invariants, bounded loop, budgets, gates, verifier policy, intent/outbox, command de-duplication, epoch/token fencing, receipts, recovery decisions and attach contract | Worker/process placement, OS daemon/service residency, durable timer implementation and invoking bounded activations |
+| SessionLedger reconciliation, artifact identity/integrity and fail-closed provider contracts | Credentials and rotation, provider implementations, workspace backend, remote storage/queues, organization policy and UI |
+
+`ProviderSet` supplies typed artifact, gate, verifier, approval, and telemetry contracts. Local defaults store content-addressed artifacts and fail gates, verification, and approval closed until the Host installs explicit providers.
+
+### This is not yet full Prime Agent parity
+
+The target SDK architecture still includes heartbeat/schedule runtime semantics, background worker claim/resume/wake residency, child Runs and A2A mailbox, context/artifact policy and compaction, skills, an independent mutable Harness aggregate with immutable `HarnessSnapshot` pinning/refinement/history/rollback, bounded Rhai workflow execution, and a `ProgramRuntime`/`PersistentKernelDriver` boundary for persistent programmable environments. Kernel/VM snapshots may be best effort; durable truth will remain explicit Run state, artifacts, handles, effects, and receipts. Rhai will be a bounded workflow driver, not a claim of RLM/IPython equivalence.
+
+Some lifecycle support types reserve future driver, child, mailbox, and revision concepts, but they are not wired through the SDK façade and are not claimed as working parity. Run schema v1 rejects non-`AutonomousTurnLoop` creation. `HarnessDescriptor` negotiation and provider credential rotation are also unimplemented additive follow-ups, not hidden behavior in this release.
+
+The first Run schema uses non-exhaustive public enums/DTO constructors, checked identifier deserialization, conservative unknown-value handling, validated envelope deserialization, and a checked-in v1 golden fixture.
+
 ## Agent API coverage
 
 The SDK does not wrap the TUI. It exposes the stateful agent actor below it:

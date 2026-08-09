@@ -1,0 +1,81 @@
+{
+  "schema_version": 1,
+  "run": {
+    "revision": 1,
+    "controller_epoch": 1,
+    "created_at_ms": 1000,
+    "updated_at_ms": 1000,
+    "id": "run_golden",
+    "session": "session_golden",
+    "goal": {
+      "objective": "Produce verified output",
+      "acceptance_criteria": [],
+      "constraints": [],
+      "required_evidence": []
+    },
+    "driver": {
+      "type": "autonomous_turn_loop",
+      "session": "session_golden",
+      "strategy_revision": 0
+    },
+    "status": "user_paused",
+    "stage": "idle",
+    "capabilities": {
+      "required": [],
+      "available": [],
+      "ceiling": []
+    },
+    "required_gates": [],
+    "verifier_policy_digest": "default",
+    "budget": {
+      "iterations": 10,
+      "agent_calls": 10,
+      "agent_concurrency": 2,
+      "active_ms": 60000,
+      "wall_ms": 120000,
+      "tokens": 100000,
+      "cost_micros": 1000000,
+      "artifact_bytes": 1048576
+    },
+    "usage": {
+      "iterations": 0,
+      "agent_calls": 0,
+      "agent_concurrency": 0,
+      "active_ms": 0,
+      "wall_ms": 0,
+      "tokens": 0,
+      "cost_micros": 0,
+      "artifact_bytes": 0
+    },
+    "child_reserved": {
+      "iterations": 0,
+      "agent_calls": 0,
+      "agent_concurrency": 0,
+      "active_ms": 0,
+      "wall_ms": 0,
+      "tokens": 0,
+      "cost_micros": 0,
+      "artifact_bytes": 0
+    },
+    "next_iteration_id": 1,
+    "active_iteration": null,
+    "iterations": [],
+    "operations": {},
+    "children": {},
+    "mailbox": {},
+    "next_message_sequence": 1,
+    "steering": {},
+    "steering_high_water": 0,
+    "strategy_revisions": [],
+    "current_strategy_revision": 0,
+    "workflow_revisions": [],
+    "current_workflow_revision": null,
+    "verdict": null,
+    "pending_approval": false,
+    "recovery_prior_status": null,
+    "command_receipts": {},
+    "terminal_report_claimed": false,
+    "event_cursor": 0
+  },
+  "events": []
+}

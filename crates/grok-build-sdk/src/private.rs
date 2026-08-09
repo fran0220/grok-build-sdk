@@ -118,6 +118,9 @@ pub struct Runtime {
 struct RuntimeShared {
     commands: mpsc::UnboundedSender<Command>,
     join: tokio::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
+    runs: tokio::sync::Mutex<
+        xai_agent_lifecycle::run::RunController<Arc<dyn xai_agent_lifecycle::run::RunStore>>,
+    >,
     shutdown: AtomicBool,
     capabilities: RuntimeCapabilities,
 }
@@ -125,6 +128,14 @@ impl Runtime {
     pub async fn start(
         input: RuntimeConfig,
         options: RuntimeOptions,
+    ) -> Result<(Self, mpsc::UnboundedReceiver<Event>), Error> {
+        Self::start_with_run_store(input, options, None).await
+    }
+
+    pub async fn start_with_run_store(
+        input: RuntimeConfig,
+        options: RuntimeOptions,
+        run_store: Option<Arc<dyn xai_agent_lifecycle::run::RunStore>>,
     ) -> Result<(Self, mpsc::UnboundedReceiver<Event>), Error> {
         validate(&input, &options)?;
         if options.event_journal_capacity == 0 {
@@ -146,6 +157,16 @@ impl Runtime {
                 "client identifier must not be empty".into(),
             ));
         }
+        let run_store: Arc<dyn xai_agent_lifecycle::run::RunStore> = match run_store {
+            Some(store) => store,
+            None => Arc::new(
+                xai_agent_lifecycle::run::LocalRunStore::new(
+                    input.session_storage.join("durable-runs"),
+                )
+                .map_err(run_error)?,
+            ),
+        };
+        let runs = xai_agent_lifecycle::run::RunController::open(run_store).map_err(run_error)?;
         let (events, event_rx) = mpsc::unbounded_channel();
         let (commands, command_rx) = mpsc::unbounded_channel();
         let (ready_tx, ready_rx) = oneshot::channel();
@@ -182,6 +203,7 @@ impl Runtime {
                 shared: Arc::new(RuntimeShared {
                     commands,
                     join: tokio::sync::Mutex::new(Some(join)),
+                    runs: tokio::sync::Mutex::new(runs),
                     shutdown: AtomicBool::new(false),
                     capabilities,
                 }),
@@ -191,6 +213,213 @@ impl Runtime {
     }
     pub fn capabilities(&self) -> RuntimeCapabilities {
         self.shared.capabilities.clone()
+    }
+    fn ensure_running(&self) -> Result<(), Error> {
+        if self.shared.shutdown.load(Ordering::Acquire) {
+            Err(Error::Shutdown)
+        } else {
+            Ok(())
+        }
+    }
+    pub async fn create_run(
+        &self,
+        request: xai_agent_lifecycle::run::CreateRunRequest,
+    ) -> Result<xai_agent_lifecycle::run::RunCommandResult, Error> {
+        self.ensure_running()?;
+        self.shared
+            .runs
+            .lock()
+            .await
+            .create_run(request, now_ms())
+            .map_err(run_error)
+    }
+    pub async fn get_run(
+        &self,
+        run_id: &xai_agent_lifecycle::run::RunId,
+    ) -> Result<Option<xai_agent_lifecycle::run::RunEnvelope>, Error> {
+        self.ensure_running()?;
+        Ok(self.shared.runs.lock().await.get_run(run_id))
+    }
+    pub async fn reload_run_if_required(
+        &self,
+        run_id: &xai_agent_lifecycle::run::RunId,
+    ) -> Result<Option<xai_agent_lifecycle::run::RunEnvelope>, Error> {
+        self.ensure_running()?;
+        let mut runs = self.shared.runs.lock().await;
+        if runs.reload_is_required(run_id) {
+            runs.reload_run(run_id).map_err(run_error)
+        } else {
+            Ok(runs.get_run(run_id))
+        }
+    }
+    pub async fn list_runs(&self) -> Result<Vec<xai_agent_lifecycle::run::RunEnvelope>, Error> {
+        self.ensure_running()?;
+        Ok(self.shared.runs.lock().await.list_runs())
+    }
+    pub async fn list_recoverable_runs(
+        &self,
+    ) -> Result<Vec<xai_agent_lifecycle::run::RunEnvelope>, Error> {
+        self.ensure_running()?;
+        Ok(self.shared.runs.lock().await.list_recoverable_runs())
+    }
+    pub async fn control_run(
+        &self,
+        request: xai_agent_lifecycle::run::MutationRequest<xai_agent_lifecycle::run::RunAction>,
+    ) -> Result<xai_agent_lifecycle::run::RunCommandResult, Error> {
+        self.ensure_running()?;
+        self.shared
+            .runs
+            .lock()
+            .await
+            .control_run(request, now_ms())
+            .map_err(run_error)
+    }
+    pub async fn wake_run(
+        &self,
+        request: xai_agent_lifecycle::run::MutationRequest<xai_agent_lifecycle::run::RunAction>,
+    ) -> Result<xai_agent_lifecycle::run::RunCommandResult, Error> {
+        self.ensure_running()?;
+        self.shared
+            .runs
+            .lock()
+            .await
+            .wake_run(request, now_ms())
+            .map_err(run_error)
+    }
+    pub async fn attach_run(
+        &self,
+        run_id: &xai_agent_lifecycle::run::RunId,
+        cursor: xai_agent_lifecycle::run::RunEventCursor,
+    ) -> Result<xai_agent_lifecycle::run::RunAttach, Error> {
+        self.ensure_running()?;
+        self.shared
+            .runs
+            .lock()
+            .await
+            .attach_run(run_id, cursor)
+            .map_err(run_error)
+    }
+    pub async fn begin_run_recovery(
+        &self,
+        request: xai_agent_lifecycle::run::MutationRequest<()>,
+    ) -> Result<xai_agent_lifecycle::run::RecoveryPlan, Error> {
+        self.ensure_running()?;
+        self.shared
+            .runs
+            .lock()
+            .await
+            .begin_recovery(request, now_ms())
+            .map_err(run_error)
+    }
+    pub async fn run_recovery_plan(
+        &self,
+        run_id: &xai_agent_lifecycle::run::RunId,
+    ) -> Result<xai_agent_lifecycle::run::RecoveryPlan, Error> {
+        self.ensure_running()?;
+        self.shared
+            .runs
+            .lock()
+            .await
+            .recovery_plan(run_id)
+            .map_err(run_error)
+    }
+    pub async fn finish_run_recovery(
+        &self,
+        request: xai_agent_lifecycle::run::MutationRequest<
+            xai_agent_lifecycle::run::RecoveryResolution,
+        >,
+    ) -> Result<xai_agent_lifecycle::run::RunCommandResult, Error> {
+        self.ensure_running()?;
+        self.shared
+            .runs
+            .lock()
+            .await
+            .finish_recovery(request, now_ms())
+            .map_err(run_error)
+    }
+    pub async fn begin_iteration(
+        &self,
+        request: xai_agent_lifecycle::run::MutationRequest<
+            xai_agent_lifecycle::run::BeginIteration,
+        >,
+    ) -> Result<
+        xai_agent_lifecycle::run::CommandOutput<xai_agent_lifecycle::run::IterationHandle>,
+        Error,
+    > {
+        self.ensure_running()?;
+        self.shared
+            .runs
+            .lock()
+            .await
+            .begin_iteration(request, now_ms())
+            .map_err(run_error)
+    }
+    pub async fn finish_iteration(
+        &self,
+        callback: xai_agent_lifecycle::run::FinishIteration,
+    ) -> Result<xai_agent_lifecycle::run::CallbackResult, Error> {
+        self.ensure_running()?;
+        self.shared
+            .runs
+            .lock()
+            .await
+            .finish_iteration(callback, now_ms())
+            .map_err(run_error)
+    }
+    pub async fn prepare_operation(
+        &self,
+        request: xai_agent_lifecycle::run::MutationRequest<
+            xai_agent_lifecycle::run::PrepareOperation,
+        >,
+    ) -> Result<xai_agent_lifecycle::run::RunCommandResult, Error> {
+        self.ensure_running()?;
+        self.shared
+            .runs
+            .lock()
+            .await
+            .prepare_operation(request, now_ms())
+            .map_err(run_error)
+    }
+    pub async fn claim_effect(
+        &self,
+        request: xai_agent_lifecycle::run::MutationRequest<xai_agent_lifecycle::run::ClaimEffect>,
+    ) -> Result<
+        xai_agent_lifecycle::run::CommandOutput<xai_agent_lifecycle::run::CommittedEffect>,
+        Error,
+    > {
+        self.ensure_running()?;
+        self.shared
+            .runs
+            .lock()
+            .await
+            .claim_effect(request, now_ms())
+            .map_err(run_error)
+    }
+    pub async fn acknowledge_effect(
+        &self,
+        callback: xai_agent_lifecycle::run::EffectCallback,
+    ) -> Result<xai_agent_lifecycle::run::CallbackResult, Error> {
+        self.ensure_running()?;
+        self.shared
+            .runs
+            .lock()
+            .await
+            .acknowledge_effect(callback, now_ms())
+            .map_err(run_error)
+    }
+    pub async fn reconcile_effect(
+        &self,
+        request: xai_agent_lifecycle::run::MutationRequest<
+            xai_agent_lifecycle::run::ReconcileEffect,
+        >,
+    ) -> Result<xai_agent_lifecycle::run::RunCommandResult, Error> {
+        self.ensure_running()?;
+        self.shared
+            .runs
+            .lock()
+            .await
+            .reconcile_effect(request, now_ms())
+            .map_err(run_error)
     }
     pub async fn list_models(&self) -> Result<ModelCatalog, Error> {
         self.call(Command::ListModels).await
@@ -797,6 +1026,57 @@ impl Client {
         }
         let _ = self.events.send(event);
     }
+}
+
+fn validate_session_ledger(id: &SessionId, ledger: &SessionLedger) -> Result<(), Error> {
+    let mut turn_ids = HashSet::new();
+    let mut active_index = 0_u64;
+    let mut pending = false;
+    for entry in &ledger.entries {
+        if entry.turn_id.trim().is_empty()
+            || entry.turn_id.len() > 512
+            || entry.prompt_digest.trim().is_empty()
+            || entry.prompt_digest.len() > 160
+            || !turn_ids.insert(entry.turn_id.as_str())
+        {
+            return Err(Error::Operation(
+                "native Turn ledger contains an invalid or duplicate identity".into(),
+            ));
+        }
+        if matches!(entry.state, LedgerTurnState::Discarded) {
+            continue;
+        }
+        if entry.runtime_prompt_index != active_index || pending {
+            return Err(Error::Operation(
+                "native Turn ledger active prompt indices are inconsistent".into(),
+            ));
+        }
+        active_index = active_index
+            .checked_add(1)
+            .ok_or_else(|| Error::Operation("native Turn ledger index overflow".into()))?;
+        match &entry.state {
+            LedgerTurnState::Completed {
+                outcome,
+                settlement_id,
+            } => {
+                let expected = ledger_settlement_id(
+                    id.as_str(),
+                    &entry.turn_id,
+                    &entry.prompt_digest,
+                    entry.runtime_prompt_index,
+                    *outcome,
+                );
+                if settlement_id != &expected {
+                    return Err(Error::Operation(
+                        "native Turn ledger settlement identity is invalid".into(),
+                    ));
+                }
+            }
+            LedgerTurnState::Pending => pending = true,
+            LedgerTurnState::Discarded => unreachable!("discarded entry handled above"),
+        }
+    }
+    Ok(())
 }
 
 fn ledger_settlement_id(
@@ -2329,11 +2609,14 @@ impl Core {
                 "native Turn ledger is unavailable for session reconciliation: {error}"
             ))
         })?;
-        serde_json::from_slice(&bytes).map_err(op)
+        let ledger: SessionLedger = serde_json::from_slice(&bytes).map_err(op)?;
+        validate_session_ledger(id, &ledger)?;
+        Ok(ledger)
     }
 
     fn save_ledger(&self, id: &SessionId, ledger: &SessionLedger) -> Result<(), Error> {
         use std::io::Write as _;
+        validate_session_ledger(id, ledger)?;
         std::fs::create_dir_all(&self.ledger_root).map_err(op)?;
         let path = self.ledger_path(id);
         let temporary = path.with_extension("json.tmp");
@@ -3171,6 +3454,10 @@ fn op(e: impl std::fmt::Display) -> Error {
     Error::Operation(e.to_string())
 }
 
+fn run_error(error: xai_agent_lifecycle::run::RunError) -> Error {
+    Error::DurableRun(error)
+}
+
 fn protocol(method: &str, error: acp::Error) -> Error {
     Error::Protocol {
         method: method.into(),
@@ -3279,6 +3566,7 @@ fn capabilities_for(options: &RuntimeOptions) -> RuntimeCapabilities {
     const SDK_FEATURES: &[(&str, &str, bool)] = &[
         ("sdk:session-lifecycle", "state", false),
         ("sdk:agent-turns", "agent", false),
+        ("sdk:autonomous-runs", "state-agent", false),
         ("sdk:event-journal", "read", false),
         ("sdk:commands", "agent", true),
         ("sdk:scheduler", "background", true),
