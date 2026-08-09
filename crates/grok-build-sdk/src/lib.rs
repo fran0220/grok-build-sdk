@@ -10,6 +10,7 @@ mod evidence;
 mod harness;
 mod prime;
 mod private;
+mod session_state;
 
 pub use autonomous::{AutonomousActivation, AutonomousActivationResult, AutonomousTurnLoop};
 pub use evidence::{
@@ -26,6 +27,16 @@ pub use harness::{
     TurnBindingStatus,
 };
 pub use prime::*;
+pub use session_state::{
+    ConformanceOpen, LocalSessionStateStore, MAX_CHECKPOINT_NAME_BYTES, MAX_CHECKPOINTS,
+    MAX_SESSION_STATE_BYTES, MAX_SESSION_STATE_KEY_BYTES, MAX_SESSION_STATE_REVISION,
+    PreparedSessionStateCommit, PreparedSessionStateDelete, SESSION_STATE_SCHEMA_MARKER,
+    SESSION_STATE_SCHEMA_VERSION, SessionStateCommit, SessionStateConformanceError,
+    SessionStateDelete, SessionStateDocument, SessionStateFault, SessionStateFaultHarness,
+    SessionStateFaultMetrics, SessionStateKey, SessionStateSnapshot, SessionStateStore,
+    SessionStateStoreError, SessionStateVersion, run_session_state_conformance,
+    run_session_state_fault_conformance,
+};
 
 use std::{collections::BTreeMap, path::PathBuf, sync::Arc};
 use tokio::sync::mpsc;

@@ -19,6 +19,15 @@
       "cas_revision": "absent -> 1; present -> checked current+1",
       "successor_helper": "SessionEvidenceVersion::successor",
       "policy": "compare revision+digest atomically; returned Committed version must equal SDK-computed successor"
+    },
+    "session_state": {
+      "marker": "grok-build-sdk.session-state",
+      "version": 1,
+      "max_document_bytes": 67108864,
+      "contents": ["canonical_transcript", "rewind_points", "compaction_checkpoints"],
+      "commit_preparation": "PreparedSessionStateCommit::new",
+      "delete_preparation": "PreparedSessionStateDelete::new",
+      "policy": "current-only bounded decode; compare revision+digest atomically; corruption and acknowledgement uncertainty fail closed"
     }
   },
   "migration_policy": "current-only fail-closed; breaking durable schemas require explicit offline migration or deliberate discard before Runtime startup",
@@ -38,6 +47,8 @@
     "RunStore": "load(&RunId)->Result<Option<RunEnvelope>,RunError>; list()->Result<Vec<RunEnvelope>,RunError>; commit(StoreCommit)->Result<StoreCommitResult,RunError>",
     "RunCommitPreparation": "StoreCommit::validate_and_encode(&self)->Result<PreparedStoreCommit,RunError>",
     "SessionEvidenceStore": "load(&SessionEvidenceKey)->Result<Option<SessionEvidenceDocument>,SessionEvidenceStoreError>; compare_and_swap(&SessionEvidenceKey,Option<&SessionEvidenceVersion>,&[u8])->Result<SessionEvidenceCommit,SessionEvidenceStoreError>",
+    "SessionStateStore": "load(&SessionStateKey)->Result<Option<SessionStateDocument>,SessionStateStoreError>; compare_and_swap(PreparedSessionStateCommit)->Result<SessionStateCommit,SessionStateStoreError>; compare_and_delete(PreparedSessionStateDelete)->Result<SessionStateDelete,SessionStateStoreError>",
+    "SessionStateConformance": "run_session_state_conformance; run_session_state_fault_conformance",
     "StoreInjection": "RuntimeBuilder::run_store(Arc<dyn RunStore>); RuntimeBuilder::session_evidence_store(Arc<dyn SessionEvidenceStore>); Runtime::start_with_stores(RuntimeConfig,Arc<dyn RunStore>,Arc<dyn SessionEvidenceStore>)",
     "Residency": "inspect_run_residency; request_run_wake; claim_run_activation; renew_run_activation; release_run_activation; AutonomousTurnLoop::activate_claimed",
     "ChildMailbox": "admit_run_child; settle_run_child; accept_run_message; transition_run_message; get_run/attach_run for list/join projection",
