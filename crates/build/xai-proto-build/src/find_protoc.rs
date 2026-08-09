@@ -24,11 +24,16 @@ fn is_github_actions() -> bool {
     env::var_os("GITHUB_ACTIONS").is_some()
 }
 
+fn bundled_protoc_name(is_windows: bool) -> &'static str {
+    if is_windows { "protoc.exe" } else { "protoc" }
+}
+
 /// Find `protoc` command.
 ///
 /// Search order:
 /// 1. `$PROTOC` environment variable (set by Bazel `build_script_env` or user override)
-/// 2. `bin/protoc` walking up parent directories (dotslash wrapper for local dev)
+/// 2. `bin/protoc` walking up parent directories (dotslash wrapper for local dev), or
+///    `bin/protoc.exe` on Windows (the dotslash script is not a Windows executable)
 /// 3. `protoc` on `$PATH` (system install or other tooling)
 ///
 /// When `bin/protoc` exists but fails to execute (e.g. the dotslash wrapper running
@@ -48,13 +53,16 @@ pub fn find_protoc() -> anyhow::Result<Option<PathBuf>> {
         }
     }
 
-    // 2. Walk up directories looking for bin/protoc (dotslash wrapper).
+    // 2. Walk up directories looking for the platform's bundled executable.
+    //    The repository's extensionless bin/protoc is a dotslash script and
+    //    must never be executed on Windows (CreateProcess returns error 193).
     let cwd = env::current_dir()?;
     let mut dir = cwd.clone();
     let mut dir_rel = PathBuf::new();
+    let bundled_name = bundled_protoc_name(cfg!(windows));
     loop {
         // Return relative path to make build more deterministic.
-        let protoc = dir_rel.join("bin/protoc");
+        let protoc = dir_rel.join("bin").join(bundled_name);
         if protoc.try_exists()? {
             match check_protoc_good(&protoc) {
                 Ok(()) => return Ok(Some(protoc)),
@@ -90,4 +98,15 @@ pub fn find_protoc() -> anyhow::Result<Option<PathBuf>> {
     }
     eprintln!("`protoc` not found; likely it is missing in docker image");
     Ok(None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::bundled_protoc_name;
+
+    #[test]
+    fn bundled_lookup_uses_a_native_windows_executable() {
+        assert_eq!(bundled_protoc_name(true), "protoc.exe");
+        assert_eq!(bundled_protoc_name(false), "protoc");
+    }
 }
