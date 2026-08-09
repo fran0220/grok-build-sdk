@@ -1,6 +1,9 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+#[path = "build/provenance.rs"]
+mod provenance;
+
 fn git(root: &Path, arguments: &[&str]) -> Option<String> {
     let output = Command::new("git")
         .arg("-C")
@@ -54,7 +57,7 @@ fn main() {
         );
     }
     let git_dirty = git(root, &["status", "--porcelain", "--untracked-files=all"])
-        .map(|status| !status.is_empty());
+        .map(|status| provenance::git_status_is_dirty(&status));
     let dirty = env_bool("GROK_BUILD_SDK_DIRTY")
         .or_else(|| env_bool("ORIGIN_GROK_BUILD_DIRTY"))
         .or(git_dirty)
