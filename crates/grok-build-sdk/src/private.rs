@@ -20,7 +20,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
     },
 };
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 use xai_acp_lib::{AcpAgentGatewaySender, AcpGatewayReceiver};
 use xai_grok_shell::{
     agent::{
@@ -137,13 +137,119 @@ pub struct Runtime {
 }
 struct RuntimeShared {
     commands: mpsc::UnboundedSender<Command>,
-    join: tokio::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
+    lifecycle: mpsc::UnboundedSender<LifecycleRequest>,
+    completion: watch::Receiver<Option<LifecycleOutcome>>,
     runs: tokio::sync::Mutex<
         xai_agent_lifecycle::run::RunController<Arc<dyn xai_agent_lifecycle::run::RunStore>>,
     >,
     shutdown: AtomicBool,
     capabilities: RuntimeCapabilities,
 }
+
+enum LifecycleRequest {
+    Shutdown,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum LifecycleOutcome {
+    Success,
+    Shutdown,
+    Operation(String),
+}
+
+impl LifecycleOutcome {
+    fn from_result(result: Result<(), Error>) -> Self {
+        match result {
+            Ok(()) => Self::Success,
+            Err(Error::Shutdown) => Self::Shutdown,
+            Err(Error::Operation(message)) => Self::Operation(message),
+            Err(error) => Self::Operation(error.to_string()),
+        }
+    }
+
+    fn into_result(self) -> Result<(), Error> {
+        match self {
+            Self::Success => Ok(()),
+            Self::Shutdown => Err(Error::Shutdown),
+            Self::Operation(message) => Err(Error::Operation(message)),
+        }
+    }
+}
+
+async fn join_worker(join: std::thread::JoinHandle<()>) -> Result<(), Error> {
+    tokio::task::spawn_blocking(move || join.join())
+        .await
+        .map_err(op)?
+        .map_err(|_| Error::Operation("runtime worker panicked".into()))
+}
+
+async fn stop_worker(
+    commands: &mpsc::UnboundedSender<Command>,
+    join: std::thread::JoinHandle<()>,
+    request_shutdown: bool,
+) -> LifecycleOutcome {
+    let shutdown_result = if request_shutdown {
+        let (tx, rx) = oneshot::channel();
+        if commands.send(Command::Shutdown(tx)).is_err() {
+            Err(Error::Shutdown)
+        } else {
+            rx.await
+                .map_err(|_| Error::Shutdown)
+                .and_then(|result| result)
+        }
+    } else {
+        Ok(())
+    };
+    LifecycleOutcome::from_result(shutdown_result.and(join_worker(join).await))
+}
+
+async fn own_worker_lifecycle(
+    commands: mpsc::UnboundedSender<Command>,
+    join: std::thread::JoinHandle<()>,
+    ready: oneshot::Receiver<Result<RuntimeCapabilities, Error>>,
+    startup: oneshot::Sender<Result<RuntimeCapabilities, Error>>,
+    mut requests: mpsc::UnboundedReceiver<LifecycleRequest>,
+    completion: watch::Sender<Option<LifecycleOutcome>>,
+) {
+    let ready = tokio::select! {
+        ready = ready => Some(ready.map_err(|_| Error::Shutdown).and_then(|result| result)),
+        _ = requests.recv() => None,
+    };
+    let outcome = match ready {
+        Some(Ok(capabilities)) => {
+            if startup.send(Ok(capabilities)).is_err() {
+                stop_worker(&commands, join, true).await
+            } else {
+                // The request channel closes when startup is canceled after
+                // readiness or when the last Runtime owner is dropped.
+                let _ = requests.recv().await;
+                stop_worker(&commands, join, true).await
+            }
+        }
+        Some(Err(error)) => {
+            let _ = startup.send(Err(error));
+            stop_worker(&commands, join, false).await
+        }
+        None => {
+            // Startup was canceled while the worker still owned initialization.
+            // Queue shutdown now; Core consumes it immediately if startup wins.
+            stop_worker(&commands, join, true).await
+        }
+    };
+    completion.send_replace(Some(outcome));
+}
+
+async fn wait_for_completion(
+    completion: &mut watch::Receiver<Option<LifecycleOutcome>>,
+) -> Result<(), Error> {
+    loop {
+        if let Some(outcome) = completion.borrow().clone() {
+            return outcome.into_result();
+        }
+        completion.changed().await.map_err(|_| Error::Shutdown)?;
+    }
+}
+
 impl Runtime {
     pub async fn start(
         input: RuntimeConfig,
@@ -232,12 +338,24 @@ impl Runtime {
                 }
             })
             .map_err(op)?;
-        let capabilities = ready_rx.await.map_err(|_| Error::Shutdown)??;
+        let (startup_tx, startup_rx) = oneshot::channel();
+        let (lifecycle, lifecycle_rx) = mpsc::unbounded_channel();
+        let (completion_tx, completion) = watch::channel(None);
+        tokio::spawn(own_worker_lifecycle(
+            commands.clone(),
+            join,
+            ready_rx,
+            startup_tx,
+            lifecycle_rx,
+            completion_tx,
+        ));
+        let capabilities = startup_rx.await.map_err(|_| Error::Shutdown)??;
         Ok((
             Self {
                 shared: Arc::new(RuntimeShared {
                     commands,
-                    join: tokio::sync::Mutex::new(Some(join)),
+                    lifecycle,
+                    completion,
                     runs: tokio::sync::Mutex::new(runs),
                     shutdown: AtomicBool::new(false),
                     capabilities,
@@ -838,25 +956,10 @@ impl Runtime {
             .await
     }
     pub async fn shutdown(&self) -> Result<(), Error> {
-        let shutdown_result = if !self.shared.shutdown.swap(true, Ordering::AcqRel) {
-            let (tx, rx) = oneshot::channel();
-            self.shared
-                .commands
-                .send(Command::Shutdown(tx))
-                .map_err(|_| Error::Shutdown)?;
-            rx.await.map_err(|_| Error::Shutdown)?
-        } else {
-            Ok(())
-        };
-        let join_result = if let Some(join) = self.shared.join.lock().await.take() {
-            tokio::task::spawn_blocking(move || join.join())
-                .await
-                .map_err(op)?
-                .map_err(|_| Error::Operation("runtime worker panicked".into()))
-        } else {
-            Ok(())
-        };
-        shutdown_result.and(join_result)
+        if !self.shared.shutdown.swap(true, Ordering::AcqRel) {
+            let _ = self.shared.lifecycle.send(LifecycleRequest::Shutdown);
+        }
+        wait_for_completion(&mut self.shared.completion.clone()).await
     }
 }
 
@@ -4583,6 +4686,172 @@ fn capabilities_for(options: &RuntimeOptions) -> RuntimeCapabilities {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_capabilities() -> RuntimeCapabilities {
+        RuntimeCapabilities {
+            profile: crate::RuntimeProfile::Restricted,
+            host: crate::HostCapabilities::default(),
+            features: Vec::new(),
+        }
+    }
+
+    fn lifecycle_test_worker(
+        mut commands: mpsc::UnboundedReceiver<Command>,
+        shutdown_observed: std::sync::mpsc::Sender<()>,
+        release_join: std::sync::mpsc::Receiver<()>,
+        joined: Arc<AtomicBool>,
+    ) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            match commands.blocking_recv().expect("lifecycle command") {
+                Command::Shutdown(reply) => {
+                    let _ = reply.send(Ok(()));
+                    shutdown_observed.send(()).expect("shutdown observed");
+                }
+                _ => panic!("expected shutdown command"),
+            }
+            release_join.recv().expect("release worker join");
+            joined.store(true, Ordering::Release);
+        })
+    }
+
+    #[tokio::test]
+    async fn canceled_startup_after_worker_spawn_requests_shutdown_and_joins() {
+        let (commands, command_rx) = mpsc::unbounded_channel();
+        let (_ready_tx, ready_rx) = oneshot::channel();
+        let (startup_tx, startup_rx) = oneshot::channel();
+        let (lifecycle, lifecycle_rx) = mpsc::unbounded_channel();
+        let (completion_tx, mut completion) = watch::channel(None);
+        let (shutdown_tx, shutdown_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let joined = Arc::new(AtomicBool::new(false));
+        let worker = lifecycle_test_worker(command_rx, shutdown_tx, release_rx, joined.clone());
+        tokio::spawn(own_worker_lifecycle(
+            commands,
+            worker,
+            ready_rx,
+            startup_tx,
+            lifecycle_rx,
+            completion_tx,
+        ));
+
+        drop(lifecycle);
+        tokio::task::spawn_blocking(move || {
+            shutdown_rx.recv().expect("startup cancellation shuts down");
+            release_tx.send(()).expect("release join");
+        })
+        .await
+        .expect("observer joins");
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            wait_for_completion(&mut completion),
+        )
+        .await
+        .expect("worker reaches terminal completion")
+        .expect("worker joins cleanly");
+        assert!(startup_rx.await.is_err());
+        assert!(joined.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn startup_readiness_racing_waiter_cancellation_retains_worker_ownership() {
+        let (commands, command_rx) = mpsc::unbounded_channel();
+        let (ready_tx, ready_rx) = oneshot::channel();
+        let (startup_tx, startup_rx) = oneshot::channel();
+        let (lifecycle, lifecycle_rx) = mpsc::unbounded_channel();
+        let (completion_tx, mut completion) = watch::channel(None);
+        let (shutdown_tx, shutdown_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let joined = Arc::new(AtomicBool::new(false));
+        let worker = lifecycle_test_worker(command_rx, shutdown_tx, release_rx, joined.clone());
+        tokio::spawn(own_worker_lifecycle(
+            commands,
+            worker,
+            ready_rx,
+            startup_tx,
+            lifecycle_rx,
+            completion_tx,
+        ));
+
+        ready_tx
+            .send(Ok(test_capabilities()))
+            .expect("worker becomes ready");
+        startup_rx
+            .await
+            .expect("startup result")
+            .expect("startup ready");
+        drop(lifecycle);
+        tokio::task::spawn_blocking(move || {
+            shutdown_rx
+                .recv()
+                .expect("dropped startup owner shuts down");
+            release_tx.send(()).expect("release join");
+        })
+        .await
+        .expect("observer joins");
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            wait_for_completion(&mut completion),
+        )
+        .await
+        .expect("worker reaches terminal completion")
+        .expect("worker joins cleanly");
+        assert!(joined.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn canceled_shutdown_waiter_does_not_cancel_pending_worker_join() {
+        let (commands, command_rx) = mpsc::unbounded_channel();
+        let (ready_tx, ready_rx) = oneshot::channel();
+        let (startup_tx, startup_rx) = oneshot::channel();
+        let (lifecycle, lifecycle_rx) = mpsc::unbounded_channel();
+        let (completion_tx, mut completion) = watch::channel(None);
+        let (shutdown_tx, shutdown_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let joined = Arc::new(AtomicBool::new(false));
+        let worker = lifecycle_test_worker(command_rx, shutdown_tx, release_rx, joined.clone());
+        tokio::spawn(own_worker_lifecycle(
+            commands,
+            worker,
+            ready_rx,
+            startup_tx,
+            lifecycle_rx,
+            completion_tx,
+        ));
+        ready_tx
+            .send(Ok(test_capabilities()))
+            .expect("worker becomes ready");
+        startup_rx
+            .await
+            .expect("startup result")
+            .expect("startup ready");
+
+        lifecycle
+            .send(LifecycleRequest::Shutdown)
+            .expect("request shutdown");
+        tokio::task::spawn_blocking(move || shutdown_rx.recv().expect("shutdown observed"))
+            .await
+            .expect("observer joins");
+        let canceled_waiter = tokio::spawn({
+            let mut completion = completion.clone();
+            async move { wait_for_completion(&mut completion).await }
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !canceled_waiter.is_finished(),
+            "worker join remains pending"
+        );
+        canceled_waiter.abort();
+        release_tx.send(()).expect("release worker join");
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            wait_for_completion(&mut completion),
+        )
+        .await
+        .expect("owned lifecycle reaches terminal completion")
+        .expect("worker joins cleanly");
+        assert!(joined.load(Ordering::Acquire));
+    }
 
     struct PermissionPolicy {
         decision: Result<crate::ToolPermissionDecision, crate::ToolPermissionError>,
