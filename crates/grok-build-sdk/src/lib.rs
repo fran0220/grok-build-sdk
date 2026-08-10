@@ -6,6 +6,7 @@
 //! private implementation details.
 
 mod activation;
+mod artifact;
 mod autonomous;
 mod evidence;
 mod harness;
@@ -22,6 +23,16 @@ pub use activation::{
     MAX_ACTIVATION_CLAIM_BATCH, MAX_ACTIVATION_ITEM_ID_BYTES, MAX_ACTIVATION_LEASE_MS,
     MAX_ACTIVATION_PAYLOAD_BYTES, MAX_ACTIVATION_WORKER_ID_BYTES,
     run_activation_coordinator_conformance,
+};
+pub use artifact::{
+    ARTIFACT_VAULT_SCHEMA_MARKER, ARTIFACT_VAULT_SCHEMA_VERSION, ArtifactDamage, ArtifactDigest,
+    ArtifactError, ArtifactHandle, ArtifactId, ArtifactIntegrity, ArtifactLabel,
+    ArtifactMaterialization, ArtifactMediaType, ArtifactObservation, ArtifactProvenance,
+    ArtifactProvenanceKind, ArtifactPut, ArtifactReceipt, ArtifactRecord, ArtifactRecovery,
+    ArtifactRetention, ArtifactUsage, ArtifactVault, ArtifactVaultHarness, ArtifactWrite,
+    LocalArtifactVault, MAX_ARTIFACT_BYTES, MAX_ARTIFACT_LABEL_BYTES,
+    MAX_ARTIFACT_MEDIA_TYPE_BYTES, MAX_ARTIFACT_OBSERVATION_INPUTS, materialize_verified_copy,
+    run_artifact_vault_conformance,
 };
 pub use autonomous::{AutonomousActivation, AutonomousActivationResult, AutonomousTurnLoop};
 pub use evidence::{

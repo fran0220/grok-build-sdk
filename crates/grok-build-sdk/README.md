@@ -49,6 +49,7 @@ executable.
 | Optimistic refinement | `HarnessRefinementPatch`, `HarnessRefinement`, `HarnessEvidenceRef`, `HarnessEvidenceKind` | First-batch contract on this branch. Patch application rejects stale content identity and duplicate typed targets, and a patch carries the bounded typed evidence it cites. The Host commits revisions, evidence, activation, history and rollback. |
 | Child Run / A2A | `admit_run_child`, `settle_run_child`, `accept_run_message`, `transition_run_message` | Durable admission, reservations, fenced settlement, de-duplication, and ordered mailbox state use the existing Run reducer. The shell subagent coordinator remains a UI/transport adapter and is not silently treated as Run authority. Hosts execute child placement and feed its typed settlement callback. |
 | Durable activation coordination | `ActivationCoordinator`, `LocalActivationCoordinator`, `ActivationWake`, `ActivationClaimRequest`, `ActivationGrant`, `ActivationHandle`, `ActivationDisposition`, `run_activation_coordinator_conformance` | Complete. The durable queue in front of Run activation: identity-keyed work items with a due time, claims fenced by a strictly monotonic per-item token, renewal, completion or yield, and expiry-based recovery. Two supervisors on one authority grant a due item exactly once, a superseded worker is refused rather than tolerated, and a retried completion is an answer rather than a second execution. |
+| Artifact custody | `ArtifactVault`, `LocalArtifactVault`, `ArtifactId`, `ArtifactHandle`, `ArtifactWrite`, `ArtifactProvenance`, `ArtifactObservation`, `ArtifactRecord`, `ArtifactIntegrity`, `ArtifactRecovery`, `ArtifactUsage`, `run_artifact_vault_conformance` | Complete. Identity is the SHA-256 of the content, so a handle names one byte sequence forever; provenance names the producing Run, iteration and operation, and an instrument observation additionally names the program execution, its inputs and the revision under observation. Damage is reported rather than served and is repaired only by an explicit recovery that cannot change what an identity means. Reads and materializations are durably counted, and two workers on one authority observe each other and converge on one artifact. |
 | Per-Session capability layering | `CapabilityLayer`, `RuntimeBuilder::general_capabilities`, `create_session_with_capabilities`, `create_session_with_harness_and_capabilities`, `load_session_with_capabilities`, `resume_session_with_capabilities`, `set_session_capabilities`, `session_capabilities` | Complete for skills, MCP mounts and agent-service routes. One application-owned general layer is masked per Session by name and kind, so per-project activation and per-Session routing need neither a Runtime restart nor a second Runtime. |
 | Persistent kernel | `TerminalBackend`, background task handles, native terminal/PTY/process tools | M3 audit only. Persistent shell state restores cwd/environment around newly spawned commands; it is not a checkpointable programmatic kernel with durable identity, execution receipt, cancel/restart and state-restore semantics. No internal kernel implementation is suitable to publish. |
 | Continuation / gates | Generation-bound `McpContinuation`; Run-scoped `GateRequest`, `GateEvaluation`, `GateProvider` | M3 audit only. MCP continuation is one non-serializable live MRTR retry and a gate evaluation is an immediate provider result. Neither supplies a durable Host aggregate with identity/revision, ownership transfer, replay cursor or content-bound receipt. |
@@ -232,12 +233,72 @@ proves the same semantics with `run_activation_coordinator_conformance`, which
 fails any backend that grants contended work twice, honours a superseded token,
 or forgets a settlement across a restart.
 
+## Artifact custody
+
+`ArtifactVault` is the durable authority a Host asks *what is this artifact*,
+*what produced it*, *is the stored copy still the copy that was written*, and
+*who has used it*. It sits beside `run::ArtifactStore`, which is the Run
+reducer's blob plumbing and answers only the first half of the first question.
+The vault's marker and version are `grok-build-sdk.artifact-vault`/1.
+
+Identity is derived, never declared. An `ArtifactId` is `sha256-` followed by
+the SHA-256 of the content, and an `ArtifactHandle` is the (id, digest) pair,
+checked at construction so a handle whose two halves disagree does not exist.
+Writing identical bytes twice is one artifact and answers `AlreadyPresent`
+without re-dating, re-labelling or re-attributing the record already there;
+`ArtifactWrite::expect_identity` lets a writer declare the identity it believes
+it is writing, and content that does not address to it is refused before any
+storage effect. That is what makes the immutability claim structural rather
+than a rule each backend has to remember.
+
+`ArtifactProvenance` names the producer by the three coordinates a Run has —
+the Run's identity, the iteration, and the operation — and carries a closed but
+additive `ArtifactProvenanceKind`. Alongside the ordinary produced-output,
+consumed-input and operation-record kinds there is `InstrumentObservation`: a
+captured frame or machine-readable measurement that records a program
+execution, and which therefore carries an `ArtifactObservation` naming the
+executed program, the artifacts it ran against, and the revision under
+observation. That kind is unconstructible without its observation, and the
+other kinds are unconstructible with one. `ArtifactWrite` also declares an
+`ArtifactMediaType` and an `ArtifactRetention` hint with an optional
+`retain_until_ms`; all of it is bounded by the contract, stored verbatim and
+returned by `inspect`. Retention is a hint the vault stores, never a schedule
+it acts on — only a Host policy can know whether anything still references the
+content.
+
+Damage is reported rather than served. `verify` answers `Intact`, `Missing` or
+`Corrupt` without reading; `read` fails as `ArtifactError::Missing` for an
+identity that was never stored and `ArtifactError::Corrupt` for a stored copy
+that no longer addresses to its digest, and the two are never collapsed because
+a Host can re-supply the bytes for one and cannot for the other. Repair is
+`recover`, which is explicit, never happens inside a read, refuses content that
+does not address to the same identity, leaves an already-intact artifact alone,
+and records the instant it ran in `ArtifactRecord::recovered_at_ms`.
+
+`materialize` writes a verified copy to a path: atomic rename, then a
+re-verification of the bytes on disk, so a returned `ArtifactMaterialization`
+means the copy addressed to the digest as it now exists rather than as it was
+in memory. `ArtifactUsage` durably counts reads, materializations and bytes
+served with saturating counters, and a read that served nothing is not counted
+as a use. Two vaults opened on one root observe each other's writes, and
+workers racing identical content converge on one artifact.
+
+`LocalArtifactVault` is the SQLite reference authority; every stored scalar is
+re-validated on read, so a foreign schema marker, an undecodable provenance
+record or a negative counter fails the read instead of presenting invented
+custody. A Host backend proves the same semantics with
+`run_artifact_vault_conformance`, which drives an `ArtifactVaultHarness` so the
+backend can damage its own storage under the contract; the suite fails any
+backend that hides damage, serves a corrupt copy, re-labels content on a
+repeated write, or forgets usage across a restart.
+
 `AutonomousTurnLoop` currently has enforceable exact upper bounds only for iteration count, agent calls, and concurrency. Until a model/runtime capability contract supplies enforceable per-Turn maxima, finite `tokens`, `cost_micros`, `active_ms`, `wall_ms`, or `artifact_bytes` budgets are rejected before an iteration or prompt is dispatched. Use `u64::MAX` to mark those dimensions explicitly unbounded. Actual typed usage is still settled and recorded; an overrun or unknown value against a finite reservation durably enters recovery rather than being treated as free work.
 
 | SDK owns | Embedding Host owns |
 |---|---|
 | Run reducer and lifecycle invariants, bounded loop, budgets, gates, verifier policy, intent/outbox, command de-duplication, epoch/token fencing, receipts, recovery decisions and attach contract | Worker/process placement, OS daemon/service residency, durable timer implementation and invoking bounded activations |
 | Activation coordination semantics: due ordering, claim exclusivity, monotonic fencing tokens, expiry-based recovery, idempotent settlement, bounds and fail-closed decoding | The timer that decides when to sweep, the supervisor loop and its renewal cadence, what a work item means, and the retention policy behind `purge_settled` |
+| Artifact custody semantics: derived identity, digest verification on read, immutable handles, provenance and observation vocabulary, declared size/media-type/retention hints, missing-versus-corrupt answers, explicit identity-preserving recovery, usage accounting and verified materialization | Physical artifact bytes and their placement, encryption, backup and replication; what an artifact means to a person; the retention policy that acts on the stored hints; which artifacts are shown, exported or garbage collected |
 | SessionLedger/rewind/binding schemas; native Session object/chunk schemas, validation, replay and publication semantics; CAS transition intent and fail-closed reconciliation; artifact identity/integrity and provider contracts | Physical Run, session-evidence, and native Session-state persistence; transactions/migrations/encryption/backup/lifecycle; uncovered shell-sidecar placement; credentials, providers, workspace, queues, policy and UI |
 
 `ProviderSet` supplies typed artifact, gate, verifier, approval, and telemetry contracts. Local defaults store content-addressed artifacts and fail gates, verification, and approval closed until the Host installs explicit providers.
