@@ -4,8 +4,8 @@ use crate::{
     LedgerTurnState, ModelCatalog, Prompt, PromptBlock, PromptReceipt, RewindPoint,
     RuntimeCapabilities, RuntimeConfig, RuntimeOptions, SessionConfig, SessionEvidenceCommit,
     SessionEvidenceDocument, SessionEvidenceKey, SessionEvidenceKind, SessionEvidenceStore,
-    SessionEvidenceVersion, SessionId, SessionLedger, SessionLedgerEntry, TurnBindingKey,
-    TurnBindingReceipt, TurnBindingRecord, TurnBindingStatus, TurnOutcome,
+    SessionEvidenceVersion, SessionId, SessionLedger, SessionLedgerEntry, SessionReplayProbe,
+    TurnBindingKey, TurnBindingReceipt, TurnBindingRecord, TurnBindingStatus, TurnOutcome,
 };
 use agent_client_protocol as acp;
 use agent_client_protocol::Agent as _;
@@ -103,6 +103,7 @@ enum Command {
     SetMode(SessionId, String, Reply<()>),
     ListSessions(Reply<serde_json::Value>),
     EventsAfter(SessionId, u64, Reply<Vec<Event>>),
+    ProbeSessionReplay(SessionId, u64, Reply<SessionReplayProbe>),
     Cancel(SessionId, Reply<()>),
     SessionLedger(SessionId, Reply<SessionLedger>),
     TurnBindingStatus(SessionId, TurnBindingKey, Reply<crate::TurnBindingStatus>),
@@ -946,6 +947,14 @@ impl Runtime {
     }
     pub async fn events_after(&self, id: &SessionId, sequence: u64) -> Result<Vec<Event>, Error> {
         self.call(|r| Command::EventsAfter(id.clone(), sequence, r))
+            .await
+    }
+    pub async fn probe_session_replay(
+        &self,
+        id: &SessionId,
+        after_sequence: u64,
+    ) -> Result<SessionReplayProbe, Error> {
+        self.call(|reply| Command::ProbeSessionReplay(id.clone(), after_sequence, reply))
             .await
     }
     pub async fn cancel(&self, id: &SessionId) -> Result<(), Error> {
@@ -2262,24 +2271,64 @@ impl Drop for TurnReservation {
 }
 
 #[derive(Clone)]
-struct SessionBinding {
+struct ResidentSessionBinding {
+    cwd: std::path::PathBuf,
     model: String,
     reasoning: Option<String>,
     harness_digest: Option<HarnessDigest>,
 }
 
-impl SessionBinding {
+impl ResidentSessionBinding {
     fn new(
         config: &SessionConfig,
         effective_reasoning: Option<String>,
         harness_digest: Option<HarnessDigest>,
     ) -> Self {
         Self {
+            cwd: config.cwd.clone(),
             model: config.model.clone(),
             reasoning: effective_reasoning,
             harness_digest,
         }
     }
+}
+
+struct JournalObservation {
+    oldest_retained_sequence: u64,
+    inclusive_end_sequence: u64,
+    retained_count: usize,
+    truncated: bool,
+    events: Vec<Event>,
+}
+
+fn observe_journal_snapshot(
+    retained: Option<&VecDeque<Event>>,
+    inclusive_end_sequence: u64,
+    after_sequence: u64,
+) -> Result<JournalObservation, Error> {
+    if after_sequence > inclusive_end_sequence {
+        return Err(Error::Operation(
+            "event cursor is beyond the session sequence".into(),
+        ));
+    }
+    let oldest_retained_sequence = retained
+        .and_then(|events| events.front())
+        .map(|event| event.sequence)
+        .unwrap_or(inclusive_end_sequence.saturating_add(1));
+    let truncated = after_sequence.saturating_add(1) < oldest_retained_sequence;
+    let events = retained
+        .into_iter()
+        .flatten()
+        .filter(|event| truncated || event.sequence > after_sequence)
+        .cloned()
+        .collect();
+    Ok(JournalObservation {
+        oldest_retained_sequence,
+        inclusive_end_sequence,
+        retained_count: retained.map_or(0, VecDeque::len),
+        truncated,
+        events,
+    })
 }
 
 struct PreparedHarnessTurn {
@@ -2302,7 +2351,7 @@ struct Core {
     capacity: usize,
     options: RuntimeOptions,
     resident: RefCell<HashSet<String>>,
-    session_bindings: RefCell<HashMap<String, SessionBinding>>,
+    session_bindings: RefCell<HashMap<String, ResidentSessionBinding>>,
     mcp_bindings: Arc<McpBindingRegistry>,
     turns: Rc<RefCell<HashMap<String, String>>>,
     turn_usages: TurnUsageMap,
@@ -3539,6 +3588,9 @@ impl Core {
                 Command::EventsAfter(i, sequence, r) => {
                     let _ = r.send(self.events_after(&i, sequence));
                 }
+                Command::ProbeSessionReplay(i, after_sequence, reply) => {
+                    let _ = reply.send(self.probe_session_replay(&i, after_sequence));
+                }
                 Command::SessionLedger(i, r) => {
                     let _ = r.send(self.session_ledger(&i));
                 }
@@ -3918,7 +3970,8 @@ impl Core {
             .map(|id| SessionLeaseAdmission::new(&self.session_leases, id, lease));
         let effective_reasoning =
             self.effective_reasoning(&config.model, config.reasoning.as_deref())?;
-        let binding = SessionBinding::new(&config, effective_reasoning.clone(), harness_digest);
+        let binding =
+            ResidentSessionBinding::new(&config, effective_reasoning.clone(), harness_digest);
         let mut meta = self.session_meta(&config, effective_reasoning.as_deref())?;
         if let Some((id, generation)) = &requested {
             meta.insert("sessionId".into(), serde_json::Value::String(id.0.clone()));
@@ -4047,7 +4100,8 @@ impl Core {
         self.load_ledger(&id)?;
         let effective_reasoning =
             self.effective_reasoning(&config.model, config.reasoning.as_deref())?;
-        let binding = SessionBinding::new(&config, effective_reasoning.clone(), harness_digest);
+        let binding =
+            ResidentSessionBinding::new(&config, effective_reasoning.clone(), harness_digest);
         let active_guard = ActiveMcpBindingGuard::new(self.mcp_bindings.clone(), id.0.clone());
         let meta = self.session_meta(&config, effective_reasoning.as_deref())?;
         struct ReplayGuard<'a>(&'a RefCell<HashMap<String, ReplayMode>>, String);
@@ -5205,41 +5259,61 @@ impl Core {
             Err(Error::Operation("session is not resident".into()))
         }
     }
-    fn events_after(&self, id: &SessionId, sequence: u64) -> Result<Vec<Event>, Error> {
-        let current = self
+    fn observe_journal(
+        &self,
+        id: &SessionId,
+        after_sequence: u64,
+    ) -> Result<JournalObservation, Error> {
+        let inclusive_end_sequence = self
             .sequences
             .borrow()
             .get(&id.0)
             .copied()
             .ok_or_else(|| Error::Operation("unknown session event journal".into()))?;
-        if sequence > current {
-            return Err(Error::Operation(
-                "event cursor is beyond the session sequence".into(),
-            ));
-        }
-        let oldest = self
-            .retained
+        let retained = self.retained.borrow();
+        observe_journal_snapshot(retained.get(&id.0), inclusive_end_sequence, after_sequence)
+    }
+    fn probe_session_replay(
+        &self,
+        id: &SessionId,
+        after_sequence: u64,
+    ) -> Result<SessionReplayProbe, Error> {
+        self.require_resident(id)?;
+        let binding = self
+            .session_bindings
             .borrow()
             .get(&id.0)
-            .and_then(|x| x.front())
-            .map(|x| x.sequence)
-            .unwrap_or(current.saturating_add(1));
-        if sequence.saturating_add(1) < oldest {
+            .cloned()
+            .ok_or_else(|| Error::Operation("session binding is unavailable".into()))?;
+        let journal = self.observe_journal(id, after_sequence)?;
+        let ledger = self.load_ledger(id)?;
+        Ok(SessionReplayProbe {
+            binding: crate::SessionBinding {
+                session_id: id.clone(),
+                cwd: binding.cwd,
+                model: binding.model,
+                reasoning: binding.reasoning,
+                harness_digest: binding.harness_digest,
+            },
+            requested_after_sequence: after_sequence,
+            oldest_retained_sequence: journal.oldest_retained_sequence,
+            inclusive_end_sequence: journal.inclusive_end_sequence,
+            retained_count: journal.retained_count,
+            truncated: journal.truncated,
+            events: journal.events,
+            ledger,
+        })
+    }
+    fn events_after(&self, id: &SessionId, sequence: u64) -> Result<Vec<Event>, Error> {
+        let observation = self.observe_journal(id, sequence)?;
+        if observation.truncated {
             return Err(Error::EventGap {
                 requested: sequence,
-                oldest_available: oldest,
-                newest: current,
+                oldest_available: observation.oldest_retained_sequence,
+                newest: observation.inclusive_end_sequence,
             });
         }
-        Ok(self
-            .retained
-            .borrow()
-            .get(&id.0)
-            .into_iter()
-            .flatten()
-            .filter(|event| event.sequence > sequence)
-            .cloned()
-            .collect())
+        Ok(observation.events)
     }
     async fn close(&self, id: SessionId) -> Result<(), Error> {
         self.require_resident(&id)?;
@@ -5821,6 +5895,24 @@ fn capabilities_for(options: &RuntimeOptions) -> RuntimeCapabilities {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_replay_probe_observes_an_empty_retained_journal_exactly() {
+        let gap = observe_journal_snapshot(None, 5, 0).expect("empty suffix is observable");
+        assert_eq!(gap.oldest_retained_sequence, 6);
+        assert_eq!(gap.inclusive_end_sequence, 5);
+        assert_eq!(gap.retained_count, 0);
+        assert!(gap.truncated);
+        assert!(gap.events.is_empty());
+
+        let empty = observe_journal_snapshot(None, 5, 5).expect("end cursor is valid");
+        assert_eq!(empty.oldest_retained_sequence, 6);
+        assert_eq!(empty.inclusive_end_sequence, 5);
+        assert_eq!(empty.retained_count, 0);
+        assert!(!empty.truncated);
+        assert!(empty.events.is_empty());
+        assert!(observe_journal_snapshot(None, 5, 6).is_err());
+    }
 
     struct LeaseDropSpy(Arc<std::sync::atomic::AtomicBool>);
     impl crate::SessionStateLease for LeaseDropSpy {}

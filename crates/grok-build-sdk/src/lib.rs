@@ -1998,6 +1998,32 @@ pub struct SessionLedger {
     pub entries: Vec<SessionLedgerEntry>,
 }
 
+/// SDK-owned identity and effective route for an attached Session.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SessionBinding {
+    pub session_id: SessionId,
+    pub cwd: PathBuf,
+    pub model: String,
+    pub reasoning: Option<String>,
+    pub harness_digest: Option<HarnessDigest>,
+}
+
+/// One command-loop snapshot of an attached Session's replay facts and ledger.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct SessionReplayProbe {
+    pub binding: SessionBinding,
+    pub requested_after_sequence: u64,
+    pub oldest_retained_sequence: u64,
+    pub inclusive_end_sequence: u64,
+    pub retained_count: usize,
+    /// True when events immediately after the requested sequence were evicted.
+    pub truncated: bool,
+    /// Retained events after the requested sequence, or the retained suffix
+    /// when `truncated` is true. Every event is at or before the captured end.
+    pub events: Vec<Event>,
+    pub ledger: SessionLedger,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ConversationRewindReceipt {
     pub operation_id: String,
@@ -3363,6 +3389,16 @@ impl Runtime {
         after_sequence: u64,
     ) -> Result<Vec<Event>, Error> {
         self.inner.events_after(id, after_sequence).await
+    }
+    /// Atomically snapshots the resident binding, retained replay range and
+    /// validated Session ledger. A truncated journal is returned successfully
+    /// with its retained suffix; unknown or unloaded Sessions fail closed.
+    pub async fn probe_session_replay(
+        &self,
+        id: &SessionId,
+        after_sequence: u64,
+    ) -> Result<SessionReplayProbe, Error> {
+        self.inner.probe_session_replay(id, after_sequence).await
     }
     pub async fn cancel(&self, id: &SessionId) -> Result<(), Error> {
         self.inner.cancel(id).await
@@ -7422,7 +7458,186 @@ done
             tail.last().map(|event| event.sequence),
             Some(receipt.final_sequence)
         );
+        let truncated = runtime
+            .probe_session_replay(&session, 0)
+            .await
+            .expect("probe returns a truncated retained suffix");
+        assert!(truncated.truncated);
+        assert_eq!(
+            truncated.oldest_retained_sequence,
+            receipt.final_sequence - 1
+        );
+        assert_eq!(truncated.inclusive_end_sequence, receipt.final_sequence);
+        assert_eq!(truncated.retained_count, 2);
+        assert_eq!(truncated.events, tail);
+        assert_eq!(truncated.ledger.entries.len(), 1);
+
+        let boundary = runtime
+            .probe_session_replay(&session, truncated.oldest_retained_sequence - 1)
+            .await
+            .expect("oldest minus one is not a gap");
+        assert!(!boundary.truncated);
+        assert_eq!(boundary.events, truncated.events);
         runtime.shutdown().await.expect("runtime shuts down");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn session_replay_probe_snapshots_binding_route_journal_ledger_and_residency() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let server = MockInferenceServer::start().await.expect("mock server");
+        let root = TempDir::new().expect("temp root");
+        let workspace = root.path().join("workspace");
+        std::fs::create_dir(&workspace).expect("workspace");
+        let mut config = runtime_config(&root, server.url());
+        config.models = vec![
+            ModelSpec {
+                id: "default-route".into(),
+                context_window: 131_072,
+                api_backend: ApiBackend::ChatCompletions,
+                supports_reasoning: true,
+                default_reasoning: Some("high".into()),
+                reasoning_options: vec!["high".into()],
+            },
+            ModelSpec {
+                id: "updated-route".into(),
+                context_window: 131_072,
+                api_backend: ApiBackend::ChatCompletions,
+                supports_reasoning: true,
+                default_reasoning: Some("xhigh".into()),
+                reasoning_options: vec!["xhigh".into()],
+            },
+        ];
+        let created_config = SessionConfig {
+            cwd: workspace.clone(),
+            model: "default-route".into(),
+            reasoning: None,
+            system_prompt: None,
+            rules: None,
+        };
+        let (runtime, _) = Runtime::start(config.clone())
+            .await
+            .expect("runtime starts");
+        let session = runtime
+            .create_session(created_config)
+            .await
+            .expect("session starts");
+        let initial = runtime
+            .probe_session_replay(&session, 0)
+            .await
+            .expect("created binding is readable");
+        assert_eq!(initial.binding.session_id, session);
+        assert_eq!(initial.binding.cwd, workspace);
+        assert_eq!(initial.binding.model, "default-route");
+        assert_eq!(initial.binding.reasoning.as_deref(), Some("high"));
+        assert_eq!(initial.requested_after_sequence, 0);
+        assert_eq!(initial.oldest_retained_sequence, 1);
+        assert_eq!(
+            initial.events.last().map(|event| event.sequence),
+            Some(initial.inclusive_end_sequence)
+        );
+        assert_eq!(initial.retained_count, initial.events.len());
+        assert!(!initial.truncated);
+        assert!(initial.ledger.entries.is_empty());
+
+        let receipt = runtime
+            .prompt(&session, "probe-turn", "probe marker")
+            .await
+            .expect("turn succeeds");
+        let snapshot = runtime
+            .probe_session_replay(&session, initial.inclusive_end_sequence)
+            .await
+            .expect("post-turn snapshot");
+        assert_eq!(snapshot.inclusive_end_sequence, receipt.final_sequence);
+        assert_eq!(
+            snapshot.events.last().map(|event| event.sequence),
+            Some(snapshot.inclusive_end_sequence)
+        );
+        assert!(snapshot.events.windows(2).all(|pair| {
+            pair[0].sequence + 1 == pair[1].sequence
+                && pair[0].sequence > snapshot.requested_after_sequence
+        }));
+        assert!(
+            snapshot
+                .events
+                .last()
+                .is_some_and(|event| matches!(&event.update, EventUpdate::TurnFinished(_)))
+        );
+        assert!(matches!(
+            &snapshot.ledger.entries[0].state,
+            LedgerTurnState::Completed { settlement_id, .. }
+                if settlement_id == &receipt.settlement_id
+        ));
+
+        runtime
+            .set_route(&session, "updated-route", None)
+            .await
+            .expect("route updates");
+        let updated = runtime
+            .probe_session_replay(&session, receipt.final_sequence)
+            .await
+            .expect("updated binding is readable");
+        assert_eq!(updated.binding.model, "updated-route");
+        assert_eq!(updated.binding.reasoning.as_deref(), Some("xhigh"));
+        assert!(updated.events.iter().all(|event| {
+            event.sequence > receipt.final_sequence
+                && event.sequence <= updated.inclusive_end_sequence
+        }));
+        assert!(
+            runtime
+                .probe_session_replay(&session, updated.inclusive_end_sequence + 1)
+                .await
+                .is_err(),
+            "future cursors fail"
+        );
+        assert!(
+            runtime
+                .probe_session_replay(&SessionId::from_stored("missing"), 0)
+                .await
+                .is_err(),
+            "unknown Sessions fail closed"
+        );
+
+        runtime
+            .unload_session(session.clone())
+            .await
+            .expect("session unloads");
+        assert!(
+            runtime.probe_session_replay(&session, 0).await.is_err(),
+            "unloaded Sessions fail closed"
+        );
+        assert!(
+            runtime
+                .events_after(&session, receipt.final_sequence)
+                .await
+                .is_ok(),
+            "legacy journal access remains available after unload"
+        );
+        runtime.shutdown().await.expect("runtime shuts down");
+
+        let (restarted, _) = Runtime::start(config).await.expect("runtime restarts");
+        restarted
+            .load_session(
+                session.clone(),
+                SessionConfig {
+                    cwd: workspace.clone(),
+                    model: "updated-route".into(),
+                    reasoning: None,
+                    system_prompt: None,
+                    rules: None,
+                },
+            )
+            .await
+            .expect("session loads");
+        let loaded = restarted
+            .probe_session_replay(&session, 0)
+            .await
+            .expect("loaded binding is readable");
+        assert_eq!(loaded.binding.session_id, session);
+        assert_eq!(loaded.binding.cwd, workspace);
+        assert_eq!(loaded.binding.model, "updated-route");
+        assert_eq!(loaded.binding.reasoning.as_deref(), Some("xhigh"));
+        assert_eq!(loaded.ledger.entries.len(), 1);
+        restarted.shutdown().await.expect("runtime shuts down");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
