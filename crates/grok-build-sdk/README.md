@@ -242,20 +242,23 @@ Capability descriptors describe public typed SDK features, not every internal sh
 
 Use the gates in increasing cost order:
 
-1. Run the deterministic, std-only source-layout gate first:
-   `cargo test -p grok-build-sdk --test source_layout`.
-2. Check formatting and every SDK target:
+1. Run the fastest no-compilation source-layout preflight from the repository
+   root: `crates/grok-build-sdk/scripts/check-source-layout.sh`.
+2. Run the Cargo-integrated version of the same policy with
+   `cargo test -p grok-build-sdk --test source_layout`. It remains part of the
+   automatic Cargo test suite and is fast when the build cache is warm.
+3. Check formatting and every SDK target:
    `cargo fmt --all -- --check`, then
    `cargo check -p grok-build-sdk --all-targets`.
-3. During iteration, run the narrow domain test that covers the change. For
+4. During iteration, run the narrow domain test that covers the change. For
    Session-state work, use
    `cargo test -p grok-build-sdk session_state::tests`,
    `cargo test -p grok-build-sdk --test session_state_store`, and
    `cargo test -p grok-build-sdk --test host_backend_conformance the_reference_session_state_store`.
-4. Before merge or push, run the full SDK suite:
+5. Before merge or push, run the full SDK suite:
    `cargo test -p grok-build-sdk`. Focused tests shorten iteration; they do not
    replace this final proof.
-5. Run comprehensive linting with
+6. Run comprehensive linting with
    `cargo clippy -p grok-build-sdk --all-targets`.
 
 `lib.rs` and `mod.rs` files are composition roots: keep them focused on module
