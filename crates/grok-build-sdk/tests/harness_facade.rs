@@ -1,8 +1,8 @@
 use grok_build_sdk::{
-    ApiBackend, Error, HarnessContent, HarnessError, HarnessRefinement, HarnessRefinementPatch,
-    HarnessSnapshot, LedgerTurnState, ModelSpec, Prompt, PromptBlock, Runtime, RuntimeConfig,
-    SessionConfig, TurnBindingKey, TurnBindingStatus, TurnOutcome, prompt_digest,
-    prompt_digest_content,
+    ApiBackend, Error, HarnessContent, HarnessError, HarnessEvidenceKind, HarnessEvidenceRef,
+    HarnessRefinement, HarnessRefinementPatch, HarnessSnapshot, LedgerTurnState, ModelSpec, Prompt,
+    PromptBlock, Runtime, RuntimeConfig, SessionConfig, TurnBindingKey, TurnBindingStatus,
+    TurnOutcome, prompt_digest, prompt_digest_content,
 };
 use std::path::PathBuf;
 use tempfile::TempDir;
@@ -100,6 +100,131 @@ fn typed_refinement_is_optimistic_and_returns_an_uncommitted_snapshot() {
     )
     .expect_err("one typed target may be changed only once");
     assert!(matches!(duplicate, HarnessError::Invalid(_)));
+}
+
+#[test]
+fn the_canonical_digest_is_stable_across_every_path_that_produces_one_snapshot() {
+    let direct = HarnessSnapshot::new(
+        HarnessContent::new()
+            .system_prompt("stable prompt")
+            .rules("stable rules"),
+    )
+    .unwrap();
+    let reordered = HarnessSnapshot::new(
+        HarnessContent::new()
+            .rules("stable rules")
+            .system_prompt("stable prompt"),
+    )
+    .unwrap();
+    let refined = HarnessRefinementPatch::new(
+        HarnessSnapshot::new(
+            HarnessContent::new()
+                .system_prompt("stable prompt")
+                .rules("superseded rules"),
+        )
+        .unwrap()
+        .digest()
+        .clone(),
+        [HarnessRefinement::SetRules("stable rules".into())],
+    )
+    .unwrap()
+    .apply(
+        &HarnessSnapshot::new(
+            HarnessContent::new()
+                .system_prompt("stable prompt")
+                .rules("superseded rules"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let decoded = HarnessSnapshot::from_json_slice(&direct.to_json_vec().unwrap()).unwrap();
+
+    // The address follows the content, never the route the content took.
+    for produced in [&reordered, &refined, &decoded] {
+        assert_eq!(produced.digest(), direct.digest());
+        assert_eq!(
+            produced.to_json_vec().unwrap(),
+            direct.to_json_vec().unwrap()
+        );
+        assert_eq!(
+            produced.materialize().unwrap(),
+            direct.materialize().unwrap()
+        );
+        assert_eq!(produced.materialize().unwrap().digest(), direct.digest());
+    }
+    assert_eq!(
+        direct.digest().as_str(),
+        "sha256:1e36ff98620a2ea16854239f8283dcafaaad7945bd2f4409ad6e74751123d6f2"
+    );
+
+    // Field boundaries and absence are part of the address, so no two
+    // different harnesses can collide by concatenation.
+    let boundary = HarnessSnapshot::new(
+        HarnessContent::new()
+            .system_prompt("stable prompts")
+            .rules("table rules"),
+    )
+    .unwrap();
+    let absent =
+        HarnessSnapshot::new(HarnessContent::new().system_prompt("stable prompt")).unwrap();
+    assert_ne!(boundary.digest(), direct.digest());
+    assert_ne!(absent.digest(), direct.digest());
+    assert_eq!(
+        absent.digest().as_str(),
+        "sha256:c329864b0e11cb75ddb285b8098a5b47447590231ecec960617ffb20f5930f7b"
+    );
+}
+
+#[test]
+fn a_refinement_cites_evidence_and_only_applies_to_the_base_it_names() {
+    let base = HarnessSnapshot::new(
+        HarnessContent::new()
+            .system_prompt("cited base prompt")
+            .rules("cited base rules"),
+    )
+    .unwrap();
+    let other = HarnessSnapshot::new(
+        HarnessContent::new()
+            .system_prompt("unrelated prompt")
+            .rules("unrelated rules"),
+    )
+    .unwrap();
+    let patch = HarnessRefinementPatch::new(
+        base.digest().clone(),
+        [HarnessRefinement::SetRules("cited successor rules".into())],
+    )
+    .unwrap()
+    .with_evidence([
+        HarnessEvidenceRef::new(HarnessEvidenceKind::TurnBinding, "turn-binding-identity").unwrap(),
+        HarnessEvidenceRef::new(HarnessEvidenceKind::Evaluation, "acceptance-check")
+            .unwrap()
+            .with_digest(format!("sha256:{}", "c".repeat(64)))
+            .unwrap(),
+    ])
+    .unwrap();
+
+    assert_eq!(patch.base_digest(), base.digest());
+    assert_eq!(patch.evidence().len(), 2);
+    let successor = patch.apply(&base).expect("the named base applies");
+    assert_eq!(
+        successor.content().rules_value(),
+        Some("cited successor rules")
+    );
+
+    let stale = patch
+        .apply(&other)
+        .expect_err("a patch cannot silently retarget another base");
+    match stale {
+        HarnessError::StaleBase { expected, actual } => {
+            assert_eq!(&expected, base.digest());
+            assert_eq!(&actual, other.digest());
+        }
+        error => panic!("expected a stale base error, got {error}"),
+    }
+    assert!(matches!(
+        patch.apply(&successor),
+        Err(HarnessError::StaleBase { .. })
+    ));
 }
 
 fn runtime_config(root: &TempDir, endpoint: String) -> RuntimeConfig {

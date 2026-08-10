@@ -5,10 +5,21 @@ use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
 use sha2::{Digest as _, Sha256};
 use std::{collections::BTreeSet, fmt, str::FromStr};
 
+mod conformance;
+mod store;
+
+pub use conformance::run_harness_store_conformance;
+pub use store::{
+    HARNESS_STORE_SCHEMA_MARKER, HARNESS_STORE_SCHEMA_VERSION, HarnessPut, HarnessStore,
+    HarnessStoreError, LocalHarnessStore, harness_put_reconciled,
+};
+
 pub const HARNESS_SNAPSHOT_SCHEMA_VERSION: u32 = 1;
 pub const MAX_HARNESS_SNAPSHOT_BYTES: usize = 2 * 1024 * 1024;
 pub const TURN_BINDING_RECORD_SCHEMA_VERSION: u32 = 1;
 pub const MAX_TURN_BINDING_RECORD_BYTES: usize = 1024 * 1024;
+pub const MAX_HARNESS_EVIDENCE_REFS: usize = 64;
+const MAX_HARNESS_EVIDENCE_IDENTITY_BYTES: usize = 512;
 const MAX_HARNESS_FIELD_BYTES: usize = 1024 * 1024;
 const HARNESS_DIGEST_PREFIX: &str = "sha256:";
 
@@ -1084,6 +1095,104 @@ impl HarnessRefinement {
     }
 }
 
+/// Namespace of one durable fact a refinement cites. Each variant names
+/// evidence the SDK or its Host already addresses; none of them describe a
+/// domain, product, or authoring workflow.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HarnessEvidenceKind {
+    /// A settled Turn, named by its [`TurnBindingReceipt::binding_id`].
+    TurnBinding,
+    /// A stored artifact, named by its content digest.
+    Artifact,
+    /// A recorded before/after evaluation of a refinement's own acceptance
+    /// check.
+    Evaluation,
+}
+
+/// Immutable reference to the evidence that produced a refinement. It carries
+/// identity only: the SDK never resolves, fetches, or stores the referenced
+/// content.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+pub struct HarnessEvidenceRef {
+    kind: HarnessEvidenceKind,
+    identity: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    digest: Option<String>,
+}
+
+impl HarnessEvidenceRef {
+    pub fn new(
+        kind: HarnessEvidenceKind,
+        identity: impl Into<String>,
+    ) -> Result<Self, HarnessError> {
+        let reference = Self {
+            kind,
+            identity: identity.into(),
+            digest: None,
+        };
+        reference.validate()?;
+        Ok(reference)
+    }
+
+    /// Pins the referenced content by SHA-256 digest so a later reader can
+    /// prove the cited evidence is the evidence that was cited.
+    pub fn with_digest(mut self, digest: impl Into<String>) -> Result<Self, HarnessError> {
+        self.digest = Some(digest.into());
+        self.validate()?;
+        Ok(self)
+    }
+
+    pub fn kind(&self) -> HarnessEvidenceKind {
+        self.kind
+    }
+
+    pub fn identity(&self) -> &str {
+        &self.identity
+    }
+
+    pub fn digest(&self) -> Option<&str> {
+        self.digest.as_deref()
+    }
+
+    fn validate(&self) -> Result<(), HarnessError> {
+        validate_text(
+            &self.identity,
+            MAX_HARNESS_EVIDENCE_IDENTITY_BYTES,
+            "evidence identity",
+        )?;
+        match &self.digest {
+            Some(digest) => validate_sha256_id(digest, "harness evidence digest"),
+            None => Ok(()),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct HarnessEvidenceRefWire {
+    kind: HarnessEvidenceKind,
+    identity: String,
+    #[serde(default)]
+    digest: Option<String>,
+}
+
+impl<'de> Deserialize<'de> for HarnessEvidenceRef {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = HarnessEvidenceRefWire::deserialize(deserializer)?;
+        let reference = Self {
+            kind: wire.kind,
+            identity: wire.identity,
+            digest: wire.digest,
+        };
+        reference.validate().map_err(D::Error::custom)?;
+        Ok(reference)
+    }
+}
+
 /// Typed optimistic patch. Applying it checks only immutable content identity;
 /// the Host remains responsible for revision CAS, commit, evidence, activation,
 /// history, and rollback.
@@ -1091,6 +1200,8 @@ impl HarnessRefinement {
 pub struct HarnessRefinementPatch {
     base_digest: HarnessDigest,
     changes: Vec<HarnessRefinement>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    evidence: Vec<HarnessEvidenceRef>,
 }
 
 impl HarnessRefinementPatch {
@@ -1101,9 +1212,22 @@ impl HarnessRefinementPatch {
         let patch = Self {
             base_digest,
             changes: changes.into_iter().collect(),
+            evidence: Vec::new(),
         };
         patch.validate()?;
         Ok(patch)
+    }
+
+    /// Replaces the evidence this refinement cites. Evidence travels with the
+    /// patch and never enters the successor snapshot, so citing evidence
+    /// cannot change the content address a refinement produces.
+    pub fn with_evidence(
+        mut self,
+        evidence: impl IntoIterator<Item = HarnessEvidenceRef>,
+    ) -> Result<Self, HarnessError> {
+        self.evidence = evidence.into_iter().collect();
+        self.validate()?;
+        Ok(self)
     }
 
     pub fn base_digest(&self) -> &HarnessDigest {
@@ -1112,6 +1236,10 @@ impl HarnessRefinementPatch {
 
     pub fn changes(&self) -> &[HarnessRefinement] {
         &self.changes
+    }
+
+    pub fn evidence(&self) -> &[HarnessEvidenceRef] {
+        &self.evidence
     }
 
     pub fn validate(&self) -> Result<(), HarnessError> {
@@ -1128,6 +1256,22 @@ impl HarnessRefinementPatch {
                     "harness refinement target '{}' occurs more than once",
                     change.target()
                 )));
+            }
+        }
+        if self.evidence.len() > MAX_HARNESS_EVIDENCE_REFS {
+            return Err(HarnessError::Invalid(format!(
+                "harness refinement cites {} evidence references; maximum is \
+                 {MAX_HARNESS_EVIDENCE_REFS}",
+                self.evidence.len()
+            )));
+        }
+        let mut cited = BTreeSet::new();
+        for reference in &self.evidence {
+            reference.validate()?;
+            if !cited.insert((reference.kind, reference.identity.as_str())) {
+                return Err(HarnessError::Invalid(
+                    "harness refinement cites one evidence identity more than once".into(),
+                ));
             }
         }
         Ok(())
@@ -1160,6 +1304,8 @@ impl HarnessRefinementPatch {
 struct HarnessRefinementPatchWire {
     base_digest: HarnessDigest,
     changes: Vec<HarnessRefinement>,
+    #[serde(default)]
+    evidence: Vec<HarnessEvidenceRef>,
 }
 
 impl<'de> Deserialize<'de> for HarnessRefinementPatch {
@@ -1168,7 +1314,9 @@ impl<'de> Deserialize<'de> for HarnessRefinementPatch {
         D: Deserializer<'de>,
     {
         let wire = HarnessRefinementPatchWire::deserialize(deserializer)?;
-        Self::new(wire.base_digest, wire.changes).map_err(D::Error::custom)
+        Self::new(wire.base_digest, wire.changes)
+            .and_then(|patch| patch.with_evidence(wire.evidence))
+            .map_err(D::Error::custom)
     }
 }
 

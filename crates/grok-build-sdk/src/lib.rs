@@ -20,11 +20,13 @@ pub use evidence::{
     SessionEvidenceVersion, run_session_evidence_conformance,
 };
 pub use harness::{
-    CompleteEventCursor, HARNESS_SNAPSHOT_SCHEMA_VERSION, HarnessContent, HarnessDigest,
-    HarnessError, HarnessRefinement, HarnessRefinementPatch, HarnessSnapshot,
+    CompleteEventCursor, HARNESS_SNAPSHOT_SCHEMA_VERSION, HARNESS_STORE_SCHEMA_MARKER,
+    HARNESS_STORE_SCHEMA_VERSION, HarnessContent, HarnessDigest, HarnessError, HarnessEvidenceKind,
+    HarnessEvidenceRef, HarnessPut, HarnessRefinement, HarnessRefinementPatch, HarnessSnapshot,
+    HarnessStore, HarnessStoreError, LocalHarnessStore, MAX_HARNESS_EVIDENCE_REFS,
     MAX_HARNESS_SNAPSHOT_BYTES, MAX_TURN_BINDING_RECORD_BYTES, MaterializedHarness, SdkProvenance,
     TURN_BINDING_RECORD_SCHEMA_VERSION, TurnBindingKey, TurnBindingReceipt, TurnBindingRecord,
-    TurnBindingStatus,
+    TurnBindingStatus, harness_put_reconciled, run_harness_store_conformance,
 };
 pub use prime::*;
 pub use session_state::{

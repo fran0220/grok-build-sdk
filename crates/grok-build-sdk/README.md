@@ -44,8 +44,9 @@ executable.
 | Restart, recovery, receipt, cursor | `PromptReceipt`, `SessionLedger`, rewind receipts, `events_after`, Run reconciliation/attach APIs | Complete for M1. A cursor gap is typed and fails closed. |
 | Host-owned native Session state | `RuntimeBuilder::session_state_store`, `SessionStateStore`, chunked `SessionObject`s, CAS `SessionManifest`, `LocalSessionStateStore` | Complete. With a Host store installed it is the sole authority for transcript/history, rewind state, and compaction checkpoints; its Session leases fence create/load/resume/delete and both sides of fork/worktree-resume across Runtime instances. Covered JSONL files are neither read nor projected. Without injection the legacy JSONL backend remains available. |
 | Immutable harness materialization | `HarnessSnapshot`, `HarnessContent`, `MaterializedHarness` | First-batch contract on this branch. A snapshot requires the complete system prompt; rules are deterministically folded into that authoritative override for native create/load/resume. There is no mutable SDK harness store. |
+| Harness snapshot persistence | `HarnessStore`, `LocalHarnessStore`, `HarnessPut`, `harness_put_reconciled`, `run_harness_store_conformance` | Content-addressed and append-only. Hosts inject the authority; the Runtime keeps only the bound digest and never reads or writes stored snapshots. No update, replace, or delete operation exists, and the conformance suite rejects a backend that replaces content under a digest. |
 | Turn binding | `TurnBindingReceipt`, `CompleteEventCursor`, `SdkProvenance`, harness-aware Session/prompt methods | First-batch contract on this branch. Provider-wire tests cover exact prompt replacement, rules update/removal, effective routes, load/resume and Runtime restart before a receipt is issued. |
-| Optimistic refinement | `HarnessRefinementPatch`, `HarnessRefinement` | First-batch contract on this branch. Patch application rejects stale content identity and duplicate typed targets. The Host commits revisions, evidence, activation, history and rollback. |
+| Optimistic refinement | `HarnessRefinementPatch`, `HarnessRefinement`, `HarnessEvidenceRef`, `HarnessEvidenceKind` | First-batch contract on this branch. Patch application rejects stale content identity and duplicate typed targets, and a patch carries the bounded typed evidence it cites. The Host commits revisions, evidence, activation, history and rollback. |
 | Child Run / A2A | `admit_run_child`, `settle_run_child`, `accept_run_message`, `transition_run_message` | Durable admission, reservations, fenced settlement, de-duplication, and ordered mailbox state use the existing Run reducer. The shell subagent coordinator remains a UI/transport adapter and is not silently treated as Run authority. Hosts execute child placement and feed its typed settlement callback. |
 | Persistent kernel | `TerminalBackend`, background task handles, native terminal/PTY/process tools | M3 audit only. Persistent shell state restores cwd/environment around newly spawned commands; it is not a checkpointable programmatic kernel with durable identity, execution receipt, cancel/restart and state-restore semantics. No internal kernel implementation is suitable to publish. |
 | Continuation / gates | Generation-bound `McpContinuation`; Run-scoped `GateRequest`, `GateEvaluation`, `GateProvider` | M3 audit only. MCP continuation is one non-serializable live MRTR retry and a gate evaluation is an immediate provider result. Neither supplies a durable Host aggregate with identity/revision, ownership transfer, replay cursor or content-bound receipt. |
@@ -90,7 +91,27 @@ provider inference.
 digest. It rejects a stale base and multiple changes to one target, then
 returns another uncommitted immutable snapshot. It has no revision number or
 activation operation: the Host remains the sole owner of revision CAS,
-evidence, activation, history, and rollback.
+evidence, activation, history, and rollback. `with_evidence` attaches up to
+`MAX_HARNESS_EVIDENCE_REFS` typed `HarnessEvidenceRef` citations — a
+`HarnessEvidenceKind` namespace, a bounded identity, and an optional SHA-256
+content pin — so a refinement names the settled Turn, artifact, or evaluation
+that produced it. Evidence rides on the patch and never enters the successor
+snapshot, so citing evidence cannot move a content address, and a patch
+serialized before evidence existed still decodes.
+
+`HarnessStore` is the optional, Host-injectable, content-addressed persistence
+boundary for snapshots; its marker/version is
+`grok-build-sdk.harness-snapshot-store`/1. The Runtime never reads or writes
+it: a resident Session retains only the digest it was bound to, so any
+per-Session harness state the SDK holds is a projection keyed by digest rather
+than a second copy of harness content. The contract is deliberately
+append-only — `get`, `put`, `contains`, and nothing that updates, replaces, or
+deletes live content. Writing a present digest is idempotent, an unknown commit
+is settled through `harness_put_reconciled`, and both SDK byte bounds and
+digest verification are enforced on read and write. `LocalHarnessStore` is the
+SQLite reference implementation; a Host backend proves the same semantics with
+`run_harness_store_conformance`, which fails any backend that lets a later
+write replace the bytes reachable under a digest.
 
 Use `create_session_with_harness`, `load_session_with_harness`, or
 `resume_session_with_harness` to bind one Session incarnation to a snapshot.
