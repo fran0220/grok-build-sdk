@@ -928,6 +928,7 @@ impl SessionActor {
             session_cwd,
             new_registry_snapshot.as_deref(),
             &self.rebuild_spec.compat,
+            self.rebuild_spec.mcp_source_scope,
         );
         let (mcp_diff, dispatch_event_tx) = {
             let mut mcp_state = self.mcp_state.lock().await;

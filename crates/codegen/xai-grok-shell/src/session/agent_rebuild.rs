@@ -79,6 +79,10 @@ pub(crate) struct ResolvedToolParamsJson {
 /// that `Arc`.
 pub(crate) struct AgentRebuildSpec {
     pub origin_embedded: bool,
+    /// MCP sources a live re-merge (plugin reload) may consult for this
+    /// session. `CallerDeclared` for an embedded runtime, whose host owns the
+    /// catalog, `Ambient` for the CLI.
+    pub mcp_source_scope: crate::session::managed_mcp::McpSourceScope,
     pub working_directory: PathBuf,
     pub terminal_backend: Arc<dyn TerminalBackend>,
     pub fs_backend: Arc<dyn AsyncFileSystem>,
@@ -183,6 +187,7 @@ impl AgentRebuildSpec {
     ) -> Result<Agent, AgentBuildError> {
         let Self {
             origin_embedded: _,
+            mcp_source_scope: _,
             working_directory,
             terminal_backend,
             fs_backend,
@@ -406,6 +411,7 @@ pub(crate) fn test_rebuild_spec_default() -> Arc<AgentRebuildSpec> {
     let (uq_tx, _uq_rx) = tokio::sync::mpsc::unbounded_channel();
     Arc::new(AgentRebuildSpec {
         origin_embedded: false,
+        mcp_source_scope: crate::session::managed_mcp::McpSourceScope::Ambient,
         working_directory: std::env::temp_dir(),
         terminal_backend: Arc::new(
             xai_grok_tools::computer::local::LocalTerminalBackend::new_local(

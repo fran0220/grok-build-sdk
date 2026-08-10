@@ -356,14 +356,23 @@ pub(crate) async fn spawn_session_actor(
             WebFetchConfig::Enabled { params } => params.allowed_domains(),
             WebFetchConfig::Disabled => vec![],
         };
-        let project_trusted =
-            crate::agent::folder_trust::project_scope_allowed(tool_context.cwd.as_path());
-        let mut permission_config =
+        // An embedded runtime's host owns approval: it answers every
+        // `session/request_permission` itself. Ambient user policy
+        // (`~/.grok/config.toml` permission_mode, `~/.claude/settings.json`
+        // defaultMode / auto mode / remembered approvals) belongs to the CLI
+        // user and must never pre-approve tools behind that host's back.
+        let host_owns_permission = tool_context.origin_runtime_embedded;
+        let project_trusted = !host_owns_permission
+            && crate::agent::folder_trust::project_scope_allowed(tool_context.cwd.as_path());
+        let mut permission_config = if host_owns_permission {
+            None
+        } else {
             xai_grok_workspace::permission::resolution::resolve_permission_config_with_fallback(
                 tool_context.cwd.as_path(),
                 project_trusted,
             )
-            .await;
+            .await
+        };
         let yolo_pin = xai_grok_workspace::permission::resolution::yolo_disabled_by_policy();
         let (cli_permission_rules, dropped_catchalls) =
             drop_cli_catchall_allows(cli_permission_rules, yolo_pin);
@@ -427,8 +436,10 @@ pub(crate) async fn spawn_session_actor(
         } else {
             None
         };
-        let remember_tool_approvals = crate::util::config::remember_tool_approvals_from_disk();
-        let auto_permission_mode = crate::util::config::auto_permission_mode_enabled_from_disk();
+        let remember_tool_approvals =
+            !host_owns_permission && crate::util::config::remember_tool_approvals_from_disk();
+        let auto_permission_mode =
+            !host_owns_permission && crate::util::config::auto_permission_mode_enabled_from_disk();
         let (permissions, permission_events_rx) =
             xai_grok_workspace::permission::spawn_permission_manager_with_hub(
                 session_info.id.clone(),
@@ -969,6 +980,9 @@ pub(crate) async fn spawn_session_actor(
     };
     let rebuild_spec = std::sync::Arc::new(crate::session::agent_rebuild::AgentRebuildSpec {
         origin_embedded: tool_context.origin_embedded,
+        mcp_source_scope: crate::session::managed_mcp::McpSourceScope::for_runtime(
+            tool_context.origin_runtime_embedded,
+        ),
         working_directory: tool_context.cwd.as_path().to_path_buf(),
         terminal_backend: terminal_backend.clone(),
         fs_backend: fs_backend.clone(),

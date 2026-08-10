@@ -367,13 +367,19 @@ async fn handle_update_mcp_servers(agent: &MvpAgent, args: &acp::ExtRequest) -> 
     };
 
     let compat = agent.cfg.borrow().compat_resolved;
-    let admitted =
-        crate::session::managed_mcp::admit_client_mcp_servers(params.mcp_servers, &cwd, &compat);
+    let scope = agent.mcp_source_scope();
+    let admitted = crate::session::managed_mcp::admit_client_mcp_servers(
+        params.mcp_servers,
+        &cwd,
+        &compat,
+        scope,
+    );
     let merged = crate::session::managed_mcp::merge_managed_mcp_servers(
         admitted.clone(),
         &cwd,
         agent.plugin_registry_handle().snapshot().as_deref(),
         &compat,
+        scope,
     );
 
     let (tx, rx) = tokio::sync::oneshot::channel();
@@ -488,6 +494,7 @@ async fn handle_reload_all_mcp_servers(agent: &MvpAgent) -> ExtResult {
             handle.initial_client_mcp_servers.clone(),
             agent.plugin_registry_handle().snapshot().as_deref(),
             &compat,
+            agent.mcp_source_scope(),
         ) {
             updated += 1;
         }
@@ -552,6 +559,7 @@ async fn handle_reload_project_mcp_servers(agent: &MvpAgent, args: &acp::ExtRequ
             cwd,
             agent.plugin_registry_handle().snapshot().as_deref(),
             &agent.cfg.borrow().compat_resolved,
+            agent.mcp_source_scope(),
         );
 
         let (tx, _rx) = tokio::sync::oneshot::channel();

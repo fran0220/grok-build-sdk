@@ -6862,6 +6862,111 @@ done
         runtime.shutdown().await.expect("runtime shuts down");
     }
 
+    /// The embedding host owns the runtime's configuration. Ambient MCP
+    /// catalogs and auto-approving permission modes belong to whoever installed
+    /// the Grok CLI or Claude Code on the machine and must never reach a session
+    /// the host declared. The workspace below plants both kinds of ambient
+    /// configuration so the assertion holds on a machine that has neither.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn embedded_runtime_ignores_ambient_mcp_and_permission_configuration() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let server = MockInferenceServer::start().await.expect("mock server");
+        let root = TempDir::new().expect("temp root");
+        let workspace = root.path().join("workspace");
+        std::fs::create_dir(&workspace).expect("workspace");
+        std::fs::write(workspace.join("note.txt"), "before").expect("fixture");
+        std::fs::write(
+            workspace.join(".mcp.json"),
+            r#"{"mcpServers":{"ambient-mcp-json-server":{"command":"/bin/false","args":[]}}}"#,
+        )
+        .expect("ambient .mcp.json");
+        std::fs::create_dir(workspace.join(".grok")).expect("ambient grok dir");
+        std::fs::write(
+            workspace.join(".grok").join("config.toml"),
+            "[mcp_servers.ambient_toml_server]\ncommand = \"/bin/false\"\nargs = []\n",
+        )
+        .expect("ambient config.toml");
+        std::fs::create_dir(workspace.join(".claude")).expect("ambient claude dir");
+        std::fs::write(
+            workspace.join(".claude").join("settings.json"),
+            r#"{"permissions":{"defaultMode":"bypassPermissions","allow":["Edit"]}}"#,
+        )
+        .expect("ambient claude settings");
+
+        let host = Arc::new(RecordingHost::default());
+        let (runtime, _) = Runtime::builder(runtime_config(&root, server.url()))
+            .profile(RuntimeProfile::Desktop)
+            .host_capabilities(HostCapabilities {
+                fs_read: true,
+                fs_write: true,
+                ..HostCapabilities::default()
+            })
+            .host_delegate(host.clone())
+            .in_process_mcp_servers([InProcessMcpServer::new(
+                "sdk-fixture",
+                "fixture-id",
+                Arc::new(InProcessFixture {
+                    contexts: Arc::new(std::sync::Mutex::new(Vec::new())),
+                }),
+            )])
+            .start()
+            .await
+            .expect("desktop runtime starts");
+        let session = runtime
+            .create_session(session_config(workspace.clone()))
+            .await
+            .expect("session starts");
+
+        let names = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if let Ok(servers) = runtime.list_mcp_servers(&session, false).await
+                    && servers
+                        .iter()
+                        .any(|server| server.status == Some(McpServerStatus::Ready))
+                {
+                    break servers
+                        .into_iter()
+                        .map(|server| server.name)
+                        .collect::<Vec<_>>();
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("declared MCP server initializes");
+        assert_eq!(
+            names,
+            vec!["sdk-fixture".to_owned()],
+            "the session catalog must hold exactly the declared servers"
+        );
+
+        let denied_call = server.expect_response(
+            "ambient auto-approve must not bypass the host",
+            InferenceRequestMatcher::foreground(InferenceEndpoint::ChatCompletions),
+            chat_tool_call(
+                "write-denied",
+                "search_replace",
+                r#"{"file_path":"note.txt","old_string":"before","new_string":"ambient"}"#,
+            ),
+        );
+        runtime
+            .prompt(&session, "turn-ambient", "attempt an edit")
+            .await
+            .expect("a denied tool does not fail the turn transport");
+        denied_call.assert_satisfied();
+        assert!(
+            host.request_methods()
+                .contains(&"session/request_permission".into()),
+            "the host delegate must decide, not ambient permission settings"
+        );
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("note.txt")).unwrap(),
+            "before",
+            "the host denied the edit"
+        );
+        runtime.shutdown().await.expect("runtime shuts down");
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn desktop_host_serves_complete_terminal_lifecycle_including_timeout_kill() {
         let _ = rustls::crypto::ring::default_provider().install_default();

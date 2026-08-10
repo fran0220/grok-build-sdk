@@ -41,6 +41,12 @@ impl MvpAgent {
             && self.origin_profile
                 == crate::agent::config::OriginEmbeddedProfile::Restricted
     }
+    /// MCP sources this runtime may consult: the embedding host's declared
+    /// servers are authoritative, the CLI additionally merges the user's
+    /// ambient configuration.
+    pub(crate) fn mcp_source_scope(&self) -> crate::session::managed_mcp::McpSourceScope {
+        crate::session::managed_mcp::McpSourceScope::for_runtime(self.origin_embedded)
+    }
     /// Announce a session's new title over ACP. ACP scopes `session/update` to
     /// sessions the client established, and a rename can name a history row it
     /// never loaded, so the liveness check belongs here rather than at each
@@ -432,16 +438,19 @@ impl MvpAgent {
         }
         self.ensure_plugin_registry();
         let compat = self.cfg.borrow().compat_resolved;
+        let scope = self.mcp_source_scope();
         let admitted = crate::session::managed_mcp::admit_client_mcp_servers(
             client_servers,
             cwd,
             &compat,
+            scope,
         );
         let merged = crate::session::managed_mcp::merge_managed_mcp_servers(
             admitted.clone(),
             cwd,
             self.plugin_registry_handle.snapshot().as_deref(),
             &compat,
+            scope,
         );
         (admitted, merged)
     }

@@ -928,19 +928,39 @@ async fn handle_list(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult {
 
     let compat = agent.cfg.borrow().compat_resolved;
     let plugin_registry_snapshot = agent.plugin_registry_snapshot();
-    let local_servers = crate::util::config::load_mcp_servers(&cwd, &compat);
-    let disabled_tools = crate::util::config::get_all_mcp_disabled_tools(&cwd);
+    // An embedded runtime's catalog is exactly what its host declared; the
+    // machine's own MCP configuration is not part of the product surface.
+    let caller_declared_only =
+        agent.mcp_source_scope() == crate::session::managed_mcp::McpSourceScope::CallerDeclared;
+    let local_servers = if caller_declared_only {
+        Vec::new()
+    } else {
+        crate::util::config::load_mcp_servers(&cwd, &compat)
+    };
+    let disabled_tools = if caller_declared_only {
+        Default::default()
+    } else {
+        crate::util::config::get_all_mcp_disabled_tools(&cwd)
+    };
     let mut servers = build_mcp_catalog_with_gateway_tools(
         &local_servers,
         gateway_catalog.as_ref(),
         &disabled_tools,
     );
-    let disabled_names = crate::util::config::disabled_mcp_server_names(&cwd);
-    let setup_entries = crate::util::config::collect_mcp_setup_configs(
-        &cwd,
-        plugin_registry_snapshot.as_deref(),
-        &compat,
-    );
+    let disabled_names = if caller_declared_only {
+        Default::default()
+    } else {
+        crate::util::config::disabled_mcp_server_names(&cwd)
+    };
+    let setup_entries = if caller_declared_only {
+        Default::default()
+    } else {
+        crate::util::config::collect_mcp_setup_configs(
+            &cwd,
+            plugin_registry_snapshot.as_deref(),
+            &compat,
+        )
+    };
     let preferences = crate::util::config::load_mcp_preferences().file();
     for (name, setup_entry) in setup_entries {
         if servers.iter().any(|entry| entry.name == name) {
@@ -1001,13 +1021,15 @@ async fn handle_list(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult {
         plugin_registry: plugin_registry_snapshot.as_deref(),
         compat: &compat,
     };
-    let stubs = crate::util::config::reenableable_disabled_stubs(
-        &disabled_names,
-        &catalog_names,
-        &discovery,
-    );
-    for name in stubs {
-        servers.push(disabled_server_placeholder_entry(&name));
+    if !caller_declared_only {
+        let stubs = crate::util::config::reenableable_disabled_stubs(
+            &disabled_names,
+            &catalog_names,
+            &discovery,
+        );
+        for name in stubs {
+            servers.push(disabled_server_placeholder_entry(&name));
+        }
     }
 
     if let Some(snapshot) = session_snapshot {
@@ -2054,6 +2076,7 @@ async fn handle_setup(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult {
         &cwd,
         plugin_reg.as_deref(),
         &compat,
+        agent.mcp_source_scope(),
     )
     .into_iter()
     .find(|s| crate::session::mcp_servers::mcp_server_name(&s.server) == req.server_name);
@@ -2170,6 +2193,7 @@ async fn handle_toggle(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult {
                 &cwd,
                 agent.plugin_registry_snapshot().as_deref(),
                 &agent.cfg.borrow().compat_resolved,
+                agent.mcp_source_scope(),
             );
         let found = all_servers_with_policy
             .into_iter()

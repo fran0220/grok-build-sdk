@@ -148,6 +148,7 @@ impl MvpAgent {
         let gateway = self.gateway.clone();
         let plugin_handle = self.plugin_registry_handle.clone();
         let compat = self.cfg.borrow().compat_resolved;
+        let mcp_source_scope = self.mcp_source_scope();
         let remote = remote.cloned();
         let cwd = cwd.to_path_buf();
         let workspace = key.display().to_string();
@@ -252,6 +253,7 @@ impl MvpAgent {
                 targets,
                 plugin_handle: &plugin_handle,
                 compat: &compat,
+                mcp_source_scope,
                 prompt_cwd: &cwd,
             })
             .await;
@@ -281,6 +283,7 @@ struct ReloadAfterGrant<'a> {
     targets: Vec<ReloadTarget>,
     plugin_handle: &'a xai_grok_agent::plugins::SharedPluginRegistryHandle,
     compat: &'a xai_grok_tools::types::CompatConfig,
+    mcp_source_scope: crate::session::managed_mcp::McpSourceScope,
     /// The prompting session's cwd — used only for the client catalog push.
     prompt_cwd: &'a std::path::Path,
 }
@@ -310,6 +313,7 @@ async fn reload_project_servers_after_grant(ctx: ReloadAfterGrant<'_>) {
             target.initial_client_mcp_servers,
             plugin_snapshot.as_deref(),
             ctx.compat,
+            ctx.mcp_source_scope,
         );
         // Plugins (+ plugin-contributed hooks) built for this session's own cwd
         // on the folder-trust verdict (mirrors `broadcast_plugin_registry_to_sessions`);
