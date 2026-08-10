@@ -5,6 +5,7 @@
 //! The public API is a typed SDK; protocol adapters used by the shell remain
 //! private implementation details.
 
+mod activation;
 mod autonomous;
 mod evidence;
 mod harness;
@@ -12,6 +13,16 @@ mod prime;
 mod private;
 mod session_state;
 
+pub use activation::{
+    ACTIVATION_STORE_SCHEMA_MARKER, ACTIVATION_STORE_SCHEMA_VERSION, ActivationClaim,
+    ActivationClaimRequest, ActivationCoordinator, ActivationDisposition, ActivationError,
+    ActivationFencingToken, ActivationGrant, ActivationHandle, ActivationItemId,
+    ActivationItemState, ActivationLeaseState, ActivationRenewal, ActivationSettlement,
+    ActivationWake, ActivationWakeOutcome, ActivationWorkerId, LocalActivationCoordinator,
+    MAX_ACTIVATION_CLAIM_BATCH, MAX_ACTIVATION_ITEM_ID_BYTES, MAX_ACTIVATION_LEASE_MS,
+    MAX_ACTIVATION_PAYLOAD_BYTES, MAX_ACTIVATION_WORKER_ID_BYTES,
+    run_activation_coordinator_conformance,
+};
 pub use autonomous::{AutonomousActivation, AutonomousActivationResult, AutonomousTurnLoop};
 pub use evidence::{
     LocalSessionEvidenceStore, MAX_SESSION_EVIDENCE_BYTES, SESSION_EVIDENCE_SCHEMA_MARKER,

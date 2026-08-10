@@ -48,6 +48,7 @@ executable.
 | Turn binding | `TurnBindingReceipt`, `CompleteEventCursor`, `SdkProvenance`, harness-aware Session/prompt methods | First-batch contract on this branch. Provider-wire tests cover exact prompt replacement, rules update/removal, effective routes, load/resume and Runtime restart before a receipt is issued. |
 | Optimistic refinement | `HarnessRefinementPatch`, `HarnessRefinement`, `HarnessEvidenceRef`, `HarnessEvidenceKind` | First-batch contract on this branch. Patch application rejects stale content identity and duplicate typed targets, and a patch carries the bounded typed evidence it cites. The Host commits revisions, evidence, activation, history and rollback. |
 | Child Run / A2A | `admit_run_child`, `settle_run_child`, `accept_run_message`, `transition_run_message` | Durable admission, reservations, fenced settlement, de-duplication, and ordered mailbox state use the existing Run reducer. The shell subagent coordinator remains a UI/transport adapter and is not silently treated as Run authority. Hosts execute child placement and feed its typed settlement callback. |
+| Durable activation coordination | `ActivationCoordinator`, `LocalActivationCoordinator`, `ActivationWake`, `ActivationClaimRequest`, `ActivationGrant`, `ActivationHandle`, `ActivationDisposition`, `run_activation_coordinator_conformance` | Complete. The durable queue in front of Run activation: identity-keyed work items with a due time, claims fenced by a strictly monotonic per-item token, renewal, completion or yield, and expiry-based recovery. Two supervisors on one authority grant a due item exactly once, a superseded worker is refused rather than tolerated, and a retried completion is an answer rather than a second execution. |
 | Per-Session capability layering | `CapabilityLayer`, `RuntimeBuilder::general_capabilities`, `create_session_with_capabilities`, `create_session_with_harness_and_capabilities`, `load_session_with_capabilities`, `resume_session_with_capabilities`, `set_session_capabilities`, `session_capabilities` | Complete for skills, MCP mounts and agent-service routes. One application-owned general layer is masked per Session by name and kind, so per-project activation and per-Session routing need neither a Runtime restart nor a second Runtime. |
 | Persistent kernel | `TerminalBackend`, background task handles, native terminal/PTY/process tools | M3 audit only. Persistent shell state restores cwd/environment around newly spawned commands; it is not a checkpointable programmatic kernel with durable identity, execution receipt, cancel/restart and state-restore semantics. No internal kernel implementation is suitable to publish. |
 | Continuation / gates | Generation-bound `McpContinuation`; Run-scoped `GateRequest`, `GateEvaluation`, `GateProvider` | M3 audit only. MCP continuation is one non-serializable live MRTR retry and a gate evaluation is an immediate provider result. Neither supplies a durable Host aggregate with identity/revision, ownership transfer, replay cursor or content-bound receipt. |
@@ -192,11 +193,51 @@ memory from the authority. Without injection, the legacy JSONL implementation
 is unchanged. The `Event` receiver and `events_after` journal remain bounded
 in-memory delivery only and are not durable evidence.
 
+## Durable activation coordination
+
+`ActivationCoordinator` is the durable authority a Host's in-application
+supervisor asks *what is due* and *may I execute it*. It sits in front of Run
+activation rather than inside it: `claim_run_activation` fences one already
+loaded Run's controller, while the coordinator decides which work is due and
+which supervisor may touch it at all, without loading anything. Its marker and
+version are `grok-build-sdk.activation-coordinator`/1.
+
+The unit is a work item: a validated `ActivationItemId`, a due time, and an
+opaque payload the coordinator never interprets. `wake` registers or reschedules
+one by identity, so a duplicate schedule is `Unchanged` rather than a second
+item, and a work item under a live lease answers `Held` rather than moving under
+its worker. `claim_due` takes up to a bounded batch of due items in due order,
+oldest first and ties broken by identity, so a supervisor that was offline
+catches up in schedule order and never sees work before its time; `claim_item`
+answers `Granted`, `Held`, `NotDue`, `Settled`, or `Unknown` for one named item.
+
+A grant carries an `ActivationFencingToken` that is strictly monotonic per item
+and never reused. `renew` extends the lease, and `release` records either
+`ActivationDisposition::Complete` or a `Yield` back into the queue. Every one of
+those carries the token, and the coordinator answers `Fenced` — not an error and
+not success — to any assertion whose token it is no longer honouring. Expiry,
+not liveness detection, returns a crashed worker's item to the queue; the
+successor claim advances the token, which is exactly what invalidates the
+crashed worker if it ever returns. Releasing twice with the same token answers
+`AlreadySettled`, so a supervisor that crashed between commit and
+acknowledgement retries safely instead of executing the work again. Every method
+takes the caller's instant; the coordinator has no clock of its own.
+
+Identities, payloads, lease durations and batch sizes are bounded by the
+contract rather than by a backend, and every stored scalar is re-validated on
+read, so a foreign schema marker, a damaged row, or a settlement that outruns
+its own fencing counter fails the read instead of scheduling invented work.
+`LocalActivationCoordinator` is the SQLite reference authority; a Host backend
+proves the same semantics with `run_activation_coordinator_conformance`, which
+fails any backend that grants contended work twice, honours a superseded token,
+or forgets a settlement across a restart.
+
 `AutonomousTurnLoop` currently has enforceable exact upper bounds only for iteration count, agent calls, and concurrency. Until a model/runtime capability contract supplies enforceable per-Turn maxima, finite `tokens`, `cost_micros`, `active_ms`, `wall_ms`, or `artifact_bytes` budgets are rejected before an iteration or prompt is dispatched. Use `u64::MAX` to mark those dimensions explicitly unbounded. Actual typed usage is still settled and recorded; an overrun or unknown value against a finite reservation durably enters recovery rather than being treated as free work.
 
 | SDK owns | Embedding Host owns |
 |---|---|
 | Run reducer and lifecycle invariants, bounded loop, budgets, gates, verifier policy, intent/outbox, command de-duplication, epoch/token fencing, receipts, recovery decisions and attach contract | Worker/process placement, OS daemon/service residency, durable timer implementation and invoking bounded activations |
+| Activation coordination semantics: due ordering, claim exclusivity, monotonic fencing tokens, expiry-based recovery, idempotent settlement, bounds and fail-closed decoding | The timer that decides when to sweep, the supervisor loop and its renewal cadence, what a work item means, and the retention policy behind `purge_settled` |
 | SessionLedger/rewind/binding schemas; native Session object/chunk schemas, validation, replay and publication semantics; CAS transition intent and fail-closed reconciliation; artifact identity/integrity and provider contracts | Physical Run, session-evidence, and native Session-state persistence; transactions/migrations/encryption/backup/lifecycle; uncovered shell-sidecar placement; credentials, providers, workspace, queues, policy and UI |
 
 `ProviderSet` supplies typed artifact, gate, verifier, approval, and telemetry contracts. Local defaults store content-addressed artifacts and fail gates, verification, and approval closed until the Host installs explicit providers.
