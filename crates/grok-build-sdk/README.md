@@ -238,6 +238,34 @@ The SDK exposes every embeddable implementation present in this source tree; it 
 
 Capability descriptors describe public typed SDK features, not every internal shell route or named xAI product service. Public releases must preserve this distinction.
 
+## Development and verification
+
+Use the gates in increasing cost order:
+
+1. Run the deterministic, std-only source-layout gate first:
+   `cargo test -p grok-build-sdk --test source_layout`.
+2. Check formatting and every SDK target:
+   `cargo fmt --all -- --check`, then
+   `cargo check -p grok-build-sdk --all-targets`.
+3. During iteration, run the narrow domain test that covers the change. For
+   Session-state work, use
+   `cargo test -p grok-build-sdk session_state::tests`,
+   `cargo test -p grok-build-sdk --test session_state_store`, and
+   `cargo test -p grok-build-sdk --test host_backend_conformance the_reference_session_state_store`.
+4. Before merge or push, run the full SDK suite:
+   `cargo test -p grok-build-sdk`. Focused tests shorten iteration; they do not
+   replace this final proof.
+5. Run comprehensive linting with
+   `cargo clippy -p grok-build-sdk --all-targets`.
+
+`lib.rs` and `mod.rs` files are composition roots: keep them focused on module
+declarations and reexports. Put `Runtime` methods in the matching domain file
+under `runtime/`. Split modules by reason to change, and do not create
+catch-all `utils` or `common` dumping grounds. The layout gate limits
+`src/lib.rs` to 300 physical lines and every other Rust source in this package
+to 2,000, with no legacy exceptions; split ownership instead of casually
+raising either limit.
+
 ## Public release status
 
 This repository can be published as an Apache-2.0 source release or consumed from a pinned public Git tag, provided the bundled third-party notices and upstream provenance remain intact. The crate is intentionally `publish = false`: its current `xai-grok-*` dependency closure is workspace-local and cannot yet be resolved independently by crates.io. A crates.io release requires publishing or replacing that full dependency closure, removing workspace-only patches, and validating a packaged source archive first. Do not present a Git release as a crates.io-compatible standalone package until those gates pass.
