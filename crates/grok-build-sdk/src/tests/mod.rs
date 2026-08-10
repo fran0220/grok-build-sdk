@@ -16,5 +16,6 @@ mod host_and_media;
 mod mcp_protocol;
 mod mcp_runtime;
 mod provider_routing;
+mod session_capabilities;
 mod session_lifecycle;
 mod session_stores;

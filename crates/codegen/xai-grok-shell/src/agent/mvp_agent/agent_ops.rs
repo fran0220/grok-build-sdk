@@ -66,6 +66,15 @@ impl MvpAgent {
                 );
         }
     }
+    /// Re-resolves one resident session's skills after its host-bound
+    /// capability layer changed. Returns `false` when the session is not
+    /// resident.
+    pub fn reload_skills_for_session(&self, session_id: &acp::SessionId) -> bool {
+        match self.resident_handle(session_id) {
+            Some(handle) => handle.cmd_tx.send(SessionCommand::ReloadSkills).is_ok(),
+            None => false,
+        }
+    }
     pub fn reload_skills_all_sessions(&self) -> usize {
         let session_ids = self.resident_ids();
         for sid in &session_ids {
@@ -4421,7 +4430,17 @@ impl MvpAgent {
             authenticated = feedback_user_token.is_some(),
             "Initializing feedback manager for session"
         );
-        let skills = self.cfg.borrow().skills.clone();
+        // A host-supplied per-session capability layer replaces the global
+        // `[skills]` table for this session only, so one embedded runtime can
+        // serve sessions with different skill roots without a restart.
+        crate::agent::session_capabilities::bind_from_meta(
+            session_info.id.0.as_ref(),
+            session_meta,
+        );
+        let skills = crate::agent::session_capabilities::skills_for(
+            session_info.id.0.as_ref(),
+        )
+        .unwrap_or_else(|| self.cfg.borrow().skills.clone());
         let compat = self.cfg.borrow().compat_resolved;
         let acp_agent_profile = (!self.origin_restricted())
             .then(|| parse_agent_profile_from_meta(session_meta))

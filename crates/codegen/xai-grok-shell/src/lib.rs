@@ -70,6 +70,23 @@ pub mod origin_runtime {
         true
     }
 
+    /// Rebinds one resident session's capability layer between turns. The
+    /// value uses the same shape as the `x.ai/sessionCapabilities` session
+    /// `_meta` entry; `None` restores the runtime-global configuration.
+    /// Only the private embedded façade calls this, and only from the agent
+    /// thread that owns the session.
+    pub fn bind_session_capabilities(session_id: &str, value: Option<&serde_json::Value>) {
+        let meta = value.map(|value| {
+            let mut meta = agent_client_protocol::Meta::new();
+            meta.insert(
+                crate::agent::session_capabilities::SESSION_CAPABILITIES_META_KEY.to_owned(),
+                value.clone(),
+            );
+            meta
+        });
+        crate::agent::session_capabilities::bind_from_meta(session_id, meta.as_ref());
+    }
+
     /// Resolves a transport session to its registered root identity.
     /// A child is admitted only when its internally supplied parent is already
     /// in the registered tree, so nesting remains transitive and a child cannot

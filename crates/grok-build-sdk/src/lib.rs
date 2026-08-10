@@ -92,6 +92,7 @@ pub mod run {
     };
 }
 
+mod capability;
 mod config;
 mod hooks;
 mod mcp;
@@ -99,6 +100,11 @@ mod provenance;
 mod runtime;
 mod session;
 
+pub use capability::{
+    AgentServiceContribution, CapabilityBinding, CapabilityError, CapabilityKind, CapabilityLayer,
+    CapabilityOrigin, CapabilityResolution, MAX_CAPABILITY_LAYER_ENTRIES,
+    MAX_CAPABILITY_NAME_BYTES, MaskedCapability, SkillContribution,
+};
 pub use config::*;
 pub use hooks::*;
 pub use mcp::*;
@@ -106,6 +112,7 @@ pub use provenance::*;
 pub use runtime::*;
 pub use session::*;
 
+pub(crate) use capability::{ResolvedCapabilities, resolve_capabilities};
 pub(crate) use mcp::InProcessMcpOutbound;
 pub(crate) use mcp::parsing::{parse_mcp_servers, parse_task_status};
 pub(crate) use provenance::canonicalize_json;

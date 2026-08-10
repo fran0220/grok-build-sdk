@@ -48,6 +48,7 @@ executable.
 | Turn binding | `TurnBindingReceipt`, `CompleteEventCursor`, `SdkProvenance`, harness-aware Session/prompt methods | First-batch contract on this branch. Provider-wire tests cover exact prompt replacement, rules update/removal, effective routes, load/resume and Runtime restart before a receipt is issued. |
 | Optimistic refinement | `HarnessRefinementPatch`, `HarnessRefinement`, `HarnessEvidenceRef`, `HarnessEvidenceKind` | First-batch contract on this branch. Patch application rejects stale content identity and duplicate typed targets, and a patch carries the bounded typed evidence it cites. The Host commits revisions, evidence, activation, history and rollback. |
 | Child Run / A2A | `admit_run_child`, `settle_run_child`, `accept_run_message`, `transition_run_message` | Durable admission, reservations, fenced settlement, de-duplication, and ordered mailbox state use the existing Run reducer. The shell subagent coordinator remains a UI/transport adapter and is not silently treated as Run authority. Hosts execute child placement and feed its typed settlement callback. |
+| Per-Session capability layering | `CapabilityLayer`, `RuntimeBuilder::general_capabilities`, `create_session_with_capabilities`, `create_session_with_harness_and_capabilities`, `load_session_with_capabilities`, `resume_session_with_capabilities`, `set_session_capabilities`, `session_capabilities` | Complete for skills, MCP mounts and agent-service routes. One application-owned general layer is masked per Session by name and kind, so per-project activation and per-Session routing need neither a Runtime restart nor a second Runtime. |
 | Persistent kernel | `TerminalBackend`, background task handles, native terminal/PTY/process tools | M3 audit only. Persistent shell state restores cwd/environment around newly spawned commands; it is not a checkpointable programmatic kernel with durable identity, execution receipt, cancel/restart and state-restore semantics. No internal kernel implementation is suitable to publish. |
 | Continuation / gates | Generation-bound `McpContinuation`; Run-scoped `GateRequest`, `GateEvaluation`, `GateProvider` | M3 audit only. MCP continuation is one non-serializable live MRTR retry and a gate evaluation is an immediate provider result. Neither supplies a durable Host aggregate with identity/revision, ownership transfer, replay cursor or content-bound receipt. |
 
@@ -252,6 +253,57 @@ The public session-scoped MCP API covers:
 Modern roots, model sampling, and elicitation requests are carried by MRTR `inputRequests` and answered through installed typed host services or an `McpContinuation` created with `McpInputRequired::respond`. A continuation is bound to its session incarnation, server, connection generation, operation kind and target; cross-operation reuse and reuse after reconnect fail closed, while the opaque `requestState` is returned unchanged. The legacy unrestricted reverse-request path is not used for these roles. Capabilities are advertised only when the corresponding typed service is installed and authorized. Unknown input-request methods fail closed.
 
 The SDK deliberately does not call legacy `resources/subscribe` / `resources/unsubscribe`, expose a generic server-to-client request peer, or add an ACP compatibility service. Deprecated pre-2026 logging and direct roots/sampling request forms are retained only where rmcp's protocol model requires them; they are not the modern public execution path. Negotiated capability fields report what the server advertised for the selected version and remain distinct from host authorization.
+
+## Session capability layering
+
+Capabilities resolve in two layers. The application installs a *general* layer
+once on `RuntimeBuilder::general_capabilities`: the built-ins, shared skills and
+shared MCP mounts every Session should see. `RuntimeBuilder::mcp_servers`
+remains supported and is folded into that same general layer, so an existing
+embedding keeps its behavior unchanged.
+
+Each Session may additionally carry its own `CapabilityLayer`, bound at
+`create_session_with_capabilities` (or the `_with_harness_and_capabilities`,
+`load_…` and `resume_…` forms) and replaceable between Turns with
+`set_session_capabilities`. A Session contribution *masks* a general
+contribution of the same kind and name; every other name stays visible.
+`session_capabilities` reports the effective names, each one's
+`CapabilityOrigin`, and the masked general entries.
+
+```rust
+let (runtime, _events) = Runtime::builder(config)
+    .profile(RuntimeProfile::Desktop)
+    .general_capabilities(
+        CapabilityLayer::new()
+            .skill(SkillContribution::new("general-skills", shared_skill_root)),
+    )
+    .start()
+    .await?;
+
+let session = runtime
+    .create_session_with_capabilities(
+        session_config,
+        CapabilityLayer::new()
+            .skill(SkillContribution::new("project-skills", project_skill_root))
+            .mcp_service(project_mcp_mount)
+            .agent_service(AgentServiceContribution::new("explore", "fast-model")),
+    )
+    .await?;
+```
+
+Layering is not a permission system: it selects which contributions a Session
+observes, and it never grants or withholds authority. Validation is fail-closed
+and runs before anything reaches the native runtime — layers require the
+`Desktop` profile, duplicate names within a layer, empty or oversized names,
+relative skill roots, MCP mount names that collide with an in-process server,
+agent-service models outside the fixed catalog, and layers beyond
+`MAX_CAPABILITY_LAYER_ENTRIES` are all rejected as `Error::InvalidConfig`.
+Rebinding a resident Session is rejected while a prompt is in flight, and the
+Session actor, its incarnation and its durable ledger are untouched by a
+rebind: the change is observed by the next Turn on that Session alone.
+
+`CapabilityLayer` deliberately implements neither `Debug` nor `Serialize`
+because MCP mounts carry environment secrets and bearer headers.
 
 ## Capability boundaries
 

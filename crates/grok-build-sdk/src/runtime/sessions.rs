@@ -47,6 +47,75 @@ impl Runtime {
     pub async fn create_session(&self, config: SessionConfig) -> Result<SessionId, Error> {
         self.inner.create_session(config).await
     }
+    /// Creates a Session that carries its own capability layer. The layer
+    /// masks the application-owned general layer by kind and name for this
+    /// Session only; every other Session on this Runtime is unaffected and no
+    /// restart or second Runtime is involved.
+    pub async fn create_session_with_capabilities(
+        &self,
+        config: SessionConfig,
+        capabilities: CapabilityLayer,
+    ) -> Result<SessionId, Error> {
+        self.inner
+            .create_session_with_capabilities(config, None, capabilities)
+            .await
+    }
+    /// Combines an immutable harness snapshot with a Session capability layer.
+    pub async fn create_session_with_harness_and_capabilities(
+        &self,
+        config: SessionConfig,
+        snapshot: &HarnessSnapshot,
+        capabilities: CapabilityLayer,
+    ) -> Result<SessionId, Error> {
+        let materialized = snapshot.materialize()?;
+        self.inner
+            .create_session_with_capabilities(
+                materialized.apply_to_session(config),
+                Some(snapshot.digest().clone()),
+                capabilities,
+            )
+            .await
+    }
+    /// Loads and replays a durable Session under its own capability layer.
+    pub async fn load_session_with_capabilities(
+        &self,
+        id: SessionId,
+        config: SessionConfig,
+        capabilities: CapabilityLayer,
+    ) -> Result<(), Error> {
+        self.inner
+            .load_session_with_capabilities(id, config, None, capabilities)
+            .await
+    }
+    /// Resumes without replay under its own capability layer.
+    pub async fn resume_session_with_capabilities(
+        &self,
+        id: SessionId,
+        config: SessionConfig,
+        capabilities: CapabilityLayer,
+    ) -> Result<(), Error> {
+        self.inner
+            .resume_session_with_capabilities(id, config, None, capabilities)
+            .await
+    }
+    /// Replaces a resident Session's capability layer. The new layer is
+    /// resolved against the general layer and bound in place, so the next Turn
+    /// on this Session — and only this Session — observes it. Rejected during
+    /// an active prompt.
+    pub async fn set_session_capabilities(
+        &self,
+        id: &SessionId,
+        capabilities: CapabilityLayer,
+    ) -> Result<CapabilityResolution, Error> {
+        self.inner.set_session_capabilities(id, capabilities).await
+    }
+    /// Reads the effective capability names bound to a resident Session.
+    pub async fn session_capabilities(
+        &self,
+        id: &SessionId,
+    ) -> Result<CapabilityResolution, Error> {
+        self.inner.session_capabilities(id).await
+    }
     /// Creates the exact caller-selected Session identity, or idempotently
     /// reopens it when the complete configuration matches. This current-only
     /// contract requires a Host [`SessionStateStore`]; a different config or a

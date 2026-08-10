@@ -541,7 +541,50 @@ impl Runtime {
         rx.await.map_err(|_| Error::Shutdown)?
     }
     pub async fn create_session(&self, c: SessionConfig) -> Result<SessionId, Error> {
-        self.call(|r| Command::Create(c, None, r)).await
+        self.call(|r| Command::Create(c, None, CapabilityLayer::default(), r))
+            .await
+    }
+    pub async fn create_session_with_capabilities(
+        &self,
+        c: SessionConfig,
+        digest: Option<HarnessDigest>,
+        layer: CapabilityLayer,
+    ) -> Result<SessionId, Error> {
+        self.call(|r| Command::Create(c, digest, layer, r)).await
+    }
+    pub async fn load_session_with_capabilities(
+        &self,
+        id: SessionId,
+        c: SessionConfig,
+        digest: Option<HarnessDigest>,
+        layer: CapabilityLayer,
+    ) -> Result<(), Error> {
+        self.call(|r| Command::Load(id, c, digest, layer, r)).await
+    }
+    pub async fn resume_session_with_capabilities(
+        &self,
+        id: SessionId,
+        c: SessionConfig,
+        digest: Option<HarnessDigest>,
+        layer: CapabilityLayer,
+    ) -> Result<(), Error> {
+        self.call(|r| Command::Resume(id, c, digest, layer, r))
+            .await
+    }
+    pub async fn set_session_capabilities(
+        &self,
+        id: &SessionId,
+        layer: CapabilityLayer,
+    ) -> Result<CapabilityResolution, Error> {
+        self.call(|r| Command::SetCapabilities(id.clone(), layer, r))
+            .await
+    }
+    pub async fn session_capabilities(
+        &self,
+        id: &SessionId,
+    ) -> Result<CapabilityResolution, Error> {
+        self.call(|r| Command::SessionCapabilities(id.clone(), r))
+            .await
     }
     pub async fn create_session_with_id(
         &self,
@@ -555,10 +598,12 @@ impl Runtime {
         c: SessionConfig,
         digest: HarnessDigest,
     ) -> Result<SessionId, Error> {
-        self.call(|r| Command::Create(c, Some(digest), r)).await
+        self.call(|r| Command::Create(c, Some(digest), CapabilityLayer::default(), r))
+            .await
     }
     pub async fn load_session(&self, id: SessionId, c: SessionConfig) -> Result<(), Error> {
-        self.call(|r| Command::Load(id, c, None, r)).await
+        self.call(|r| Command::Load(id, c, None, CapabilityLayer::default(), r))
+            .await
     }
     pub async fn load_session_with_harness(
         &self,
@@ -566,10 +611,12 @@ impl Runtime {
         c: SessionConfig,
         digest: HarnessDigest,
     ) -> Result<(), Error> {
-        self.call(|r| Command::Load(id, c, Some(digest), r)).await
+        self.call(|r| Command::Load(id, c, Some(digest), CapabilityLayer::default(), r))
+            .await
     }
     pub async fn resume_session(&self, id: SessionId, c: SessionConfig) -> Result<(), Error> {
-        self.call(|r| Command::Resume(id, c, None, r)).await
+        self.call(|r| Command::Resume(id, c, None, CapabilityLayer::default(), r))
+            .await
     }
     pub async fn resume_session_with_harness(
         &self,
@@ -577,7 +624,8 @@ impl Runtime {
         c: SessionConfig,
         digest: HarnessDigest,
     ) -> Result<(), Error> {
-        self.call(|r| Command::Resume(id, c, Some(digest), r)).await
+        self.call(|r| Command::Resume(id, c, Some(digest), CapabilityLayer::default(), r))
+            .await
     }
     pub async fn prompt(
         &self,

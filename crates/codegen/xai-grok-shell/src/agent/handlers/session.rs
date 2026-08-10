@@ -93,6 +93,7 @@ async fn handle_origin_session_unload(
         .unload_session(&sid)
         .await
         .map_err(|reason| acp::Error::internal_error().data(reason))?;
+    crate::agent::session_capabilities::release(sid.0.as_ref());
     crate::extensions::to_raw_response(&serde_json::json!({
         "success": true,
         "drained": drained,

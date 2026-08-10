@@ -1,5 +1,6 @@
 use super::*;
 
+mod capabilities;
 mod command_loop;
 mod evidence;
 mod extensions;
@@ -131,6 +132,7 @@ struct ResidentSessionBinding {
     model: String,
     reasoning: Option<String>,
     harness_digest: Option<HarnessDigest>,
+    capabilities: CapabilityResolution,
 }
 
 impl ResidentSessionBinding {
@@ -138,12 +140,14 @@ impl ResidentSessionBinding {
         config: &SessionConfig,
         effective_reasoning: Option<String>,
         harness_digest: Option<HarnessDigest>,
+        capabilities: CapabilityResolution,
     ) -> Self {
         Self {
             cwd: config.cwd.clone(),
             model: config.model.clone(),
             reasoning: effective_reasoning,
             harness_digest,
+            capabilities,
         }
     }
 }
@@ -205,6 +209,7 @@ pub(super) struct Core {
     retained: Rc<RefCell<HashMap<String, VecDeque<Event>>>>,
     capacity: usize,
     options: RuntimeOptions,
+    general_capabilities: crate::CapabilityLayer,
     resident: RefCell<HashSet<String>>,
     session_bindings: RefCell<HashMap<String, ResidentSessionBinding>>,
     mcp_bindings: Arc<McpBindingRegistry>,

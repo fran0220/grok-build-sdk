@@ -266,6 +266,7 @@ impl Core {
             .await
             .map_err(|error| protocol("initialize", error))?;
         let capabilities = capabilities_for(&options);
+        let general_capabilities = capabilities::general_layer(&options)?;
         Ok((
             Self {
                 agent,
@@ -282,6 +283,7 @@ impl Core {
                 retained,
                 capacity: options.event_journal_capacity,
                 options,
+                general_capabilities,
                 resident: RefCell::new(HashSet::new()),
                 session_bindings: RefCell::new(HashMap::new()),
                 mcp_bindings,

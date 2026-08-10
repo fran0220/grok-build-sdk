@@ -76,6 +76,13 @@ impl RuntimeBuilder {
             .insert(model_id.into(), provider);
         self
     }
+    /// Installs the application-owned general capability layer. Built-ins,
+    /// general skills and general services live here; a Session layer masks a
+    /// general contribution of the same kind and name for that Session only.
+    pub fn general_capabilities(mut self, value: CapabilityLayer) -> Self {
+        self.options.general_capabilities = value;
+        self
+    }
     pub fn agent_services(mut self, value: AgentServiceConfig) -> Self {
         self.options.services.agents = value;
         self

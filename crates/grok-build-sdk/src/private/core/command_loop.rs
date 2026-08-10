@@ -4,17 +4,23 @@ impl Core {
     pub(in crate::private) async fn run(self: Rc<Self>, mut rx: mpsc::UnboundedReceiver<Command>) {
         while let Some(c) = rx.recv().await {
             match c {
-                Command::Create(x, harness_digest, r) => {
-                    let _ = r.send(self.create(x, harness_digest).await);
+                Command::Create(x, harness_digest, layer, r) => {
+                    let _ = r.send(self.create(x, harness_digest, layer).await);
                 }
                 Command::Ensure(id, config, r) => {
                     let _ = r.send(self.ensure(id, config).await);
                 }
-                Command::Load(i, x, harness_digest, r) => {
-                    let _ = r.send(self.load(i, x, harness_digest).await);
+                Command::Load(i, x, harness_digest, layer, r) => {
+                    let _ = r.send(self.load(i, x, harness_digest, layer).await);
                 }
-                Command::Resume(i, x, harness_digest, r) => {
-                    let _ = r.send(self.resume(i, x, harness_digest).await);
+                Command::Resume(i, x, harness_digest, layer, r) => {
+                    let _ = r.send(self.resume(i, x, harness_digest, layer).await);
+                }
+                Command::SetCapabilities(i, layer, r) => {
+                    let _ = r.send(self.set_session_capabilities(i, layer).await);
+                }
+                Command::SessionCapabilities(i, r) => {
+                    let _ = r.send(self.session_capabilities(&i));
                 }
                 Command::Prompt(i, t, x, r) => {
                     if t.trim().is_empty() {

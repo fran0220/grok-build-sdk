@@ -1,11 +1,12 @@
 use crate::{
-    AvailableModel, ConversationRewindReceipt, ConversationRewindStatus, Error, Event, EventUpdate,
-    ExtensionNotification, ExtensionRequest, ExtensionResponse, HarnessDigest, HarnessError,
-    LedgerTurnState, ModelCatalog, Prompt, PromptBlock, PromptReceipt, RewindPoint,
-    RuntimeCapabilities, RuntimeConfig, RuntimeOptions, SessionConfig, SessionEvidenceCommit,
-    SessionEvidenceDocument, SessionEvidenceKey, SessionEvidenceKind, SessionEvidenceStore,
-    SessionEvidenceVersion, SessionId, SessionLedger, SessionLedgerEntry, SessionReplayProbe,
-    TurnBindingKey, TurnBindingReceipt, TurnBindingRecord, TurnBindingStatus, TurnOutcome,
+    AvailableModel, CapabilityLayer, CapabilityResolution, ConversationRewindReceipt,
+    ConversationRewindStatus, Error, Event, EventUpdate, ExtensionNotification, ExtensionRequest,
+    ExtensionResponse, HarnessDigest, HarnessError, LedgerTurnState, ModelCatalog, Prompt,
+    PromptBlock, PromptReceipt, ResolvedCapabilities, RewindPoint, RuntimeCapabilities,
+    RuntimeConfig, RuntimeOptions, SessionConfig, SessionEvidenceCommit, SessionEvidenceDocument,
+    SessionEvidenceKey, SessionEvidenceKind, SessionEvidenceStore, SessionEvidenceVersion,
+    SessionId, SessionLedger, SessionLedgerEntry, SessionReplayProbe, TurnBindingKey,
+    TurnBindingReceipt, TurnBindingRecord, TurnBindingStatus, TurnOutcome, resolve_capabilities,
 };
 use agent_client_protocol as acp;
 use agent_client_protocol::Agent as _;
@@ -78,10 +79,29 @@ enum CapturedTurnUsage {
 
 type TurnUsageMap = Rc<RefCell<HashMap<(String, String), CapturedTurnUsage>>>;
 enum Command {
-    Create(SessionConfig, Option<HarnessDigest>, Reply<SessionId>),
+    Create(
+        SessionConfig,
+        Option<HarnessDigest>,
+        CapabilityLayer,
+        Reply<SessionId>,
+    ),
     Ensure(SessionId, SessionConfig, Reply<SessionId>),
-    Load(SessionId, SessionConfig, Option<HarnessDigest>, Reply<()>),
-    Resume(SessionId, SessionConfig, Option<HarnessDigest>, Reply<()>),
+    Load(
+        SessionId,
+        SessionConfig,
+        Option<HarnessDigest>,
+        CapabilityLayer,
+        Reply<()>,
+    ),
+    Resume(
+        SessionId,
+        SessionConfig,
+        Option<HarnessDigest>,
+        CapabilityLayer,
+        Reply<()>,
+    ),
+    SetCapabilities(SessionId, CapabilityLayer, Reply<CapabilityResolution>),
+    SessionCapabilities(SessionId, Reply<CapabilityResolution>),
     Prompt(SessionId, String, String, Reply<PromptReceipt>),
     PromptContent(SessionId, String, Prompt, Reply<PromptReceipt>),
     PromptBound(

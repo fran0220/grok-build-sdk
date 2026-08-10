@@ -387,7 +387,7 @@ impl MvpAgent {
             None => (None, None),
         };
         let project_trusted = crate::agent::folder_trust::project_scope_allowed(&parent_cwd);
-        let (base_roles, base_personas, subagent_model_overrides, subagent_toggle) = {
+        let (base_roles, base_personas, mut subagent_model_overrides, subagent_toggle) = {
             let cfg = self.cfg.borrow();
             (
                 cfg.subagent_roles.clone(),
@@ -396,6 +396,14 @@ impl MvpAgent {
                 cfg.subagent_toggle.clone(),
             )
         };
+        // A per-session agent-service route masks the global one of the same
+        // name; nested subagents inherit their registered root's layer.
+        let capability_root =
+            crate::origin_runtime::resolve_root_session(parent_session_id, None)
+                .unwrap_or_else(|| parent_session_id.to_owned());
+        subagent_model_overrides.extend(
+            crate::agent::session_capabilities::agent_services_for(&capability_root),
+        );
         let (subagent_roles, subagent_personas) =
             crate::config::SubagentsConfig::effective_definition_maps(
                 &base_roles,

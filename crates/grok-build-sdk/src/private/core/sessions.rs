@@ -54,6 +54,7 @@ impl Core {
         &self,
         config: &SessionConfig,
         effective_reasoning: Option<&str>,
+        capabilities: &ResolvedCapabilities,
     ) -> Result<SessionMeta, Error> {
         let mut meta = serde_json::json!({
             "modelId": config.model,
@@ -72,6 +73,9 @@ impl Core {
         }
         if let Some(rules) = &config.rules {
             meta.insert("rules".into(), serde_json::Value::String(rules.clone()));
+        }
+        if let Some(value) = self.capability_meta(capabilities) {
+            meta.insert("x.ai/sessionCapabilities".into(), value);
         }
         if self.options.profile == crate::RuntimeProfile::Desktop
             && !self.options.agent_hooks.is_empty()
@@ -119,46 +123,19 @@ impl Core {
             .map_err(|error| protocol("session/set_model", error))
     }
 
-    pub(super) fn mcp_servers(&self) -> Vec<acp::McpServer> {
+    /// The Session's effective MCP mounts: the general layer masked by this
+    /// Session's own layer. Restricted runtimes mount nothing.
+    pub(super) fn mcp_servers_for(
+        &self,
+        capabilities: &ResolvedCapabilities,
+    ) -> Vec<acp::McpServer> {
         if self.options.profile == crate::RuntimeProfile::Restricted {
             return Vec::new();
         }
-        self.options
-            .services
-            .mcp_servers
+        capabilities
+            .mcp_services
             .iter()
-            .map(|server| match server {
-                crate::McpServerConfig::Stdio {
-                    name,
-                    command,
-                    args,
-                    env,
-                } => acp::McpServer::Stdio(
-                    acp::McpServerStdio::new(name, command)
-                        .args(args.clone())
-                        .env(
-                            env.iter()
-                                .map(|(name, value)| acp::EnvVariable::new(name, value))
-                                .collect(),
-                        ),
-                ),
-                crate::McpServerConfig::Http { name, url, headers } => acp::McpServer::Http(
-                    acp::McpServerHttp::new(name, url).headers(
-                        headers
-                            .iter()
-                            .map(|(name, value)| acp::HttpHeader::new(name, value))
-                            .collect(),
-                    ),
-                ),
-                crate::McpServerConfig::Sse { name, url, headers } => acp::McpServer::Sse(
-                    acp::McpServerSse::new(name, url).headers(
-                        headers
-                            .iter()
-                            .map(|(name, value)| acp::HttpHeader::new(name, value))
-                            .collect(),
-                    ),
-                ),
-            })
+            .map(to_acp_mcp_server)
             .collect()
     }
     pub(super) fn emit(&self, id: &SessionId, u: EventUpdate, t: Option<String>) {
@@ -211,16 +188,25 @@ impl Core {
         &self,
         config: SessionConfig,
         harness_digest: Option<HarnessDigest>,
+        layer: crate::CapabilityLayer,
     ) -> Result<SessionId, Error> {
         self.check(&config)?;
+        let capabilities = self.resolve_capabilities(&layer)?;
         if self.session_state_store.is_some() {
             let id = SessionId(uuid::Uuid::now_v7().to_string());
             let generation = uuid::Uuid::now_v7().to_string();
             let lease = self.acquire_session_lease(&id)?;
-            self.create_inner(config, harness_digest, Some((id, generation)), lease)
-                .await
+            self.create_inner(
+                config,
+                harness_digest,
+                capabilities,
+                Some((id, generation)),
+                lease,
+            )
+            .await
         } else {
-            self.create_inner(config, harness_digest, None, None).await
+            self.create_inner(config, harness_digest, capabilities, None, None)
+                .await
         }
     }
 
@@ -264,15 +250,23 @@ impl Core {
         let generation = format!("config-sha256:{:x}", Sha256::digest(exact));
         match authority.inspect(id.as_str()).map_err(op)? {
             xai_grok_shell::session::state_authority::SessionInspection::Vacant => {
-                self.create_inner(config, None, Some((id, generation)), lease)
+                let capabilities = self.resolve_capabilities(&crate::CapabilityLayer::default())?;
+                self.create_inner(config, None, capabilities, Some((id, generation)), lease)
                     .await
             }
             xai_grok_shell::session::state_authority::SessionInspection::Live {
                 generation: current,
             } if current == generation => {
                 if !already_resident {
-                    self.attach_with_lease(id.clone(), config, None, false, lease)
-                        .await?;
+                    self.attach_with_lease(
+                        id.clone(),
+                        config,
+                        None,
+                        crate::CapabilityLayer::default(),
+                        false,
+                        lease,
+                    )
+                    .await?;
                 }
                 Ok(id)
             }
@@ -291,6 +285,7 @@ impl Core {
         &self,
         config: SessionConfig,
         harness_digest: Option<HarnessDigest>,
+        capabilities: ResolvedCapabilities,
         requested: Option<(SessionId, String)>,
         lease: Option<Box<dyn crate::SessionStateLease>>,
     ) -> Result<SessionId, Error> {
@@ -301,9 +296,13 @@ impl Core {
             .map(|id| SessionLeaseAdmission::new(&self.session_leases, id, lease));
         let effective_reasoning =
             self.effective_reasoning(&config.model, config.reasoning.as_deref())?;
-        let binding =
-            ResidentSessionBinding::new(&config, effective_reasoning.clone(), harness_digest);
-        let mut meta = self.session_meta(&config, effective_reasoning.as_deref())?;
+        let binding = ResidentSessionBinding::new(
+            &config,
+            effective_reasoning.clone(),
+            harness_digest,
+            capabilities.resolution.clone(),
+        );
+        let mut meta = self.session_meta(&config, effective_reasoning.as_deref(), &capabilities)?;
         if let Some((id, generation)) = &requested {
             meta.insert("sessionId".into(), serde_json::Value::String(id.0.clone()));
             meta.insert(
@@ -318,7 +317,7 @@ impl Core {
             .agent
             .new_session(
                 acp::NewSessionRequest::new(config.cwd.clone())
-                    .mcp_servers(self.mcp_servers())
+                    .mcp_servers(self.mcp_servers_for(&capabilities))
                     .meta(meta),
             )
             .await
@@ -389,8 +388,9 @@ impl Core {
         id: SessionId,
         config: SessionConfig,
         harness_digest: Option<HarnessDigest>,
+        layer: crate::CapabilityLayer,
     ) -> Result<(), Error> {
-        self.attach(id, config, harness_digest, false).await
+        self.attach(id, config, harness_digest, layer, false).await
     }
 
     pub(super) async fn resume(
@@ -398,8 +398,9 @@ impl Core {
         id: SessionId,
         config: SessionConfig,
         harness_digest: Option<HarnessDigest>,
+        layer: crate::CapabilityLayer,
     ) -> Result<(), Error> {
-        self.attach(id, config, harness_digest, true).await
+        self.attach(id, config, harness_digest, layer, true).await
     }
 
     pub(super) async fn attach(
@@ -407,11 +408,12 @@ impl Core {
         id: SessionId,
         config: SessionConfig,
         harness_digest: Option<HarnessDigest>,
+        layer: crate::CapabilityLayer,
         resume: bool,
     ) -> Result<(), Error> {
         self.check(&config)?;
         let lease = self.acquire_session_lease(&id)?;
-        self.attach_with_lease(id, config, harness_digest, resume, lease)
+        self.attach_with_lease(id, config, harness_digest, layer, resume, lease)
             .await
     }
 
@@ -420,10 +422,12 @@ impl Core {
         id: SessionId,
         config: SessionConfig,
         harness_digest: Option<HarnessDigest>,
+        layer: crate::CapabilityLayer,
         resume: bool,
         lease: Option<Box<dyn crate::SessionStateLease>>,
     ) -> Result<(), Error> {
         self.check(&config)?;
+        let capabilities = self.resolve_capabilities(&layer)?;
         let mut lease_admission = SessionLeaseAdmission::new(&self.session_leases, &id, lease);
         if self.resident.borrow().contains(&id.0) {
             return Err(Error::Operation("session is already resident".into()));
@@ -431,10 +435,14 @@ impl Core {
         self.load_ledger(&id)?;
         let effective_reasoning =
             self.effective_reasoning(&config.model, config.reasoning.as_deref())?;
-        let binding =
-            ResidentSessionBinding::new(&config, effective_reasoning.clone(), harness_digest);
+        let binding = ResidentSessionBinding::new(
+            &config,
+            effective_reasoning.clone(),
+            harness_digest,
+            capabilities.resolution.clone(),
+        );
         let active_guard = ActiveMcpBindingGuard::new(self.mcp_bindings.clone(), id.0.clone());
-        let meta = self.session_meta(&config, effective_reasoning.as_deref())?;
+        let meta = self.session_meta(&config, effective_reasoning.as_deref(), &capabilities)?;
         struct ReplayGuard<'a>(&'a RefCell<HashMap<String, ReplayMode>>, String);
         impl Drop for ReplayGuard<'_> {
             fn drop(&mut self) {
@@ -456,7 +464,7 @@ impl Core {
             self.agent
                 .resume_session(
                     acp::ResumeSessionRequest::new(acp::SessionId::new(id.0.clone()), config.cwd)
-                        .mcp_servers(self.mcp_servers())
+                        .mcp_servers(self.mcp_servers_for(&capabilities))
                         .meta(meta),
                 )
                 .await
@@ -465,7 +473,7 @@ impl Core {
             self.agent
                 .load_session(
                     acp::LoadSessionRequest::new(acp::SessionId::new(id.0.clone()), config.cwd)
-                        .mcp_servers(self.mcp_servers())
+                        .mcp_servers(self.mcp_servers_for(&capabilities))
                         .meta(meta),
                 )
                 .await

@@ -137,6 +137,9 @@ pub struct RuntimeOptions {
     pub skill_paths: Vec<PathBuf>,
     pub plugin_paths: Vec<PathBuf>,
     pub services: RuntimeServices,
+    /// Application-owned general capability layer. A Session's own layer masks
+    /// a general contribution of the same kind and name for that Session only.
+    pub general_capabilities: CapabilityLayer,
     pub host: Option<Arc<dyn HostDelegate>>,
     pub tool_permission_handler: Option<Arc<dyn ToolPermissionHandler>>,
     pub mcp_host_services: xai_grok_mcp::servers::McpHostServices,
@@ -154,6 +157,7 @@ impl Default for RuntimeOptions {
             skill_paths: Vec::new(),
             plugin_paths: Vec::new(),
             services: RuntimeServices::default(),
+            general_capabilities: CapabilityLayer::default(),
             host: None,
             tool_permission_handler: None,
             mcp_host_services: xai_grok_mcp::servers::McpHostServices::default(),
