@@ -93,7 +93,12 @@ enum Command {
     ),
     ListModels(Reply<ModelCatalog>),
     Extension(ExtensionRequest, Reply<ExtensionResponse>),
-    Fork(SessionId, ExtensionRequest, Reply<ExtensionResponse>),
+    Fork(
+        SessionId,
+        SessionId,
+        ExtensionRequest,
+        Reply<ExtensionResponse>,
+    ),
     ExtensionNotification(ExtensionNotification, Reply<()>),
     SetMode(SessionId, String, Reply<()>),
     ListSessions(Reply<serde_json::Value>),
@@ -730,10 +735,11 @@ impl Runtime {
     }
     pub async fn fork_session(
         &self,
+        source: SessionId,
         target: SessionId,
         request: ExtensionRequest,
     ) -> Result<ExtensionResponse, Error> {
-        self.call(|reply| Command::Fork(target, request, reply))
+        self.call(|reply| Command::Fork(source, target, request, reply))
             .await
     }
     pub async fn extension_notification(&self, x: ExtensionNotification) -> Result<(), Error> {
@@ -2057,6 +2063,10 @@ struct UnloadWire {
     drained: bool,
 }
 
+fn close_outcome_releases_lease(outcome: Option<&str>) -> bool {
+    matches!(outcome, Some("closed" | "notResident"))
+}
+
 struct TurnReservation {
     turns: Rc<RefCell<HashMap<String, String>>>,
     turn_usages: TurnUsageMap,
@@ -2134,6 +2144,14 @@ struct SessionLeaseAdmission<'a> {
     leases: &'a RefCell<HashMap<String, Box<dyn crate::SessionStateLease>>>,
     id: String,
     lease: Option<Box<dyn crate::SessionStateLease>>,
+    state: LeaseAdmissionState,
+}
+
+#[derive(Clone, Copy)]
+enum LeaseAdmissionState {
+    Release,
+    CommitResident,
+    Quarantine,
 }
 
 impl<'a> SessionLeaseAdmission<'a> {
@@ -2146,14 +2164,33 @@ impl<'a> SessionLeaseAdmission<'a> {
             leases,
             id: id.0.clone(),
             lease,
+            state: LeaseAdmissionState::Release,
         }
+    }
+
+    fn dispatch_uncertain(&mut self) {
+        self.state = LeaseAdmissionState::Quarantine;
+    }
+
+    fn release(&mut self) {
+        self.state = LeaseAdmissionState::Release;
+    }
+
+    fn commit_resident(&mut self) {
+        self.state = LeaseAdmissionState::CommitResident;
     }
 }
 
 impl Drop for SessionLeaseAdmission<'_> {
     fn drop(&mut self) {
         if let Some(lease) = self.lease.take() {
-            self.leases.borrow_mut().insert(self.id.clone(), lease);
+            match self.state {
+                LeaseAdmissionState::Release => drop(lease),
+                LeaseAdmissionState::CommitResident => {
+                    self.leases.borrow_mut().insert(self.id.clone(), lease);
+                }
+                LeaseAdmissionState::Quarantine => quarantine_session_leases(vec![lease]),
+            }
         }
     }
 }
@@ -3246,8 +3283,8 @@ impl Core {
                 Command::Extension(x, r) => {
                     let _ = r.send(self.extension_raw(x).await);
                 }
-                Command::Fork(target, request, reply) => {
-                    let _ = reply.send(self.fork(target, request).await);
+                Command::Fork(source, target, request, reply) => {
+                    let _ = reply.send(self.fork(source, target, request).await);
                 }
                 Command::ExtensionNotification(x, r) => {
                     let _ = r.send(self.extension_notification(x).await);
@@ -3704,7 +3741,7 @@ impl Core {
     ) -> Result<SessionId, Error> {
         self.check(&config)?;
         let lease_id = requested.as_ref().map(|(id, _)| id).cloned();
-        let _lease_admission = lease_id
+        let mut lease_admission = lease_id
             .as_ref()
             .map(|id| SessionLeaseAdmission::new(&self.session_leases, id, lease));
         let effective_reasoning =
@@ -3717,6 +3754,9 @@ impl Core {
                 "sessionStateGeneration".into(),
                 serde_json::Value::String(generation.clone()),
             );
+        }
+        if let Some(admission) = &mut lease_admission {
+            admission.dispatch_uncertain();
         }
         let x = self
             .agent
@@ -3736,7 +3776,12 @@ impl Core {
             .await
         {
             return match self.detach_unregistered_session(&id).await {
-                Ok(()) => Err(error),
+                Ok(()) => {
+                    if let Some(admission) = &mut lease_admission {
+                        admission.release();
+                    }
+                    Err(error)
+                }
                 Err(cleanup_error) => Err(Error::Operation(format!(
                     "{error}; native session cleanup failed: {cleanup_error}"
                 ))),
@@ -3745,7 +3790,12 @@ impl Core {
         let active_guard = ActiveMcpBindingGuard::new(self.mcp_bindings.clone(), id.0.clone());
         if let Err(error) = self.save_ledger(&id, &SessionLedger::default()) {
             return match self.detach_unregistered_session(&id).await {
-                Ok(()) => Err(error),
+                Ok(()) => {
+                    if let Some(admission) = &mut lease_admission {
+                        admission.release();
+                    }
+                    Err(error)
+                }
                 Err(cleanup_error) => Err(Error::Operation(format!(
                     "{error}; native session cleanup failed: {cleanup_error}"
                 ))),
@@ -3755,8 +3805,15 @@ impl Core {
             let cleanup = self.detach_unregistered_session(&id).await;
             let mut detail =
                 "native session identity collided with an existing embedded root".to_owned();
-            if let Err(error) = cleanup {
-                detail.push_str(&format!("; native session cleanup failed: {error}"));
+            match cleanup {
+                Ok(()) => {
+                    if let Some(admission) = &mut lease_admission {
+                        admission.release();
+                    }
+                }
+                Err(error) => {
+                    detail.push_str(&format!("; native session cleanup failed: {error}"));
+                }
             }
             return Err(Error::Operation(detail));
         }
@@ -3765,6 +3822,9 @@ impl Core {
             .borrow_mut()
             .insert(id.0.clone(), binding);
         active_guard.commit();
+        if let Some(admission) = &mut lease_admission {
+            admission.commit_resident();
+        }
         self.emit(&id, EventUpdate::SessionStarted, None);
         Ok(id)
     }
@@ -3808,7 +3868,7 @@ impl Core {
         lease: Option<Box<dyn crate::SessionStateLease>>,
     ) -> Result<(), Error> {
         self.check(&config)?;
-        let _lease_admission = SessionLeaseAdmission::new(&self.session_leases, &id, lease);
+        let mut lease_admission = SessionLeaseAdmission::new(&self.session_leases, &id, lease);
         if self.resident.borrow().contains(&id.0) {
             return Err(Error::Operation("session is already resident".into()));
         }
@@ -3834,6 +3894,7 @@ impl Core {
             },
         );
         let _guard = ReplayGuard(&self.replay, id.0.clone());
+        lease_admission.dispatch_uncertain();
         if resume {
             self.agent
                 .resume_session(
@@ -3855,9 +3916,12 @@ impl Core {
         }
         if !xai_grok_shell::origin_runtime::register_root_session(&id.0) {
             return match self.detach_unregistered_session(&id).await {
-                Ok(()) => Err(Error::Operation(
-                    "loaded session identity collided with an existing embedded root".into(),
-                )),
+                Ok(()) => {
+                    lease_admission.release();
+                    Err(Error::Operation(
+                        "loaded session identity collided with an existing embedded root".into(),
+                    ))
+                }
                 Err(cleanup_error) => Err(Error::Operation(format!(
                     "loaded session identity collided with an existing embedded root; native session cleanup failed: {cleanup_error}"
                 ))),
@@ -3868,6 +3932,7 @@ impl Core {
             .borrow_mut()
             .insert(id.0.clone(), binding);
         active_guard.commit();
+        lease_admission.commit_resident();
         Ok(())
     }
     async fn prompt(&self, id: SessionId, t: String, x: String) -> Result<PromptReceipt, Error> {
@@ -4480,7 +4545,9 @@ impl Core {
                 | "origin/session/unload"
                 | "x.ai/session/close"
                 | "x.ai/session/fork"
-        ) {
+        ) || self.session_state_store.is_some()
+            && request.method == "x.ai/git/worktree/resume_session"
+        {
             return Err(Error::Operation(
                 "Session lifecycle methods require their typed Runtime operation".into(),
             ));
@@ -4503,10 +4570,46 @@ impl Core {
     }
     async fn fork(
         &self,
+        source: SessionId,
         target: SessionId,
         request: ExtensionRequest,
     ) -> Result<ExtensionResponse, Error> {
-        let _lease = self.acquire_session_lease(&target)?;
+        if source == target {
+            return Err(Error::InvalidConfig(
+                "fork source and target must be different".into(),
+            ));
+        }
+        // The store leases are fail-fast. Acquire absent identities in stable
+        // full-id order; a resident source's lease is borrowed, never removed.
+        let source_resident = self.resident.borrow().contains(source.as_str());
+        let source_held = self.session_leases.borrow().contains_key(source.as_str());
+        if self.session_state_store.is_some() {
+            match (source_resident, source_held) {
+                (true, false) => {
+                    return Err(Error::Operation(
+                        "resident fork source is missing its authority lease".into(),
+                    ));
+                }
+                (false, true) => {
+                    return Err(Error::Operation(
+                        "fork source teardown is uncertain; its authority lease remains retained"
+                            .into(),
+                    ));
+                }
+                _ => {}
+            }
+        }
+        let mut ids = vec![target.clone()];
+        if !source_resident {
+            ids.push(source);
+        }
+        ids.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+        let mut _leases = Vec::with_capacity(ids.len());
+        for id in ids {
+            if let Some(lease) = self.acquire_session_lease(&id)? {
+                _leases.push(lease);
+            }
+        }
         self.extension_raw_unchecked(request).await
     }
     async fn extension_notification(&self, request: ExtensionNotification) -> Result<(), Error> {
@@ -4971,14 +5074,36 @@ impl Core {
         if self.turns.borrow().contains_key(&id.0) {
             self.cancel(id.clone()).await?;
         }
-        self.agent
+        let response = match self
+            .agent
             .close_session(acp::CloseSessionRequest::new(acp::SessionId::new(
                 id.0.clone(),
             )))
             .await
-            .map_err(|error| protocol("session/close", error))?;
-        self.finish_close(&id, true);
-        Ok(())
+        {
+            Ok(response) => response,
+            Err(error) => {
+                self.mark_close_uncertain(&id);
+                return Err(protocol("session/close", error));
+            }
+        };
+        let outcome = response
+            .meta
+            .as_ref()
+            .and_then(|meta| meta.get("x.ai/closeOutcome"))
+            .and_then(serde_json::Value::as_str);
+        if close_outcome_releases_lease(outcome) {
+            self.finish_close(&id, true);
+            Ok(())
+        } else {
+            if outcome != Some("superseded") {
+                self.mark_close_uncertain(&id);
+            }
+            Err(Error::Operation(format!(
+                "native session close was not positively confirmed (outcome: {})",
+                outcome.unwrap_or("missing")
+            )))
+        }
     }
     async fn delete(&self, id: SessionId) -> Result<(), Error> {
         if self.resident.borrow().contains(&id.0) {
@@ -5054,6 +5179,16 @@ impl Core {
         self.turns.borrow_mut().remove(&id.0);
         self.replay.borrow_mut().remove(&id.0);
         xai_grok_shell::origin_runtime::unregister_session_tree(&id.0);
+    }
+
+    fn mark_close_uncertain(&self, id: &SessionId) {
+        self.resident.borrow_mut().remove(&id.0);
+        self.session_bindings.borrow_mut().remove(&id.0);
+        self.mcp_bindings.revoke_session(&id.0);
+        self.turns.borrow_mut().remove(&id.0);
+        self.replay.borrow_mut().remove(&id.0);
+        // Keep both the authority lease and root registration: either may
+        // still cover an actor whose close result was commit-unknown.
     }
 }
 fn validate(c: &RuntimeConfig, options: &RuntimeOptions) -> Result<(), Error> {
@@ -5528,6 +5663,56 @@ mod tests {
         let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
         quarantine_session_leases(vec![Box::new(LeaseDropSpy(dropped.clone()))]);
         assert!(!dropped.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn session_lease_admission_releases_safe_failures_and_commits_only_residency() {
+        let leases = RefCell::new(HashMap::new());
+        let id = SessionId("admission-state".into());
+
+        let safe_dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        drop(SessionLeaseAdmission::new(
+            &leases,
+            &id,
+            Some(Box::new(LeaseDropSpy(safe_dropped.clone()))),
+        ));
+        assert!(safe_dropped.load(Ordering::Acquire));
+        assert!(leases.borrow().is_empty());
+
+        let resident_dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut resident = SessionLeaseAdmission::new(
+            &leases,
+            &id,
+            Some(Box::new(LeaseDropSpy(resident_dropped.clone()))),
+        );
+        resident.commit_resident();
+        drop(resident);
+        assert!(!resident_dropped.load(Ordering::Acquire));
+        assert!(leases.borrow_mut().remove(id.as_str()).is_some());
+        assert!(resident_dropped.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn uncertain_session_lease_admission_does_not_reopen_identity() {
+        let leases = RefCell::new(HashMap::new());
+        let id = SessionId("uncertain-admission".into());
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut admission =
+            SessionLeaseAdmission::new(&leases, &id, Some(Box::new(LeaseDropSpy(dropped.clone()))));
+        admission.dispatch_uncertain();
+        drop(admission);
+        assert!(!dropped.load(Ordering::Acquire));
+        assert!(leases.borrow().is_empty());
+    }
+
+    #[test]
+    fn facade_close_releases_only_positively_verified_outcomes() {
+        assert!(close_outcome_releases_lease(Some("closed")));
+        assert!(close_outcome_releases_lease(Some("notResident")));
+        assert!(!close_outcome_releases_lease(Some("superseded")));
+        assert!(!close_outcome_releases_lease(Some("drainTimedOut")));
+        assert!(!close_outcome_releases_lease(None));
+        assert!(!close_outcome_releases_lease(Some("futureOutcome")));
     }
 
     #[test]

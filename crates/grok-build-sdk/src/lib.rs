@@ -1697,6 +1697,51 @@ pub struct ForkSessionReceipt {
     pub new_model_id: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WorktreeCopyMode {
+    Clean,
+    #[default]
+    Dirty,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WorktreeType {
+    #[default]
+    Linked,
+    Standalone,
+    Git,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ResumeSessionInWorktreeRequest {
+    pub source_cwd: PathBuf,
+    #[serde(default)]
+    pub copy_mode: WorktreeCopyMode,
+    #[serde(default)]
+    pub worktree_type: Option<WorktreeType>,
+    #[serde(default)]
+    pub restore_code: Option<bool>,
+    #[serde(default)]
+    pub git_ref: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResumeSessionInWorktreeReceipt {
+    pub session_id: SessionId,
+    pub worktree_path: PathBuf,
+    pub effective_cwd: PathBuf,
+    pub remote_restored: bool,
+    pub parent_session_id: SessionId,
+    pub chat_messages_copied: usize,
+    pub updates_copied: usize,
+    pub code_restored: bool,
+    pub restore_summary: Option<String>,
+    pub restore_degree: Option<String>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct WorkflowInfo {
     pub name: String,
@@ -2548,6 +2593,7 @@ impl Runtime {
         let value = self
             .inner
             .fork_session(
+                source.clone(),
                 SessionId::from_stored(target.clone()),
                 ExtensionRequest {
                     method: "x.ai/session/fork".into(),
@@ -2567,6 +2613,41 @@ impl Runtime {
             .result;
         serde_json::from_value(value)
             .map_err(|e| Error::Operation(format!("invalid session/fork response: {e}")))
+    }
+    /// Resumes a persisted Session in a new worktree. Host-authority mode
+    /// fences both the source and the selected target for the complete copy.
+    pub async fn resume_session_in_worktree(
+        &self,
+        source: &SessionId,
+        request: &ResumeSessionInWorktreeRequest,
+    ) -> Result<ResumeSessionInWorktreeReceipt, Error> {
+        let target = SessionId::from_stored(uuid::Uuid::now_v7().to_string());
+        let response = self
+            .inner
+            .fork_session(
+                source.clone(),
+                target.clone(),
+                ExtensionRequest {
+                    method: "x.ai/git/worktree/resume_session".into(),
+                    params: serde_json::json!({
+                        "sessionId": source.as_str(),
+                        "sourceCwd": request.source_cwd,
+                        "copyMode": request.copy_mode,
+                        "worktreeType": request.worktree_type,
+                        "restoreCode": request.restore_code,
+                        "gitRef": request.git_ref,
+                        "newSessionId": target.as_str(),
+                    }),
+                },
+            )
+            .await?
+            .result;
+        if let Some(error) = response.get("error").filter(|error| !error.is_null()) {
+            return Err(Error::Operation(format!("worktree resume failed: {error}")));
+        }
+        let value = response.get("result").cloned().unwrap_or(response);
+        serde_json::from_value(value)
+            .map_err(|error| Error::Operation(format!("invalid worktree resume response: {error}")))
     }
     /// Lists launchable workflows for this live session.
     pub async fn list_workflows(&self, id: &SessionId) -> Result<Vec<WorkflowInfo>, Error> {
@@ -7896,6 +7977,18 @@ done
                 std::sync::mpsc::Receiver<()>,
             )>,
         >,
+        inspect_pause: Mutex<
+            Option<(
+                std::sync::mpsc::SyncSender<()>,
+                std::sync::mpsc::Receiver<()>,
+            )>,
+        >,
+        lease_pause: Mutex<
+            Option<(
+                std::sync::mpsc::SyncSender<()>,
+                std::sync::mpsc::Receiver<()>,
+            )>,
+        >,
         inspect_calls: std::sync::atomic::AtomicU64,
         lease_conflicts: std::sync::atomic::AtomicU64,
         observed_sidecar_before_delete: AtomicBool,
@@ -7915,6 +8008,8 @@ done
                 behavior: Mutex::new(DeleteProbeBehavior::Normal),
                 sidecar: Mutex::new(None),
                 delete_pause: Mutex::new(None),
+                inspect_pause: Mutex::new(None),
+                lease_pause: Mutex::new(None),
                 inspect_calls: std::sync::atomic::AtomicU64::new(0),
                 lease_conflicts: std::sync::atomic::AtomicU64::new(0),
                 observed_sidecar_before_delete: AtomicBool::new(false),
@@ -7940,6 +8035,30 @@ done
             *self.delete_pause.lock().unwrap() = Some((entered_tx, release_rx));
             (entered_rx, release_tx)
         }
+
+        fn pause_next_inspect(
+            &self,
+        ) -> (
+            std::sync::mpsc::Receiver<()>,
+            std::sync::mpsc::SyncSender<()>,
+        ) {
+            let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(0);
+            let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
+            *self.inspect_pause.lock().unwrap() = Some((entered_tx, release_rx));
+            (entered_rx, release_tx)
+        }
+
+        fn pause_next_lease(
+            &self,
+        ) -> (
+            std::sync::mpsc::Receiver<()>,
+            std::sync::mpsc::SyncSender<()>,
+        ) {
+            let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(0);
+            let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
+            *self.lease_pause.lock().unwrap() = Some((entered_tx, release_rx));
+            (entered_rx, release_tx)
+        }
     }
 
     impl SessionStateStore for DeleteProbeStore {
@@ -7950,12 +8069,19 @@ done
             let result = self.inner.acquire_session_lease(key);
             if result.is_err() {
                 self.lease_conflicts.fetch_add(1, Ordering::AcqRel);
+            } else if let Some((entered, release)) = self.lease_pause.lock().unwrap().take() {
+                entered.send(()).expect("lease observer remains live");
+                release.recv().expect("lease release remains live");
             }
             result
         }
 
         fn inspect_slot(&self, key: &SessionKey) -> Result<SessionSlot, SessionStateStoreError> {
             self.inspect_calls.fetch_add(1, Ordering::AcqRel);
+            if let Some((entered, release)) = self.inspect_pause.lock().unwrap().take() {
+                entered.send(()).expect("inspect observer remains live");
+                release.recv().expect("inspect release remains live");
+            }
             self.inner.inspect_slot(key)
         }
 
@@ -8221,6 +8347,306 @@ done
         assert!(runtime_b.unload_session(id).await.is_err());
         runtime_a.shutdown().await.expect("Runtime A shuts down");
         runtime_b.shutdown().await.expect("Runtime B shuts down");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn fork_holds_unloaded_source_and_target_leases_through_publication() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let server = MockInferenceServer::start().await.expect("mock server");
+        let root = TempDir::new().expect("temp root");
+        let workspace = root.path().join("workspace");
+        let child_workspace = root.path().join("child-workspace");
+        std::fs::create_dir(&workspace).expect("workspace");
+        std::fs::create_dir(&child_workspace).expect("child workspace");
+        let config = runtime_config(&root, server.url());
+        let store = Arc::new(DeleteProbeStore::new(root.path().join("host-state")));
+        let (runtime_a, _) = Runtime::builder(config.clone())
+            .session_state_store(store.clone())
+            .start()
+            .await
+            .expect("Runtime A starts");
+        let (runtime_b, _) = Runtime::builder(config)
+            .session_state_store(store.clone())
+            .start()
+            .await
+            .expect("Runtime B starts");
+        let source = runtime_a
+            .create_session(session_config(workspace.clone()))
+            .await
+            .expect("source session");
+        runtime_a
+            .unload_session(source.clone())
+            .await
+            .expect("source unloads so fork must acquire it temporarily");
+        let target = uuid::Uuid::now_v7().to_string();
+        let request = ForkSessionRequest {
+            source_cwd: workspace,
+            new_cwd: child_workspace,
+            new_session_id: Some(target.clone()),
+            new_model_id: None,
+            target_prompt_index: None,
+            session_kind: None,
+            source_workspace_dir: None,
+        };
+        let (inspect_entered, release_inspect) = store.pause_next_inspect();
+        let forking = {
+            let runtime = runtime_a.clone();
+            let source = source.clone();
+            tokio::spawn(async move { runtime.fork_session(&source, &request).await })
+        };
+        tokio::task::spawn_blocking(move || inspect_entered.recv())
+            .await
+            .expect("inspect observer joins")
+            .expect("fork pauses after both leases and before authority traversal");
+
+        assert!(
+            runtime_b.delete_session(source.clone()).await.is_err(),
+            "source deletion must fail fast while fork traverses source authority"
+        );
+        assert!(store.lease_conflicts.load(Ordering::Acquire) >= 1);
+        release_inspect.send(()).expect("release fork inspection");
+        let receipt = forking
+            .await
+            .expect("fork task joins")
+            .expect("fork publishes while both identities remain fenced");
+        assert_eq!(receipt.new_session_id.as_str(), target);
+        assert_eq!(receipt.parent_session_id, source);
+
+        runtime_a.shutdown().await.expect("Runtime A shuts down");
+        runtime_b.shutdown().await.expect("Runtime B shuts down");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn reverse_forks_fail_fast_without_order_deadlock() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let server = MockInferenceServer::start().await.expect("mock server");
+        let root = TempDir::new().expect("temp root");
+        let workspace = root.path().join("workspace");
+        std::fs::create_dir(&workspace).expect("workspace");
+        let config = runtime_config(&root, server.url());
+        let store = Arc::new(DeleteProbeStore::new(root.path().join("host-state")));
+        let (runtime_a, _) = Runtime::builder(config.clone())
+            .session_state_store(store.clone())
+            .start()
+            .await
+            .expect("Runtime A starts");
+        let (runtime_b, _) = Runtime::builder(config.clone())
+            .session_state_store(store.clone())
+            .start()
+            .await
+            .expect("Runtime B starts");
+        let low = SessionId::from_stored("00000000-0000-7000-8000-000000000001");
+        let high = SessionId::from_stored("ffffffff-ffff-7fff-bfff-ffffffffffff");
+        let session = session_config(workspace.clone());
+        runtime_a
+            .create_session_with_id(low.clone(), session.clone())
+            .await
+            .expect("low source");
+        runtime_a
+            .unload_session(low.clone())
+            .await
+            .expect("low unloads");
+        runtime_a
+            .create_session_with_id(high.clone(), session)
+            .await
+            .expect("high source");
+        runtime_a
+            .unload_session(high.clone())
+            .await
+            .expect("high unloads");
+        let low_summary = find_session_dir(&config.session_storage, &low).join("summary.json");
+        let high_summary = find_session_dir(&config.session_storage, &high).join("summary.json");
+        let low_summary_before = std::fs::read(&low_summary).expect("low summary");
+        let high_summary_before = std::fs::read(&high_summary).expect("high summary");
+        let low_to_high = ForkSessionRequest {
+            source_cwd: workspace.clone(),
+            new_cwd: root.path().join("high-target"),
+            new_session_id: Some(high.as_str().to_owned()),
+            new_model_id: None,
+            target_prompt_index: None,
+            session_kind: None,
+            source_workspace_dir: None,
+        };
+        let high_to_low = ForkSessionRequest {
+            source_cwd: workspace,
+            new_cwd: root.path().join("low-target"),
+            new_session_id: Some(low.as_str().to_owned()),
+            new_model_id: None,
+            target_prompt_index: None,
+            session_kind: None,
+            source_workspace_dir: None,
+        };
+        let (lease_entered, release_lease) = store.pause_next_lease();
+        let a = tokio::spawn({
+            let runtime = runtime_a.clone();
+            let low = low.clone();
+            async move { runtime.fork_session(&low, &low_to_high).await }
+        });
+        tokio::task::spawn_blocking(move || lease_entered.recv())
+            .await
+            .expect("lease observer joins")
+            .expect("first fork pauses while holding the lower ordered identity");
+        let b = tokio::spawn({
+            let runtime = runtime_b.clone();
+            let high = high.clone();
+            async move { runtime.fork_session(&high, &high_to_low).await }
+        });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(2), b)
+                .await
+                .expect("reverse fork must fail fast, never wait for the lower lease")
+                .expect("B joins")
+                .is_err()
+        );
+        release_lease.send(()).expect("release lower lease");
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(5), a)
+                .await
+                .expect("A completes after its ordered lease is released")
+                .expect("A joins")
+                .is_err()
+        );
+        assert!(store.lease_conflicts.load(Ordering::Acquire) >= 1);
+        assert_eq!(
+            std::fs::read(low_summary).expect("low summary survives"),
+            low_summary_before
+        );
+        assert_eq!(
+            std::fs::read(high_summary).expect("high summary survives"),
+            high_summary_before
+        );
+
+        runtime_a.shutdown().await.expect("Runtime A shuts down");
+        runtime_b.shutdown().await.expect("Runtime B shuts down");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn host_worktree_resume_denies_raw_bypass_and_typed_path_is_fenced() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let server = MockInferenceServer::start().await.expect("mock server");
+        let root = TempDir::new().expect("temp root");
+        let config = runtime_config(&root, server.url());
+        let store = Arc::new(DeleteProbeStore::new(root.path().join("host-state")));
+        let (runtime_a, _) = Runtime::builder(config.clone())
+            .session_state_store(store.clone())
+            .start()
+            .await
+            .expect("Runtime A starts");
+        let (runtime_b, _) = Runtime::builder(config)
+            .profile(RuntimeProfile::Desktop)
+            .session_state_store(store.clone())
+            .start()
+            .await
+            .expect("Runtime B starts");
+        let workspace = root.path().join("workspace");
+        std::fs::create_dir(&workspace).expect("workspace");
+        let source = runtime_a
+            .create_session(session_config(workspace.clone()))
+            .await
+            .expect("Runtime A owns source");
+        let error = runtime_b
+            .extension_request(ExtensionRequest {
+                method: "x.ai/git/worktree/resume_session".into(),
+                params: serde_json::json!({}),
+            })
+            .await
+            .expect_err("Host generic lifecycle transport is denied");
+        assert!(error.to_string().contains("typed Runtime operation"));
+        let conflicts = store.lease_conflicts.load(Ordering::Acquire);
+        let typed = runtime_b
+            .resume_session_in_worktree(
+                &source,
+                &ResumeSessionInWorktreeRequest {
+                    source_cwd: workspace,
+                    copy_mode: WorktreeCopyMode::Clean,
+                    worktree_type: None,
+                    restore_code: Some(false),
+                    git_ref: None,
+                },
+            )
+            .await;
+        assert!(typed.is_err(), "typed path must acquire the source fence");
+        assert_eq!(store.lease_conflicts.load(Ordering::Acquire), conflicts + 1);
+        runtime_a.shutdown().await.expect("Runtime A shuts down");
+        runtime_b.shutdown().await.expect("Runtime B shuts down");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn typed_host_worktree_resume_uses_exact_authority_source_without_jsonl_summary() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let server = MockInferenceServer::start().await.expect("mock server");
+        let root = TempDir::new().expect("temp root");
+        let workspace = root.path().join("workspace");
+        std::fs::create_dir(&workspace).expect("workspace");
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&workspace)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("HOME", root.path())
+                .output()
+                .expect("git command runs");
+            assert!(
+                output.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&["init"]);
+        std::fs::write(workspace.join("tracked.txt"), b"tracked").expect("tracked file");
+        git(&["add", "tracked.txt"]);
+        git(&[
+            "-c",
+            "user.name=SDK Test",
+            "-c",
+            "user.email=sdk@example.invalid",
+            "commit",
+            "-m",
+            "initial",
+        ]);
+
+        let config = runtime_config(&root, server.url());
+        let store = Arc::new(DeleteProbeStore::new(root.path().join("host-state")));
+        let (runtime, _) = Runtime::builder(config.clone())
+            .session_state_store(store.clone())
+            .start()
+            .await
+            .expect("Runtime starts");
+        let source = runtime
+            .create_session(session_config(workspace.clone()))
+            .await
+            .expect("source Session");
+        runtime
+            .unload_session(source.clone())
+            .await
+            .expect("source unloads");
+        let source_dir = find_session_dir(&config.session_storage, &source);
+        std::fs::remove_file(source_dir.join("summary.json"))
+            .expect("remove non-authoritative source summary");
+        assert_no_covered_session_jsonl(&config.session_storage);
+
+        let receipt = runtime
+            .resume_session_in_worktree(
+                &source,
+                &ResumeSessionInWorktreeRequest {
+                    source_cwd: workspace,
+                    copy_mode: WorktreeCopyMode::Clean,
+                    worktree_type: Some(WorktreeType::Git),
+                    restore_code: Some(false),
+                    git_ref: None,
+                },
+            )
+            .await
+            .expect("typed worktree resume uses Host authority without source JSONL metadata");
+        assert_eq!(receipt.parent_session_id, source);
+        assert!(matches!(
+            store
+                .inspect_slot(&SessionKey::new(receipt.session_id.as_str()).unwrap())
+                .unwrap(),
+            SessionSlot::Live(_)
+        ));
+        assert_no_covered_session_jsonl(&config.session_storage);
+        runtime.shutdown().await.expect("Runtime shuts down");
     }
 
     async fn claim_test_session_turn(

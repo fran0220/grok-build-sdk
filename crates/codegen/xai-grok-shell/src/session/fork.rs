@@ -191,6 +191,19 @@ fn copy_authority_fork(
         filter_rewind_by, rewind_step_for_update, truncate_for_prompt_by,
     };
 
+    if !matches!(
+        authority
+            .inspect(target_info.id.0.as_ref())
+            .map_err(|e| io::Error::other(e.to_string()))?,
+        SessionInspection::Vacant
+    ) {
+        return Err(io::Error::other("fork target identity already exists"));
+    }
+    if storage.session_dir(target_info).exists() {
+        return Err(io::Error::other(
+            "fork target sidecar directory already exists",
+        ));
+    }
     let generation = match authority
         .inspect(source_info.id.0.as_ref())
         .map_err(|e| io::Error::other(e.to_string()))?

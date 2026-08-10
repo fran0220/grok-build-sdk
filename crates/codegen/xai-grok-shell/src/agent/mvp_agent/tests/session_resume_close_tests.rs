@@ -153,6 +153,59 @@ fn close_does_not_free_a_session_that_replaced_its_target() {
         );
     });
 }
+/// A replacement does not make the displaced actor safe to forget. If its
+/// thread cannot be positively drained, close must fail closed while leaving
+/// the replacement resident.
+#[test]
+fn close_does_not_report_superseded_until_the_old_actor_drains() {
+    super::run_local_for_bridge_test(|| async {
+        tokio::time::pause();
+        let agent = super::build_minimal_agent_for_tests();
+        let sid = acp::SessionId::new("sess-replaced-running");
+        let (original, _tx, _rx) = super::make_live_session_handle(&sid, Some("turn-1"));
+        agent.insert_resident(&sid, original);
+        let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
+        agent.session_registry.set_thread(
+            &sid,
+            crate::session::SessionThread::from_handle(std::thread::spawn(move || {
+                let _ = stop_rx.recv();
+            })),
+        );
+        let intake = agent.dispatch_lock(&sid);
+        let intake_guard = intake.lock().await;
+        let mut close = std::pin::pin!(agent.close_active_session(&sid));
+        assert!(futures::poll!(close.as_mut()).is_pending());
+        let (replacement, _tx2, _rx2) = super::make_live_session_handle(&sid, Some("turn-2"));
+        agent.insert_resident(&sid, replacement);
+        drop(intake_guard);
+        assert_eq!(close.await, CloseOutcome::DrainTimedOut);
+        assert!(agent.is_resident(&sid));
+        drop(stop_tx);
+    });
+}
+
+/// A target can disappear while close waits for intake. The old actor must be
+/// positively drained before this post-observation NotResident is successful.
+#[test]
+fn close_verifies_post_observation_not_resident() {
+    super::run_local_for_bridge_test(|| async {
+        let agent = super::build_minimal_agent_for_tests();
+        let sid = acp::SessionId::new("sess-disappeared-during-close");
+        let (handle, _tx, _rx) = super::make_live_session_handle(&sid, None);
+        agent.insert_resident(&sid, handle);
+        agent
+            .session_registry
+            .set_thread(&sid, exited_thread().await);
+        let intake = agent.dispatch_lock(&sid);
+        let intake_guard = intake.lock().await;
+        let mut close = std::pin::pin!(agent.close_active_session(&sid));
+        assert!(futures::poll!(close.as_mut()).is_pending());
+        agent.remove_session(&sid);
+        drop(intake_guard);
+        assert_eq!(close.await, CloseOutcome::NotResident);
+        assert!(!agent.session_registry.has_thread(&sid));
+    });
+}
 /// `attach_session` sweeps before it drains. The thread here is the evicted
 /// actor's, and the sweep's not-resident branch would drop it out from under
 /// the drain about to wait on it.

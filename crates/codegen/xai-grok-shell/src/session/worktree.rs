@@ -34,6 +34,7 @@ impl From<WorktreeType> for ShellWorktreeType {
 /// manual `create_from_worktree_sync` path used by `grok -w --ref`).
 async fn create_worktree_for_resume(
     source_cwd: &str,
+    new_session_id: &str,
     copy_mode: WorktreeCopyMode,
     worktree_type: ShellWorktreeType,
     git_ref: Option<String>,
@@ -45,7 +46,7 @@ async fn create_worktree_for_resume(
     };
     let wt_req = CreateWorktreeFromWorktreeRequest {
         source_worktree_path: source_cwd.to_owned(),
-        new_session_id: uuid::Uuid::now_v7().to_string(),
+        new_session_id: new_session_id.to_owned(),
         copy_mode,
         git_ref,
         worktree_type: Some(WorktreeType::from(worktree_type)),
@@ -178,6 +179,7 @@ pub(crate) async fn resume_session_in_worktree(
     authority: Option<
         std::sync::Arc<dyn crate::session::state_authority::NativeSessionStateAuthority>,
     >,
+    requested_target: Option<&str>,
 ) -> Result<ResumeSessionInWorktreeResponse> {
     use xai_grok_workspace::session::git::effective_worktree_path;
     tracing::info!(
@@ -188,6 +190,26 @@ pub(crate) async fn resume_session_in_worktree(
         effective_restore_code = req.restore_code.unwrap_or(restore_code_default),
         "RESTORE_CODE_DEBUG: resume_session_in_worktree entry"
     );
+    let target = requested_target
+        .map(str::to_owned)
+        .unwrap_or_else(|| uuid::Uuid::now_v7().to_string());
+    if authority.is_some() {
+        return resume_local_session_in_worktree(
+            req,
+            ops,
+            &req.session_id,
+            &req.source_cwd,
+            worktree_type_default,
+            restore_code_default,
+            registry_client,
+            auth_manager,
+            agent_id,
+            storage_root,
+            authority,
+            &target,
+        )
+        .await;
+    }
     let cwd_path = std::path::Path::new(req.source_cwd.as_str());
     let local_resolution = resolve_session_repo_wide(&req.session_id, cwd_path);
     if let Ok(Some(resolved)) = local_resolution {
@@ -210,6 +232,7 @@ pub(crate) async fn resume_session_in_worktree(
             agent_id,
             storage_root,
             authority,
+            &target,
         )
         .await;
     }
@@ -230,6 +253,7 @@ pub(crate) async fn resume_session_in_worktree(
         .unwrap_or(worktree_type_default);
     let wt_resp = create_worktree_for_resume(
         &req.source_cwd,
+        &target,
         req.copy_mode,
         worktree_type,
         req.git_ref.clone(),
@@ -318,15 +342,18 @@ async fn resume_local_session_in_worktree(
     authority: Option<
         std::sync::Arc<dyn crate::session::state_authority::NativeSessionStateAuthority>,
     >,
+    target: &str,
 ) -> Result<ResumeSessionInWorktreeResponse> {
     use crate::session::fork::{ForkSessionRequest, fork_session};
     use xai_grok_workspace::session::git::effective_worktree_path;
+    let host_authority = authority.is_some();
     let worktree_type = req
         .worktree_type
         .map(ShellWorktreeType::from)
         .unwrap_or(worktree_type_default);
     let wt_resp = create_worktree_for_resume(
         resolved_source_cwd,
+        target,
         req.copy_mode,
         worktree_type,
         req.git_ref.clone(),
@@ -365,12 +392,16 @@ async fn resume_local_session_in_worktree(
                 cwd: resolved_source_cwd.to_owned(),
             };
             let summary_path = crate::session::persistence::session_dir(&info).join("summary.json");
-            let head_commit = std::fs::read_to_string(&summary_path)
-                .ok()
-                .and_then(|raw| {
-                    serde_json::from_str::<crate::session::persistence::Summary>(&raw).ok()
-                })
-                .and_then(|s| s.head_commit);
+            let head_commit = if host_authority {
+                None
+            } else {
+                std::fs::read_to_string(&summary_path)
+                    .ok()
+                    .and_then(|raw| {
+                        serde_json::from_str::<crate::session::persistence::Summary>(&raw).ok()
+                    })
+                    .and_then(|s| s.head_commit)
+            };
             tracing::info!(
                 target: WORKTREE_LOG,
                 head_commit = ?head_commit,
@@ -413,6 +444,7 @@ async fn resume_local_session_in_worktree(
         source_session_id: resolved_session_id.to_owned(),
         source_cwd: resolved_source_cwd.to_owned(),
         new_cwd: effective_cwd.clone(),
+        new_session_id: Some(target.to_owned()),
         session_kind: Some("worktree".to_string()),
         source_workspace_dir: Some(resolved_source_cwd.to_owned()),
         ..Default::default()
@@ -946,6 +978,7 @@ mod tests {
             "test-agent",
             None,
             None,
+            None,
         )
         .await;
         let err = result.expect_err("should fail when session not found and no registry");
@@ -998,6 +1031,7 @@ mod tests {
         let source_cwd = repo_path.to_string_lossy().to_string();
         let wt_resp = create_worktree_for_resume(
             &source_cwd,
+            &uuid::Uuid::now_v7().to_string(),
             WorktreeCopyMode::Clean,
             ShellWorktreeType::Linked,
             None,
@@ -1038,6 +1072,7 @@ mod tests {
         let source_cwd = repo_path.to_string_lossy().to_string();
         let wt_resp = create_worktree_for_resume(
             &source_cwd,
+            &uuid::Uuid::now_v7().to_string(),
             WorktreeCopyMode::Dirty,
             ShellWorktreeType::Linked,
             Some("main".into()),
@@ -1066,6 +1101,7 @@ mod tests {
         let source_cwd = repo_path.to_string_lossy().to_string();
         let wt_resp = create_worktree_for_resume(
             &source_cwd,
+            &uuid::Uuid::now_v7().to_string(),
             WorktreeCopyMode::Clean,
             ShellWorktreeType::Linked,
             None,

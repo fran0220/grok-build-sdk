@@ -291,18 +291,30 @@ impl JsonlStorageAdapter {
         chat_messages_copied: usize,
     ) -> io::Result<CopySessionResult> {
         std::fs::create_dir_all(self.session_dir(target_info))?;
-        let source_summary = self.read_summary_sync(source_info)?;
-        let target_summary = fork_summary(
-            source_summary,
+        // Host authority owns all covered conversation state, so source
+        // summary metadata is neither required nor authoritative here.
+        let mut target_summary = Summary::new(
             target_info,
-            &options,
-            ForkCounters {
-                num_messages: updates_copied,
-                num_chat_messages: chat_messages_copied,
-                cwd_switch_bookkeeping_generation: 0,
-                inherited_prefix_len: None,
-            },
+            options
+                .new_model_id
+                .clone()
+                .map(acp::ModelId::new)
+                .unwrap_or_else(crate::session::persistence::default_model_id),
+        )?;
+        target_summary.num_messages = updates_copied;
+        target_summary.num_chat_messages = chat_messages_copied;
+        target_summary.parent_session_id = options.parent_session_id.clone();
+        target_summary.forked_at = Some(chrono::Utc::now());
+        target_summary.prompt_display_cwd = options.prompt_display_cwd.clone();
+        target_summary.session_kind = Some(
+            options
+                .session_kind
+                .clone()
+                .unwrap_or_else(|| "fork".to_string()),
         );
+        target_summary.fork_context_source = options.fork_context_source.clone();
+        target_summary.fork_parent_prompt_id = options.fork_parent_prompt_id.clone();
+        target_summary.source_workspace_dir = options.source_workspace_dir.clone();
         std::fs::write(
             self.summary_file(target_info),
             serde_json::to_vec_pretty(&target_summary).map_err(invalid_data)?,

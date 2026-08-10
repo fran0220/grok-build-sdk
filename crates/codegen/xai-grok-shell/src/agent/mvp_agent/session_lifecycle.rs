@@ -132,14 +132,47 @@ impl MvpAgent {
                 .await
                 .ok();
         match self.resident_handle(id).map(|h| h.cmd_tx.clone()) {
-            None => return CloseOutcome::NotResident,
+            None => {
+                drop(intake_guard);
+                return if self
+                    .drain_old_session_thread_within(
+                        id,
+                        stage_budget(deadline, DRAIN_OLD_THREAD_WAIT),
+                    )
+                    .await
+                {
+                    CloseOutcome::NotResident
+                } else {
+                    CloseOutcome::DrainTimedOut
+                };
+            }
             Some(current) if !current.same_channel(&target) => {
+                // The original target disappeared. Positively drain it before
+                // reporting that the replacement survived.
+                drop(intake_guard);
+                if !self
+                    .drain_old_session_thread_within(
+                        id,
+                        stage_budget(deadline, DRAIN_OLD_THREAD_WAIT),
+                    )
+                    .await
+                {
+                    return CloseOutcome::DrainTimedOut;
+                }
                 return CloseOutcome::Superseded;
             }
             Some(_) => {}
         }
         if !self.hard_stop_resident(id, CancelTrigger::SessionClose) {
-            return CloseOutcome::NotResident;
+            drop(intake_guard);
+            return if self
+                .drain_old_session_thread_within(id, stage_budget(deadline, DRAIN_OLD_THREAD_WAIT))
+                .await
+            {
+                CloseOutcome::NotResident
+            } else {
+                CloseOutcome::DrainTimedOut
+            };
         }
         drop(intake_guard);
         self.remove_session_terminal(id, SessionLiveState::Completed);
