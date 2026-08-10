@@ -27,6 +27,7 @@ pub(crate) enum CloseOutcome {
     Closed,
     NotResident,
     Superseded,
+    DrainTimedOut,
 }
 impl CloseOutcome {
     /// The spelling clients see in the close response.
@@ -35,6 +36,7 @@ impl CloseOutcome {
             Self::Closed => "closed",
             Self::NotResident => "notResident",
             Self::Superseded => "superseded",
+            Self::DrainTimedOut => "drainTimedOut",
         }
     }
 }
@@ -112,7 +114,17 @@ impl MvpAgent {
         self.wait_for_load_to_settle(id, stage_budget(deadline, CLOSE_ATTACH_SETTLE_WAIT))
             .await;
         let Some(target) = self.resident_handle(id).map(|h| h.cmd_tx.clone()) else {
-            return CloseOutcome::NotResident;
+            return if self
+                .drain_old_session_thread_within(
+                    id,
+                    stage_budget(deadline, DRAIN_OLD_THREAD_WAIT),
+                )
+                .await
+            {
+                CloseOutcome::NotResident
+            } else {
+                CloseOutcome::DrainTimedOut
+            };
         };
         let intake = self.dispatch_lock(id);
         let intake_guard =
@@ -131,8 +143,12 @@ impl MvpAgent {
         }
         drop(intake_guard);
         self.remove_session_terminal(id, SessionLiveState::Completed);
-        self.drain_old_session_thread_within(id, stage_budget(deadline, DRAIN_OLD_THREAD_WAIT))
+        let drained = self
+            .drain_old_session_thread_within(id, stage_budget(deadline, DRAIN_OLD_THREAD_WAIT))
             .await;
+        if !drained {
+            return CloseOutcome::DrainTimedOut;
+        }
         self.finalize_session_replica(id);
         CloseOutcome::Closed
     }

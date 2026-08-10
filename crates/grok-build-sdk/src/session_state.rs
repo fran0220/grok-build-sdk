@@ -570,6 +570,17 @@ pub fn delete_reconciled(
 }
 
 pub trait SessionStateStore: Send + Sync + 'static {
+    /// Acquires exclusive admission for one Session identity. The returned
+    /// lease must exclude other processes as well as other threads and remain
+    /// held for the complete resident or deletion lifetime.
+    fn acquire_session_lease(
+        &self,
+        _key: &SessionKey,
+    ) -> Result<Box<dyn SessionStateLease>, SessionStateStoreError> {
+        Err(validation(
+            "SessionStateStore does not provide cross-runtime Session admission fencing",
+        ))
+    }
     fn inspect_slot(&self, key: &SessionKey) -> Result<SessionSlot, SessionStateStoreError>;
     fn load_object(
         &self,
@@ -588,10 +599,20 @@ pub trait SessionStateStore: Send + Sync + 'static {
     ) -> Result<SessionDelete, SessionStateStoreError>;
 }
 
+/// Opaque exclusive Session admission lease. Dropping it releases admission.
+pub trait SessionStateLease: Send + Sync + 'static {}
+
 pub struct LocalSessionStateStore {
     path: PathBuf,
+    lease_root: PathBuf,
     connection: Mutex<rusqlite::Connection>,
 }
+
+struct LocalSessionStateLease {
+    _file: std::fs::File,
+}
+impl SessionStateLease for LocalSessionStateLease {}
+
 impl LocalSessionStateStore {
     pub fn new(root: impl Into<PathBuf>) -> Result<Self, SessionStateStoreError> {
         let root = root.into();
@@ -616,8 +637,11 @@ impl LocalSessionStateStore {
         }
         c.execute_batch("PRAGMA journal_mode=WAL;PRAGMA synchronous=FULL;")
             .map_err(storage)?;
+        let lease_root = root.join("session-leases");
+        std::fs::create_dir_all(&lease_root).map_err(storage)?;
         Ok(Self {
             path,
+            lease_root,
             connection: Mutex::new(c),
         })
     }
@@ -627,6 +651,29 @@ impl LocalSessionStateStore {
 }
 
 impl SessionStateStore for LocalSessionStateStore {
+    fn acquire_session_lease(
+        &self,
+        key: &SessionKey,
+    ) -> Result<Box<dyn SessionStateLease>, SessionStateStoreError> {
+        use fs2::FileExt as _;
+        let digest = Sha256::digest(key.session_identity().as_bytes());
+        let path = self.lease_root.join(format!("{digest:x}.lock"));
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(path)
+            .map_err(storage)?;
+        file.try_lock_exclusive().map_err(|error| {
+            if error.kind() == std::io::ErrorKind::WouldBlock {
+                validation("Session identity is owned by another Runtime")
+            } else {
+                storage(error)
+            }
+        })?;
+        Ok(Box::new(LocalSessionStateLease { _file: file }))
+    }
+
     fn inspect_slot(&self, key: &SessionKey) -> Result<SessionSlot, SessionStateStoreError> {
         let mut c = self.connection.lock().map_err(storage)?;
         let tx = c
@@ -1403,6 +1450,13 @@ where
     let store = open(ConformanceOpen::Fresh)?;
     let key = SessionKey::new("session-state-conformance")?;
     let generation = SessionGeneration::new("generation-1")?;
+    let concurrent = open(ConformanceOpen::Concurrent)?;
+    let lease = store.acquire_session_lease(&key)?;
+    if concurrent.acquire_session_lease(&key).is_ok() {
+        return Err(suite_error("concurrent Session admission was not fenced"));
+    }
+    drop(lease);
+    drop(concurrent.acquire_session_lease(&key)?);
     if store.inspect_slot(&key)? != SessionSlot::Vacant {
         return Err(suite_error("fresh slot is not vacant"));
     }
@@ -2082,6 +2136,17 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         run_session_state_conformance(|_| Ok(Arc::new(LocalSessionStateStore::new(d.path())?)))
             .unwrap();
+    }
+    #[test]
+    fn local_session_lease_fences_independent_store_handles() {
+        let d = tempfile::tempdir().unwrap();
+        let first = LocalSessionStateStore::new(d.path()).unwrap();
+        let second = LocalSessionStateStore::new(d.path()).unwrap();
+        let key = SessionKey::new("shared-session").unwrap();
+        let lease = first.acquire_session_lease(&key).unwrap();
+        assert!(second.acquire_session_lease(&key).is_err());
+        drop(lease);
+        second.acquire_session_lease(&key).unwrap();
     }
     #[test]
     fn local_fault_conformance() {

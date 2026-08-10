@@ -34,7 +34,7 @@ pub use session_state::{
     PreparedSessionDelete, RewindKind, SESSION_LOG_SCHEMA_MARKER, SESSION_LOG_SCHEMA_VERSION,
     SessionDelete, SessionGeneration, SessionKey, SessionManifest, SessionObject, SessionObjectId,
     SessionObjectKind, SessionSlot, SessionStateFault, SessionStateFaultHarness,
-    SessionStateFaultMetrics, SessionStateStore, SessionStateStoreError,
+    SessionStateFaultMetrics, SessionStateLease, SessionStateStore, SessionStateStoreError,
     TARGET_TRANSCRIPT_SEGMENT_BYTES, delete_reconciled, manifest_cas_reconciled,
     object_put_reconciled, run_session_state_conformance, run_session_state_fault_conformance,
 };
@@ -2541,21 +2541,30 @@ impl Runtime {
         source: &SessionId,
         request: &ForkSessionRequest,
     ) -> Result<ForkSessionReceipt, Error> {
+        let target = request
+            .new_session_id
+            .clone()
+            .unwrap_or_else(|| uuid::Uuid::now_v7().to_string());
         let value = self
-            .raw_ext(
-                "x.ai/session/fork",
-                serde_json::json!({
+            .inner
+            .fork_session(
+                SessionId::from_stored(target.clone()),
+                ExtensionRequest {
+                    method: "x.ai/session/fork".into(),
+                    params: serde_json::json!({
                     "sourceSessionId": source.as_str(),
                     "sourceCwd": request.source_cwd,
                     "newCwd": request.new_cwd,
-                    "newSessionId": request.new_session_id,
+                    "newSessionId": target,
                     "newModelId": request.new_model_id,
                     "targetPromptIndex": request.target_prompt_index,
                     "sessionKind": request.session_kind,
                     "sourceWorkspaceDir": request.source_workspace_dir
-                }),
+                    }),
+                },
             )
-            .await?;
+            .await?
+            .result;
         serde_json::from_value(value)
             .map_err(|e| Error::Operation(format!("invalid session/fork response: {e}")))
     }
@@ -7881,6 +7890,14 @@ done
         inner: LocalSessionStateStore,
         behavior: Mutex<DeleteProbeBehavior>,
         sidecar: Mutex<Option<std::path::PathBuf>>,
+        delete_pause: Mutex<
+            Option<(
+                std::sync::mpsc::SyncSender<()>,
+                std::sync::mpsc::Receiver<()>,
+            )>,
+        >,
+        inspect_calls: std::sync::atomic::AtomicU64,
+        lease_conflicts: std::sync::atomic::AtomicU64,
         observed_sidecar_before_delete: AtomicBool,
     }
 
@@ -7897,6 +7914,9 @@ done
                 inner: LocalSessionStateStore::new(root).expect("Host Session store"),
                 behavior: Mutex::new(DeleteProbeBehavior::Normal),
                 sidecar: Mutex::new(None),
+                delete_pause: Mutex::new(None),
+                inspect_calls: std::sync::atomic::AtomicU64::new(0),
+                lease_conflicts: std::sync::atomic::AtomicU64::new(0),
                 observed_sidecar_before_delete: AtomicBool::new(false),
             }
         }
@@ -7908,10 +7928,34 @@ done
         fn observe_sidecar(&self, path: std::path::PathBuf) {
             *self.sidecar.lock().unwrap() = Some(path);
         }
+
+        fn pause_next_delete(
+            &self,
+        ) -> (
+            std::sync::mpsc::Receiver<()>,
+            std::sync::mpsc::SyncSender<()>,
+        ) {
+            let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(0);
+            let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
+            *self.delete_pause.lock().unwrap() = Some((entered_tx, release_rx));
+            (entered_rx, release_tx)
+        }
     }
 
     impl SessionStateStore for DeleteProbeStore {
+        fn acquire_session_lease(
+            &self,
+            key: &SessionKey,
+        ) -> Result<Box<dyn SessionStateLease>, SessionStateStoreError> {
+            let result = self.inner.acquire_session_lease(key);
+            if result.is_err() {
+                self.lease_conflicts.fetch_add(1, Ordering::AcqRel);
+            }
+            result
+        }
+
         fn inspect_slot(&self, key: &SessionKey) -> Result<SessionSlot, SessionStateStoreError> {
+            self.inspect_calls.fetch_add(1, Ordering::AcqRel);
             self.inner.inspect_slot(key)
         }
 
@@ -7939,6 +7983,10 @@ done
             &self,
             request: PreparedSessionDelete,
         ) -> Result<SessionDelete, SessionStateStoreError> {
+            if let Some((entered, release)) = self.delete_pause.lock().unwrap().take() {
+                entered.send(()).expect("delete observer remains live");
+                release.recv().expect("delete release remains live");
+            }
             if self
                 .sidecar
                 .lock()
@@ -8104,6 +8152,75 @@ done
         assert!(!sidecar.exists());
         runtime.shutdown().await.expect("runtime shuts down");
         assert_no_covered_session_jsonl(&config.session_storage);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn shared_store_fences_admission_from_unload_through_tombstone() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let server = MockInferenceServer::start().await.expect("mock server");
+        let root = TempDir::new().expect("temp root");
+        let workspace = root.path().join("workspace");
+        std::fs::create_dir(&workspace).expect("workspace");
+        let config = runtime_config(&root, server.url());
+        let store = Arc::new(DeleteProbeStore::new(root.path().join("host-state")));
+        let (runtime_a, _) = Runtime::builder(config.clone())
+            .session_state_store(store.clone())
+            .start()
+            .await
+            .expect("Runtime A starts");
+        let (runtime_b, _) = Runtime::builder(config)
+            .session_state_store(store.clone())
+            .start()
+            .await
+            .expect("Runtime B starts");
+        let id = SessionId::from_stored(uuid::Uuid::new_v4().to_string());
+        let session = session_config(workspace);
+        runtime_a
+            .create_session_with_id(id.clone(), session.clone())
+            .await
+            .expect("Runtime A owns the live Session");
+        let (delete_entered, release_delete) = store.pause_next_delete();
+        let deleting = {
+            let runtime = runtime_a.clone();
+            let id = id.clone();
+            tokio::spawn(async move { runtime.delete_session(id).await })
+        };
+        tokio::task::spawn_blocking(move || delete_entered.recv())
+            .await
+            .expect("delete observer joins")
+            .expect("A pauses after unload and before tombstone");
+
+        let inspections_before_b = store.inspect_calls.load(Ordering::Acquire);
+        let admission = runtime_b.load_session(id.clone(), session.clone()).await;
+        assert!(
+            admission.is_err(),
+            "Runtime B must not establish a live actor while A holds deletion admission"
+        );
+        assert_eq!(store.lease_conflicts.load(Ordering::Acquire), 1);
+        assert_eq!(
+            store.inspect_calls.load(Ordering::Acquire),
+            inspections_before_b,
+            "Runtime B must fail at admission before inspecting or opening authority state"
+        );
+        assert!(runtime_b.unload_session(id.clone()).await.is_err());
+        release_delete.send(()).expect("release Runtime A");
+        deleting
+            .await
+            .expect("delete task joins")
+            .expect("Runtime A completes deletion");
+        assert!(matches!(
+            store
+                .inspect_slot(&SessionKey::new(id.as_str()).unwrap())
+                .unwrap(),
+            SessionSlot::Tombstoned { .. }
+        ));
+        assert!(
+            runtime_b.load_session(id.clone(), session).await.is_err(),
+            "after A succeeds, B must observe the tombstone rather than become resident"
+        );
+        assert!(runtime_b.unload_session(id).await.is_err());
+        runtime_a.shutdown().await.expect("Runtime A shuts down");
+        runtime_b.shutdown().await.expect("Runtime B shuts down");
     }
 
     async fn claim_test_session_turn(

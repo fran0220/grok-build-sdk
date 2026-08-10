@@ -93,6 +93,7 @@ enum Command {
     ),
     ListModels(Reply<ModelCatalog>),
     Extension(ExtensionRequest, Reply<ExtensionResponse>),
+    Fork(SessionId, ExtensionRequest, Reply<ExtensionResponse>),
     ExtensionNotification(ExtensionNotification, Reply<()>),
     SetMode(SessionId, String, Reply<()>),
     ListSessions(Reply<serde_json::Value>),
@@ -726,6 +727,14 @@ impl Runtime {
     }
     pub async fn extension_request(&self, x: ExtensionRequest) -> Result<ExtensionResponse, Error> {
         self.call(|r| Command::Extension(x, r)).await
+    }
+    pub async fn fork_session(
+        &self,
+        target: SessionId,
+        request: ExtensionRequest,
+    ) -> Result<ExtensionResponse, Error> {
+        self.call(|reply| Command::Fork(target, request, reply))
+            .await
     }
     pub async fn extension_notification(&self, x: ExtensionNotification) -> Result<(), Error> {
         self.call(|r| Command::ExtensionNotification(x, r)).await
@@ -2102,6 +2111,8 @@ struct PreparedHarnessTurn {
 struct Core {
     agent: Rc<MvpAgent>,
     session_state_authority: Option<Arc<ShellAuthority>>,
+    session_state_store: Option<Arc<dyn crate::SessionStateStore>>,
+    session_leases: RefCell<HashMap<String, Box<dyn crate::SessionStateLease>>>,
     events: mpsc::UnboundedSender<Event>,
     catalog: HashMap<String, crate::ModelSpec>,
     sequences: Rc<RefCell<HashMap<String, u64>>>,
@@ -2117,6 +2128,57 @@ struct Core {
     replay: Rc<RefCell<HashMap<String, ReplayMode>>>,
     evidence_store: Arc<dyn SessionEvidenceStore>,
     evidence_versions: RefCell<HashMap<SessionEvidenceKey, SessionEvidenceVersion>>,
+}
+
+struct SessionLeaseAdmission<'a> {
+    leases: &'a RefCell<HashMap<String, Box<dyn crate::SessionStateLease>>>,
+    id: String,
+    lease: Option<Box<dyn crate::SessionStateLease>>,
+}
+
+impl<'a> SessionLeaseAdmission<'a> {
+    fn new(
+        leases: &'a RefCell<HashMap<String, Box<dyn crate::SessionStateLease>>>,
+        id: &SessionId,
+        lease: Option<Box<dyn crate::SessionStateLease>>,
+    ) -> Self {
+        Self {
+            leases,
+            id: id.0.clone(),
+            lease,
+        }
+    }
+}
+
+impl Drop for SessionLeaseAdmission<'_> {
+    fn drop(&mut self) {
+        if let Some(lease) = self.lease.take() {
+            self.leases.borrow_mut().insert(self.id.clone(), lease);
+        }
+    }
+}
+
+fn quarantine_session_leases(leases: Vec<Box<dyn crate::SessionStateLease>>) {
+    static QUARANTINE: std::sync::OnceLock<
+        std::sync::Mutex<Vec<Box<dyn crate::SessionStateLease>>>,
+    > = std::sync::OnceLock::new();
+    QUARANTINE
+        .get_or_init(|| std::sync::Mutex::new(Vec::new()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .extend(leases);
+}
+
+impl Drop for Core {
+    fn drop(&mut self) {
+        let leases = self
+            .session_leases
+            .get_mut()
+            .drain()
+            .map(|(_, lease)| lease)
+            .collect();
+        quarantine_session_leases(leases);
+    }
 }
 
 type ShellAuthority = dyn xai_grok_shell::session::state_authority::NativeSessionStateAuthority;
@@ -2920,8 +2982,12 @@ impl Core {
                 xai_grok_shell::agent::config::OriginEmbeddedProfile::Desktop
             }
         };
-        let session_state_authority: Option<Arc<ShellAuthority>> = session_state_store
-            .map(|store| Arc::new(SessionStateAuthorityBridge { store }) as Arc<ShellAuthority>);
+        let session_state_authority: Option<Arc<ShellAuthority>> =
+            session_state_store.as_ref().map(|store| {
+                Arc::new(SessionStateAuthorityBridge {
+                    store: store.clone(),
+                }) as Arc<ShellAuthority>
+            });
         let agent = Rc::new(
             MvpAgent::with_origin_embedded_profile_models_and_session_state(
                 AcpAgentGatewaySender::new(gw_tx),
@@ -3032,6 +3098,8 @@ impl Core {
             Self {
                 agent,
                 session_state_authority,
+                session_state_store,
+                session_leases: RefCell::new(HashMap::new()),
                 events,
                 catalog: input
                     .models
@@ -3178,6 +3246,9 @@ impl Core {
                 Command::Extension(x, r) => {
                     let _ = r.send(self.extension_raw(x).await);
                 }
+                Command::Fork(target, request, reply) => {
+                    let _ = reply.send(self.fork(target, request).await);
+                }
                 Command::ExtensionNotification(x, r) => {
                     let _ = r.send(self.extension_notification(x).await);
                 }
@@ -3321,6 +3392,13 @@ impl Core {
                             failures.push(format!("unload {id}: {error}"));
                         }
                     }
+                    let uncertain_leases = self
+                        .session_leases
+                        .borrow_mut()
+                        .drain()
+                        .map(|(_, lease)| lease)
+                        .collect();
+                    quarantine_session_leases(uncertain_leases);
                     let result = if failures.is_empty() {
                         Ok(())
                     } else {
@@ -3546,7 +3624,29 @@ impl Core {
         config: SessionConfig,
         harness_digest: Option<HarnessDigest>,
     ) -> Result<SessionId, Error> {
-        self.create_inner(config, harness_digest, None).await
+        self.check(&config)?;
+        if self.session_state_store.is_some() {
+            let id = SessionId(uuid::Uuid::now_v7().to_string());
+            let generation = uuid::Uuid::now_v7().to_string();
+            let lease = self.acquire_session_lease(&id)?;
+            self.create_inner(config, harness_digest, Some((id, generation)), lease)
+                .await
+        } else {
+            self.create_inner(config, harness_digest, None, None).await
+        }
+    }
+
+    fn acquire_session_lease(
+        &self,
+        id: &SessionId,
+    ) -> Result<Option<Box<dyn crate::SessionStateLease>>, Error> {
+        self.session_state_store
+            .as_ref()
+            .map(|store| {
+                let key = crate::SessionKey::new(id.as_str()).map_err(op)?;
+                store.acquire_session_lease(&key).map_err(op)
+            })
+            .transpose()
     }
 
     async fn ensure(&self, id: SessionId, config: SessionConfig) -> Result<SessionId, Error> {
@@ -3557,6 +3657,12 @@ impl Core {
                 "caller-selected session id must be a UUID: {error}"
             ))
         })?;
+        let already_resident = self.resident.borrow().contains(id.as_str());
+        let lease = if already_resident {
+            None
+        } else {
+            self.acquire_session_lease(&id)?
+        };
         let authority = self.session_state_authority.as_ref().ok_or_else(|| {
             Error::InvalidConfig(
                 "create_session_with_id requires a Host session state authority".into(),
@@ -3566,14 +3672,15 @@ impl Core {
         let generation = format!("config-sha256:{:x}", Sha256::digest(exact));
         match authority.inspect(id.as_str()).map_err(op)? {
             xai_grok_shell::session::state_authority::SessionInspection::Vacant => {
-                self.create_inner(config, None, Some((id, generation)))
+                self.create_inner(config, None, Some((id, generation)), lease)
                     .await
             }
             xai_grok_shell::session::state_authority::SessionInspection::Live {
                 generation: current,
             } if current == generation => {
-                if !self.resident.borrow().contains(id.as_str()) {
-                    self.load(id.clone(), config, None).await?;
+                if !already_resident {
+                    self.attach_with_lease(id.clone(), config, None, false, lease)
+                        .await?;
                 }
                 Ok(id)
             }
@@ -3593,8 +3700,13 @@ impl Core {
         config: SessionConfig,
         harness_digest: Option<HarnessDigest>,
         requested: Option<(SessionId, String)>,
+        lease: Option<Box<dyn crate::SessionStateLease>>,
     ) -> Result<SessionId, Error> {
         self.check(&config)?;
+        let lease_id = requested.as_ref().map(|(id, _)| id).cloned();
+        let _lease_admission = lease_id
+            .as_ref()
+            .map(|id| SessionLeaseAdmission::new(&self.session_leases, id, lease));
         let effective_reasoning =
             self.effective_reasoning(&config.model, config.reasoning.as_deref())?;
         let binding = SessionBinding::new(&config, effective_reasoning.clone(), harness_digest);
@@ -3682,6 +3794,21 @@ impl Core {
         resume: bool,
     ) -> Result<(), Error> {
         self.check(&config)?;
+        let lease = self.acquire_session_lease(&id)?;
+        self.attach_with_lease(id, config, harness_digest, resume, lease)
+            .await
+    }
+
+    async fn attach_with_lease(
+        &self,
+        id: SessionId,
+        config: SessionConfig,
+        harness_digest: Option<HarnessDigest>,
+        resume: bool,
+        lease: Option<Box<dyn crate::SessionStateLease>>,
+    ) -> Result<(), Error> {
+        self.check(&config)?;
+        let _lease_admission = SessionLeaseAdmission::new(&self.session_leases, &id, lease);
         if self.resident.borrow().contains(&id.0) {
             return Err(Error::Operation("session is already resident".into()));
         }
@@ -4347,6 +4474,23 @@ impl Core {
                 "generic extension requests require the Desktop profile".into(),
             ));
         }
+        if matches!(
+            request.method.as_str(),
+            "x.ai/session/delete"
+                | "origin/session/unload"
+                | "x.ai/session/close"
+                | "x.ai/session/fork"
+        ) {
+            return Err(Error::Operation(
+                "Session lifecycle methods require their typed Runtime operation".into(),
+            ));
+        }
+        self.extension_raw_unchecked(request).await
+    }
+    async fn extension_raw_unchecked(
+        &self,
+        request: ExtensionRequest,
+    ) -> Result<ExtensionResponse, Error> {
         let raw = serde_json::value::to_raw_value(&request.params).map_err(op)?;
         let response = self
             .agent
@@ -4356,6 +4500,14 @@ impl Core {
         Ok(ExtensionResponse {
             result: serde_json::from_str(response.0.get()).map_err(op)?,
         })
+    }
+    async fn fork(
+        &self,
+        target: SessionId,
+        request: ExtensionRequest,
+    ) -> Result<ExtensionResponse, Error> {
+        let _lease = self.acquire_session_lease(&target)?;
+        self.extension_raw_unchecked(request).await
     }
     async fn extension_notification(&self, request: ExtensionNotification) -> Result<(), Error> {
         if request.method.trim().is_empty() {
@@ -4825,32 +4977,48 @@ impl Core {
             )))
             .await
             .map_err(|error| protocol("session/close", error))?;
-        self.finish_close(&id);
+        self.finish_close(&id, true);
         Ok(())
     }
     async fn delete(&self, id: SessionId) -> Result<(), Error> {
         if self.resident.borrow().contains(&id.0) {
-            self.unload(id.clone()).await?;
+            if let Err(error) = self.unload_inner(id.clone(), false).await {
+                return Err(error);
+            }
+        } else if !self.session_leases.borrow().contains_key(&id.0) {
+            let lease = self.acquire_session_lease(&id)?;
+            if let Some(lease) = lease {
+                self.session_leases.borrow_mut().insert(id.0.clone(), lease);
+            }
         }
         #[derive(serde::Deserialize)]
         struct DeleteWire {
             success: bool,
         }
-        let response: DeleteWire = self
+        let result = self
             .extension(
                 "x.ai/session/delete",
-                serde_json::json!({"sessionId": id.0}),
+                serde_json::json!({"sessionId": id.as_str()}),
             )
-            .await?;
-        if response.success {
-            Ok(())
-        } else {
-            Err(Error::Operation(
-                "native session deletion was not confirmed".into(),
-            ))
+            .await
+            .and_then(|response: DeleteWire| {
+                if response.success {
+                    Ok(())
+                } else {
+                    Err(Error::Operation(
+                        "native session deletion was not confirmed".into(),
+                    ))
+                }
+            });
+        if result.is_ok() {
+            self.session_leases.borrow_mut().remove(&id.0);
         }
+        result
     }
     async fn unload(&self, id: SessionId) -> Result<(), Error> {
+        self.unload_inner(id, true).await
+    }
+    async fn unload_inner(&self, id: SessionId, release_lease: bool) -> Result<(), Error> {
         self.require_resident(&id)?;
         if self.turns.borrow().contains_key(&id.0) {
             self.cancel(id.clone()).await?;
@@ -4866,7 +5034,7 @@ impl Core {
                 "native session unload did not detach the actor".into(),
             ));
         }
-        self.finish_close(&id);
+        self.finish_close(&id, release_lease && response.drained);
         if response.drained {
             Ok(())
         } else {
@@ -4875,10 +5043,13 @@ impl Core {
             ))
         }
     }
-    fn finish_close(&self, id: &SessionId) {
+    fn finish_close(&self, id: &SessionId, release_lease: bool) {
         self.emit(id, EventUpdate::SessionClosed, None);
         self.resident.borrow_mut().remove(&id.0);
         self.session_bindings.borrow_mut().remove(&id.0);
+        if release_lease {
+            self.session_leases.borrow_mut().remove(&id.0);
+        }
         self.mcp_bindings.revoke_session(&id.0);
         self.turns.borrow_mut().remove(&id.0);
         self.replay.borrow_mut().remove(&id.0);
@@ -5343,6 +5514,21 @@ fn capabilities_for(options: &RuntimeOptions) -> RuntimeCapabilities {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct LeaseDropSpy(Arc<std::sync::atomic::AtomicBool>);
+    impl crate::SessionStateLease for LeaseDropSpy {}
+    impl Drop for LeaseDropSpy {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Release);
+        }
+    }
+
+    #[test]
+    fn uncertain_session_leases_are_quarantined_for_process_lifetime() {
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        quarantine_session_leases(vec![Box::new(LeaseDropSpy(dropped.clone()))]);
+        assert!(!dropped.load(Ordering::Acquire));
+    }
 
     #[test]
     fn session_state_bridge_round_trips_semantic_port() {

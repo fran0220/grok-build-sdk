@@ -364,7 +364,7 @@ fn close_answers_within_the_aggregate_budget() {
         );
         let started = tokio::time::Instant::now();
         let outcome = agent.close_active_session(&sid).await;
-        assert_eq!(outcome, CloseOutcome::Closed);
+        assert_eq!(outcome, CloseOutcome::DrainTimedOut);
         assert!(
             started.elapsed() <= CLOSE_TOTAL_BUDGET + std::time::Duration::from_secs(1),
             "every stage stalled, and close still waited {:?}: the aggregate \

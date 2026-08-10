@@ -3,6 +3,7 @@
 //!
 //! [session setup]: https://agentclientprotocol.com/protocol/v1/session-setup
 use super::*;
+use super::session_lifecycle::CloseOutcome;
 /// Refusals resume must give verbatim, so a test cannot mistake some other
 /// `invalid_params` for the guard it is pinning.
 pub(super) const RESUME_REFUSES_CHAT: &str =
@@ -1705,6 +1706,10 @@ impl MvpAgent {
         args: acp::CloseSessionRequest,
     ) -> Result<acp::CloseSessionResponse, acp::Error> {
         let outcome = self.close_active_session(&args.session_id).await;
+        if outcome == CloseOutcome::DrainTimedOut {
+            return Err(acp::Error::internal_error()
+                .data("session actor did not drain before close completed"));
+        }
         tracing::info!(
             session_id = %args.session_id.0,
             ?outcome,
