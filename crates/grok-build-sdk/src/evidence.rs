@@ -345,10 +345,202 @@ fn storage_error(error: impl std::fmt::Display) -> SessionEvidenceStoreError {
     SessionEvidenceStoreError::Storage(error.to_string())
 }
 
+fn evidence_suite_error(message: impl Into<String>) -> SessionEvidenceStoreError {
+    SessionEvidenceStoreError::Storage(format!("conformance: {}", message.into()))
+}
+
+/// Runs the backend-neutral session-evidence contract against independent
+/// handles to one authority.
+///
+/// The opener answers with a handle for each [`ConformanceOpen`] phase against
+/// the same authority: `Fresh` and `Concurrent` must observe each other's
+/// commits, and `Reopen` must be a handle taken after the earlier ones were
+/// dropped. A host backend that passes this suite has the same validation
+/// ordering, CAS identity, bounds and restart semantics as
+/// [`LocalSessionEvidenceStore`].
+pub fn run_session_evidence_conformance<F>(mut open: F) -> Result<(), SessionEvidenceStoreError>
+where
+    F: FnMut(
+        crate::session_state::ConformanceOpen,
+    ) -> Result<std::sync::Arc<dyn SessionEvidenceStore>, SessionEvidenceStoreError>,
+{
+    use crate::session_state::ConformanceOpen;
+
+    let store = open(ConformanceOpen::Fresh)?;
+    let key = SessionEvidenceKey {
+        kind: SessionEvidenceKind::Ledger,
+        identity: "session-evidence-conformance".into(),
+    };
+
+    if store.load(&key)?.is_some() {
+        return Err(evidence_suite_error("fresh authority is not empty"));
+    }
+
+    // Creating from absence returns exactly the successor identity the SDK
+    // computes, so a host cannot invent its own revision or digest.
+    let expected_first = SessionEvidenceVersion::successor(None, b"first")?;
+    match store.compare_and_swap(&key, None, b"first")? {
+        SessionEvidenceCommit::Committed(version) if version == expected_first => {}
+        other => {
+            return Err(evidence_suite_error(format!(
+                "create-from-absent returned {other:?} rather than the exact successor"
+            )));
+        }
+    }
+    match store.load(&key)? {
+        Some(document) if document.version == expected_first && document.bytes == b"first" => {}
+        _ => return Err(evidence_suite_error("committed document did not load back")),
+    }
+
+    // Every stale expectation conflicts rather than overwriting.
+    if store.compare_and_swap(&key, None, b"duplicate")? != SessionEvidenceCommit::Conflict {
+        return Err(evidence_suite_error(
+            "create-from-absent over an existing document was accepted",
+        ));
+    }
+    let stale_digest = SessionEvidenceVersion {
+        revision: expected_first.revision,
+        digest: "sha256:0000000000000000000000000000000000000000000000000000000000000000".into(),
+    };
+    if store.compare_and_swap(&key, Some(&stale_digest), b"conflict")?
+        != SessionEvidenceCommit::Conflict
+    {
+        return Err(evidence_suite_error("a stale digest was accepted"));
+    }
+    let stale_revision = SessionEvidenceVersion {
+        revision: expected_first.revision + 1,
+        digest: expected_first.digest.clone(),
+    };
+    if store.compare_and_swap(&key, Some(&stale_revision), b"conflict")?
+        != SessionEvidenceCommit::Conflict
+    {
+        return Err(evidence_suite_error("a stale revision was accepted"));
+    }
+    match store.load(&key)? {
+        Some(document) if document.bytes == b"first" => {}
+        _ => {
+            return Err(evidence_suite_error(
+                "a conflicting swap changed the stored document",
+            ));
+        }
+    }
+
+    // Two independent handles racing the same expectation: exactly one wins.
+    let concurrent = open(ConformanceOpen::Concurrent)?;
+    match concurrent.load(&key)? {
+        Some(document) if document.version == expected_first => {}
+        _ => {
+            return Err(evidence_suite_error(
+                "a concurrent handle did not observe the committed document",
+            ));
+        }
+    }
+    let first_outcome = store.compare_and_swap(&key, Some(&expected_first), b"winner")?;
+    let second_outcome = concurrent.compare_and_swap(&key, Some(&expected_first), b"loser")?;
+    let committed = match (&first_outcome, &second_outcome) {
+        (SessionEvidenceCommit::Committed(version), SessionEvidenceCommit::Conflict) => {
+            version.clone()
+        }
+        (SessionEvidenceCommit::Conflict, SessionEvidenceCommit::Committed(version)) => {
+            version.clone()
+        }
+        _ => {
+            return Err(evidence_suite_error(format!(
+                "a contended CAS produced {first_outcome:?} and {second_outcome:?} rather than one \
+                 winner and one conflict"
+            )));
+        }
+    };
+    if committed.revision != expected_first.revision + 1 {
+        return Err(evidence_suite_error(
+            "the winning revision did not advance by exactly one",
+        ));
+    }
+
+    // Bounds are the SDK's, not the backend's: an oversize payload is refused
+    // and leaves the current document intact.
+    let oversize = vec![0_u8; MAX_SESSION_EVIDENCE_BYTES + 1];
+    if store
+        .compare_and_swap(&key, Some(&committed), &oversize)
+        .is_ok()
+    {
+        return Err(evidence_suite_error(
+            "a payload over the 8 MiB bound was accepted",
+        ));
+    }
+    let before_restart = store.load(&key)?.ok_or_else(|| {
+        evidence_suite_error("the document vanished after a refused oversize CAS")
+    })?;
+    if before_restart.version != committed {
+        return Err(evidence_suite_error(
+            "a refused oversize CAS changed the stored version",
+        ));
+    }
+
+    // Kinds and identities are separate documents, never one shared slot.
+    let other_kind = SessionEvidenceKey {
+        kind: SessionEvidenceKind::Rewind,
+        identity: key.identity.clone(),
+    };
+    let other_identity = SessionEvidenceKey {
+        kind: key.kind,
+        identity: "session-evidence-conformance-other".into(),
+    };
+    for neighbour in [&other_kind, &other_identity] {
+        if store.load(neighbour)?.is_some() {
+            return Err(evidence_suite_error(
+                "an unrelated evidence key shared another key's document",
+            ));
+        }
+        if !matches!(
+            store.compare_and_swap(neighbour, None, b"neighbour")?,
+            SessionEvidenceCommit::Committed(_)
+        ) {
+            return Err(evidence_suite_error(
+                "an unrelated evidence key could not be created",
+            ));
+        }
+    }
+
+    drop(concurrent);
+    drop(store);
+
+    // Restart: the exact version and bytes survive, and a pre-restart
+    // expectation still commits.
+    let reopened = open(ConformanceOpen::Reopen)?;
+    match reopened.load(&key)? {
+        Some(document) if document == before_restart => {}
+        _ => {
+            return Err(evidence_suite_error(
+                "the document did not survive a restart unchanged",
+            ));
+        }
+    }
+    if !matches!(
+        reopened.compare_and_swap(&key, Some(&committed), b"after-restart")?,
+        SessionEvidenceCommit::Committed(_)
+    ) {
+        return Err(evidence_suite_error(
+            "a pre-restart expectation was refused after restart",
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::{Arc, Barrier};
+
+    #[test]
+    fn local_store_passes_the_public_session_evidence_conformance() {
+        let root = tempfile::tempdir().unwrap();
+        run_session_evidence_conformance(|_| {
+            Ok(Arc::new(LocalSessionEvidenceStore::new(root.path())?)
+                as Arc<dyn SessionEvidenceStore>)
+        })
+        .unwrap();
+    }
 
     #[test]
     fn local_store_enforces_revision_and_digest_cas_across_reopen() {

@@ -17,7 +17,7 @@ pub use evidence::{
     LocalSessionEvidenceStore, MAX_SESSION_EVIDENCE_BYTES, SESSION_EVIDENCE_SCHEMA_MARKER,
     SESSION_EVIDENCE_SCHEMA_VERSION, SessionEvidenceCommit, SessionEvidenceDocument,
     SessionEvidenceKey, SessionEvidenceKind, SessionEvidenceStore, SessionEvidenceStoreError,
-    SessionEvidenceVersion,
+    SessionEvidenceVersion, run_session_evidence_conformance,
 };
 pub use harness::{
     CompleteEventCursor, HARNESS_SNAPSHOT_SCHEMA_VERSION, HarnessContent, HarnessDigest,
@@ -83,9 +83,10 @@ pub mod run {
         RollbackHarness, RunAction, RunAttach, RunCommandResult, RunDriverSpec, RunEnvelope,
         RunError, RunEvent, RunEventCursor, RunEventKind, RunId, RunLifecycle, RunRevision,
         RunSchemaMarker, RunStage, RunStatus, RunStore, SessionRef, SessionTurnOutcome,
-        SkillDescriptorPin, StoreCommit, StoreCommitResult, TelemetryRecord, TelemetrySink,
-        TransitionMessage, ValidateHarness, WaitingReason, WakeIntent, WakeReason, WakeRequest,
-        WorkerId, migrate_legacy_goal,
+        SkillDescriptorPin, StoreCommit, StoreCommitResult, StoreConformanceOpen, TelemetryRecord,
+        TelemetrySink, TransitionMessage, ValidateHarness, WaitingReason, WakeIntent, WakeReason,
+        WakeRequest, WorkerId, migrate_legacy_goal, run_artifact_store_conformance,
+        run_run_store_conformance,
     };
 }
 

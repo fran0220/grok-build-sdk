@@ -6,12 +6,16 @@
 //! than introducing another conversation or settlement ledger here.
 
 mod artifact;
+mod conformance;
 mod controller;
 mod model;
 mod providers;
 mod store;
 
 pub use artifact::{ArtifactMetadata, ArtifactStore, LocalArtifactStore};
+pub use conformance::{
+    StoreConformanceOpen, run_artifact_store_conformance, run_run_store_conformance,
+};
 pub use controller::RunController;
 pub use model::*;
 pub use providers::*;
