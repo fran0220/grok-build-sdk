@@ -292,6 +292,39 @@ pub(super) fn client_capability_meta(options: &RuntimeOptions) -> Result<acp::Me
     Ok(meta)
 }
 
+/// Mounts the three declared conversation tools when — and only when — a
+/// delegate is installed. The mount is an SDK-owned in-process MCP server, so
+/// it goes through the same Desktop-only routing and the same name-collision
+/// rules as every other mount.
+pub(super) fn mount_conversation_tools(options: &mut RuntimeOptions) -> Result<(), Error> {
+    let Some(delegate) = options.conversation_delegate.clone() else {
+        return Ok(());
+    };
+    if options.profile != crate::RuntimeProfile::Desktop {
+        return Err(crate::ConversationError::RestrictedProfile.into());
+    }
+    let taken = options
+        .in_process_mcp_servers
+        .iter()
+        .any(|server| server.name == crate::CONVERSATION_TOOL_SERVER)
+        || options
+            .services
+            .mcp_servers
+            .iter()
+            .chain(options.general_capabilities.mcp_service_contributions())
+            .any(|server| server.name() == crate::CONVERSATION_TOOL_SERVER);
+    if taken {
+        return Err(Error::InvalidConfig(format!(
+            "the '{}' mount is reserved for the conversation tools",
+            crate::CONVERSATION_TOOL_SERVER
+        )));
+    }
+    options
+        .in_process_mcp_servers
+        .push(crate::conversation_tool_server(delegate));
+    Ok(())
+}
+
 pub(super) fn capabilities_for(options: &RuntimeOptions) -> RuntimeCapabilities {
     const SDK_FEATURES: &[(&str, &str, bool)] = &[
         ("sdk:session-lifecycle", "state", false),
@@ -358,6 +391,22 @@ pub(super) fn capabilities_for(options: &RuntimeOptions) -> RuntimeCapabilities 
         }),
         effect_class: "in-process".into(),
         host_requirement: None,
+    });
+    descriptors.push(crate::CapabilityDescriptor {
+        namespace: "sdk:conversation-tools".into(),
+        enabled: options.profile == crate::RuntimeProfile::Desktop
+            && options.conversation_delegate.is_some(),
+        disabled_reason: (options.profile != crate::RuntimeProfile::Desktop
+            || options.conversation_delegate.is_none())
+        .then(|| {
+            if options.profile == crate::RuntimeProfile::Restricted {
+                "restricted profile".into()
+            } else {
+                "no conversation delegate installed".into()
+            }
+        }),
+        effect_class: "host".into(),
+        host_requirement: Some("ConversationDelegate".into()),
     });
     descriptors.push(crate::CapabilityDescriptor {
         namespace: "sdk:extension-bridge".into(),

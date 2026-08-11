@@ -1,8 +1,8 @@
 use crate::{
     AvailableModel, CapabilityLayer, CapabilityResolution, ConversationRewindReceipt,
     ConversationRewindStatus, Error, Event, EventUpdate, ExtensionNotification, ExtensionRequest,
-    ExtensionResponse, HarnessDigest, HarnessError, LedgerTurnState, ModelCatalog, Prompt,
-    PromptBlock, PromptReceipt, ResolvedCapabilities, RewindPoint, RuntimeCapabilities,
+    ExtensionResponse, HarnessDigest, HarnessError, InputSource, LedgerTurnState, ModelCatalog,
+    Prompt, PromptBlock, PromptReceipt, ResolvedCapabilities, RewindPoint, RuntimeCapabilities,
     RuntimeConfig, RuntimeOptions, SessionConfig, SessionEvidenceCommit, SessionEvidenceDocument,
     SessionEvidenceKey, SessionEvidenceKind, SessionEvidenceStore, SessionEvidenceVersion,
     SessionId, SessionLedger, SessionLedgerEntry, SessionReplayProbe, TurnBindingKey,
@@ -102,8 +102,8 @@ enum Command {
     ),
     SetCapabilities(SessionId, CapabilityLayer, Reply<CapabilityResolution>),
     SessionCapabilities(SessionId, Reply<CapabilityResolution>),
-    Prompt(SessionId, String, String, Reply<PromptReceipt>),
-    PromptContent(SessionId, String, Prompt, Reply<PromptReceipt>),
+    Prompt(SessionId, String, String, InputSource, Reply<PromptReceipt>),
+    PromptContent(SessionId, String, Prompt, InputSource, Reply<PromptReceipt>),
     PromptBound(
         SessionId,
         String,

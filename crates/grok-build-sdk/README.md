@@ -52,6 +52,7 @@ executable.
 | Artifact custody | `ArtifactVault`, `LocalArtifactVault`, `ArtifactId`, `ArtifactHandle`, `ArtifactWrite`, `ArtifactProvenance`, `ArtifactObservation`, `ArtifactRecord`, `ArtifactIntegrity`, `ArtifactRecovery`, `ArtifactUsage`, `run_artifact_vault_conformance` | Complete. Identity is the SHA-256 of the content, so a handle names one byte sequence forever; provenance names the producing Run, iteration and operation, and an instrument observation additionally names the program execution, its inputs and the revision under observation. Damage is reported rather than served and is repaired only by an explicit recovery that cannot change what an identity means. Reads and materializations are durably counted, and two workers on one authority observe each other and converge on one artifact. |
 | Program execution custody | `ProgramRuntime`, `LocalProgramRuntime`, `ExecutionId`, `ProgramLaunch`, `ProgramBounds`, `ExecutionReceipt`, `ExitDisposition`, `CaptureRecord`, `CredentialHandleName`, `CredentialResolver`, `ProgramOutputSink`, `LivenessProbe`, `ReconcileOutcome`, `run_program_runtime_conformance` | Complete. Every execution is named by its caller before it runs and receipted after it settles; the receipt names the program, the argument and environment digests, the working root, the attached credential handles, the exit disposition, the timing and the artifact handles of captured output, and is digest-verified on read. A cancel and an elapsed declared deadline settle as `Cancelled` and `TimedOut`, output past a declared capture bound is a recorded truncation with an honest produced-byte count, and an execution that was running at a crash is found alive, settled `Interrupted`, or left uncertain — never reported as success. Secrets are unrepresentable in durable state: a launch binds a handle name and the value exists only between the caller's resolver and the spawn. |
 | Per-Session capability layering | `CapabilityLayer`, `RuntimeBuilder::general_capabilities`, `create_session_with_capabilities`, `create_session_with_harness_and_capabilities`, `load_session_with_capabilities`, `resume_session_with_capabilities`, `set_session_capabilities`, `session_capabilities` | Complete for skills, MCP mounts and agent-service routes. One application-owned general layer is masked per Session by name and kind, so per-project activation and per-Session routing need neither a Runtime restart nor a second Runtime. |
+| Peer conversations | `InputSource`, `prompt_from`, `prompt_content_from`, `ConversationDelegate`, `RuntimeBuilder::conversation_delegate`, `conversation_tool_descriptors`, `ConversationCreate`, `ConversationRead`, `ConversationSend`, `ConversationAcceptance`, `ConversationDigest`, `create_conversation`, `read_conversation`, `send_to_conversation`, `invoke_conversation_tool` | Complete as a contract. A Turn's prompt states whether a person or another conversation produced it, and a peer source carries the originating conversation identity into the durable ledger; an absent source is the user and an unknown one fails the read. The three tools are declared, bounded and dispatched by the SDK and answered entirely by the Host: it owns conversation existence, the send queue and transcript distillation, and no raw transcript crosses the boundary. There is no parent/child coupling, no wait primitive and no mailbox reducer. |
 | Persistent kernel | `TerminalBackend`, background task handles, native terminal/PTY/process tools | M3 audit only, now narrower. `ProgramRuntime` supplies the durable identity, execution receipt, declared cancel/timeout bounds and restart reconciliation that this row previously listed as missing; what remains missing is the *persistent* half — a checkpointable kernel whose state survives between executions and can be restored into a new one. `PersistentKernelDriver` still describes that shape and no internal implementation is suitable to publish. Persistent shell state restores cwd/environment around newly spawned commands and is not a substitute. |
 | Continuation / gates | Generation-bound `McpContinuation`; Run-scoped `GateRequest`, `GateEvaluation`, `GateProvider` | M3 audit only. MCP continuation is one non-serializable live MRTR retry and a gate evaluation is an immediate provider result. Neither supplies a durable Host aggregate with identity/revision, ownership transfer, replay cursor or content-bound receipt. |
 
@@ -387,6 +388,7 @@ persists a resolved secret, or lets one identity start two processes.
 | Activation coordination semantics: due ordering, claim exclusivity, monotonic fencing tokens, expiry-based recovery, idempotent settlement, bounds and fail-closed decoding | The timer that decides when to sweep, the supervisor loop and its renewal cadence, what a work item means, and the retention policy behind `purge_settled` |
 | Artifact custody semantics: derived identity, digest verification on read, immutable handles, provenance and observation vocabulary, declared size/media-type/retention hints, missing-versus-corrupt answers, explicit identity-preserving recovery, usage accounting and verified materialization | Physical artifact bytes and their placement, encryption, backup and replication; what an artifact means to a person; the retention policy that acts on the stored hints; which artifacts are shown, exported or garbage collected |
 | Program execution semantics: caller-supplied execution identity and one-process-per-identity claiming, receipt content and digest verification, honest exit dispositions, declared deadline and capture bounds, truncation accounting, credential handle vocabulary and spawn-time resolution, artifact binding of captured output, restart backlog and probe-driven reconciliation | Process placement and isolation, cgroups/job objects/containers, the authority that holds secrets behind a handle name, the liveness evidence a `LivenessProbe` answers from, where captured artifacts physically live, retention of settled executions, and what an execution means to a person |
+| Peer conversation semantics: the input-source vocabulary and its fail-closed decoding, validated conversation/project/label/delivery-key shapes, the declared tool names, schemas and argument bounds, the digest ceiling and truncation vocabulary, and the checks that an answer is about the conversation, project and delivery key that were asked about | Which conversations exist and what a project is, the one send queue and whether a delivery starts a Turn or waits for settlement, delivery-key retention, how a transcript is distilled and what belongs in a digest, and every reply or completion notice — which are ordinary reverse sends, not mechanism |
 | SessionLedger/rewind/binding schemas; native Session object/chunk schemas, validation, replay and publication semantics; CAS transition intent and fail-closed reconciliation; artifact identity/integrity and provider contracts | Physical Run, session-evidence, and native Session-state persistence; transactions/migrations/encryption/backup/lifecycle; uncovered shell-sidecar placement; credentials, providers, workspace, queues, policy and UI |
 
 `ProviderSet` supplies typed artifact, gate, verifier, approval, and telemetry contracts. Local defaults store content-addressed artifacts and fail gates, verification, and approval closed until the Host installs explicit providers.
@@ -407,6 +409,8 @@ The SDK does not wrap the TUI. It exposes the stateful agent actor below it:
 |---|---|
 | Session create/load/resume/unload, cancel, rewind and durable Turn reconciliation | `Runtime` session and ledger methods |
 | Text, image, audio and embedded-resource prompts | `prompt` / `prompt_content` |
+| Prompts that state where they came from | `prompt_from` / `prompt_content_from` with an `InputSource` |
+| Talking to another conversation | `conversation_create`, `conversation_read` and `conversation_send`, served on the `conversation` mount behind a `ConversationDelegate` |
 | System-prompt replacement and host rules | `SessionConfig::system_prompt` / `rules` |
 | Mid-turn steering and follow-up | `interject` |
 | Built-ins, skills and workflows | `list_agent_commands` / `execute_agent_command` |
@@ -494,6 +498,109 @@ rebind: the change is observed by the next Turn on that Session alone.
 
 `CapabilityLayer` deliberately implements neither `Debug` nor `Serialize`
 because MCP mounts carry environment secrets and bearer headers.
+
+## Peer conversations
+
+An agent that wants durable, user-visible parallel work talks to an ordinary
+conversation rather than spawning something. Ephemeral in-Turn subagents remain
+the separate mechanism they always were: they live inside one Turn, they are
+invisible between Turns, and they settle back into their caller. A peer
+conversation does none of that. It has no parent, nothing waits on it, nothing
+settles it, and it is reachable from any Session on the Runtime — target choice
+is the agent's judgement, and the guardrail is that every message is visible in
+a real conversation a person can open.
+
+### Where a prompt came from
+
+`InputSource` states whether a person produced a prompt or another conversation
+did, and a peer source carries the originating `ConversationId` plus an optional
+display label. `prompt_from` and `prompt_content_from` take it; `prompt` and
+`prompt_content` are exactly the `InputSource::User` forms of the same call, so
+an existing embedding is unchanged. The source is recorded in the Session's
+durable ledger next to the Turn's identity and digest, so a restart, a replay
+and an inspection all agree about who spoke.
+
+The field is additive but deliberately not forward-tolerant. An entry with no
+source is the user — which is what every ledger written before this contract
+meant, and a user Turn's entry is still byte-identical to those. A *stated*
+source this build does not know fails the read instead of being quietly
+attributed to a person, because a message misattributed to the user is exactly
+the failure the field exists to prevent.
+
+### The three tools
+
+Installing a `ConversationDelegate` on `RuntimeBuilder::conversation_delegate`
+is what makes `conversation_create`, `conversation_read` and
+`conversation_send` exist; without one they are absent from every Session, and
+`Runtime::capabilities` reports `sdk:conversation-tools` as disabled with the
+reason. They are served to the agent on the SDK-owned in-process mount named
+`conversation`, so they follow the same Desktop-only routing and the same
+name-collision rules as every other mount; a delegate under the Restricted
+profile, or a mount of that name claimed by something else, fails closed at
+`start`.
+
+The SDK owns the contract and nothing else. It declares the names, the JSON
+schemas and every bound; it parses arguments into validated newtypes —
+`ConversationId`, `ProjectName`, `ConversationLabel`, `PeerMessage`,
+`IdempotencyKey` — and rejects unknown fields, unknown tool names and
+out-of-range values before the Host is asked anything. It never stores a
+conversation, never runs a queue, and never sees a transcript.
+
+`conversation_create` names a target project and returns the created identity;
+it is expected to run the same host command path as user conversation creation,
+and the SDK refuses an answer about a different project. `conversation_send`
+carries a caller-chosen `idempotencyKey`, so a retry after an uncertain result
+is the same delivery: the acceptance answers `StartedTurn` for an idle target,
+`Queued` for a running one, and `AlreadyAccepted` when that key was already
+admitted. `conversation_read` returns a bounded distillate; the read declares
+its ceiling, `MAX_CONVERSATION_DIGEST_BYTES` is the absolute one, truncation is
+reported as a fact rather than a silently shortened answer, and a digest that
+outruns its declared bound is refused. The distillation is entirely host-side,
+which is the point: the raw transcript never enters the calling Session's
+context.
+
+An answer about the wrong conversation, the wrong project, or the wrong
+delivery key is a failure, not a result — a delegate cannot silently retarget a
+create, a read or a delivery. A Host refusal, by contrast, is returned to the
+agent as a readable tool error rather than a transport fault.
+
+```rust
+let (runtime, _events) = Runtime::builder(config)
+    .profile(RuntimeProfile::Desktop)
+    .conversation_delegate(host_conversations.clone())
+    .start()
+    .await?;
+
+// The same validated contract the agent reaches as a tool.
+let peer = runtime
+    .create_conversation(&session, ConversationCreate::new(ProjectName::new("Desktop Product")?))
+    .await?;
+let acceptance = runtime
+    .send_to_conversation(
+        &session,
+        ConversationSend::new(
+            peer.conversation.clone(),
+            PeerMessage::new("please review the release plan")?,
+            IdempotencyKey::new("delivery-1")?,
+        ),
+    )
+    .await?;
+
+// The Host delivers it as an ordinary Turn that says where it came from.
+runtime
+    .prompt_from(
+        &target_session,
+        "turn-1",
+        "please review the release plan",
+        InputSource::Peer { conversation: origin, label: Some(label) },
+    )
+    .await?;
+```
+
+Replies and completion notices are ordinary reverse sends by convention. There
+is no reply channel, no correlation identifier and no mailbox reducer here,
+because a conversation that answers another conversation is just a conversation
+sending a message.
 
 ## Capability boundaries
 

@@ -141,6 +141,9 @@ pub struct RuntimeOptions {
     /// a general contribution of the same kind and name for that Session only.
     pub general_capabilities: CapabilityLayer,
     pub host: Option<Arc<dyn HostDelegate>>,
+    /// Host authority behind the three conversation tools. Installing it is
+    /// what makes those tools exist on this Runtime's Sessions.
+    pub conversation_delegate: Option<Arc<dyn ConversationDelegate>>,
     pub tool_permission_handler: Option<Arc<dyn ToolPermissionHandler>>,
     pub mcp_host_services: xai_grok_mcp::servers::McpHostServices,
     pub in_process_mcp_servers: Vec<InProcessMcpServer>,
@@ -159,6 +162,7 @@ impl Default for RuntimeOptions {
             services: RuntimeServices::default(),
             general_capabilities: CapabilityLayer::default(),
             host: None,
+            conversation_delegate: None,
             tool_permission_handler: None,
             mcp_host_services: xai_grok_mcp::servers::McpHostServices::default(),
             in_process_mcp_servers: Vec::new(),

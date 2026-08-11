@@ -49,6 +49,7 @@ pub(crate) fn run_reconcile_command_id(
 #[derive(Clone)]
 pub struct Runtime {
     pub(crate) inner: private::Runtime,
+    pub(crate) conversation: Option<Arc<dyn ConversationDelegate>>,
 }
 
 impl Runtime {
@@ -57,7 +58,15 @@ impl Runtime {
     ) -> Result<(Self, mpsc::UnboundedReceiver<Event>), Error> {
         private::Runtime::start(config, RuntimeOptions::default())
             .await
-            .map(|(inner, events)| (Self { inner }, events))
+            .map(|(inner, events)| {
+                (
+                    Self {
+                        inner,
+                        conversation: None,
+                    },
+                    events,
+                )
+            })
     }
     /// Starts the SDK with one Host-provided Run authority. The supplied store
     /// replaces (rather than mirrors) the standalone SQLite store, so snapshot,
@@ -68,7 +77,15 @@ impl Runtime {
     ) -> Result<(Self, mpsc::UnboundedReceiver<Event>), Error> {
         private::Runtime::start_with_run_store(config, RuntimeOptions::default(), Some(store))
             .await
-            .map(|(inner, events)| (Self { inner }, events))
+            .map(|(inner, events)| {
+                (
+                    Self {
+                        inner,
+                        conversation: None,
+                    },
+                    events,
+                )
+            })
     }
     /// Starts with both Host-owned persistence authorities. Each injected store
     /// replaces its local default; neither is mirrored.
@@ -85,7 +102,15 @@ impl Runtime {
             None,
         )
         .await
-        .map(|(inner, events)| (Self { inner }, events))
+        .map(|(inner, events)| {
+            (
+                Self {
+                    inner,
+                    conversation: None,
+                },
+                events,
+            )
+        })
     }
     pub fn capabilities(&self) -> RuntimeCapabilities {
         self.inner.capabilities()
@@ -96,6 +121,7 @@ impl Runtime {
 }
 
 mod builder;
+mod conversations;
 mod extensions;
 mod mcp;
 mod runs;

@@ -58,6 +58,7 @@ impl Core {
                 prompt_digest,
                 runtime_prompt_index,
                 state: LedgerTurnState::Discarded,
+                source: InputSource::User,
             });
         }
         self.save_ledger(id, &ledger)

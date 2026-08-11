@@ -12,6 +12,7 @@ fn pending_rewind_never_guesses_from_prompt_count_when_prefix_identity_drifted()
                 settlement_id: "settlement-0".into(),
                 usage: None,
             },
+            source: InputSource::User,
         }],
     };
     let drifted = RewindPointWire {

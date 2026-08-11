@@ -6,6 +6,7 @@ impl Core {
         id: SessionId,
         t: String,
         x: String,
+        source: InputSource,
     ) -> Result<PromptReceipt, Error> {
         let digest = crate::prompt_digest(&x);
         self.prompt_wire(
@@ -14,6 +15,7 @@ impl Core {
             vec![acp::ContentBlock::Text(acp::TextContent::new(x))],
             digest,
             serde_json::Value::Null,
+            source,
             None,
         )
         .await
@@ -24,6 +26,7 @@ impl Core {
         id: SessionId,
         t: String,
         prompt: Prompt,
+        source: InputSource,
     ) -> Result<PromptReceipt, Error> {
         if prompt.blocks.is_empty() {
             return Err(Error::InvalidConfig(
@@ -36,7 +39,7 @@ impl Core {
             blocks.push(serde_json::from_value(value).map_err(op)?);
         }
         let digest = crate::prompt_digest_content(&prompt)?;
-        self.prompt_wire(id, t, blocks, digest, prompt.metadata, None)
+        self.prompt_wire(id, t, blocks, digest, prompt.metadata, source, None)
             .await
             .map(|(receipt, _)| receipt)
     }
@@ -70,6 +73,7 @@ impl Core {
                 blocks,
                 prompt_digest,
                 prompt.metadata,
+                InputSource::User,
                 Some(prepared),
             )
             .await?;
@@ -122,6 +126,7 @@ impl Core {
         blocks: Vec<acp::ContentBlock>,
         prompt_digest: String,
         metadata: serde_json::Value,
+        source: InputSource,
         prepared: Option<PreparedHarnessTurn>,
     ) -> Result<(PromptReceipt, Option<TurnBindingRecord>), Error> {
         self.require_resident(&id)?;
@@ -148,6 +153,7 @@ impl Core {
             prompt_digest: prompt_digest.clone(),
             runtime_prompt_index,
             state: LedgerTurnState::Pending,
+            source: source.clone(),
         });
         self.save_ledger(&id, &ledger)?;
         let usage_key = (id.0.clone(), t.clone());
@@ -157,6 +163,7 @@ impl Core {
                 "originTurnId":t,
                 "promptId":t,
                 "originPromptDigest": prompt_digest,
+                "originInputSource": serde_json::to_value(&source).map_err(op)?,
                 "originMetadata": metadata
             })
             .as_object()

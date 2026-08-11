@@ -121,6 +121,15 @@ impl RuntimeBuilder {
         self.options.host = Some(value);
         self
     }
+    /// Installs the Host authority behind `conversation_create`,
+    /// `conversation_read` and `conversation_send`. The three tools appear on
+    /// every Session of this Runtime under the `conversation` mount exactly
+    /// when this is installed, and nowhere otherwise. Requires the Desktop
+    /// profile, and rejects a colliding mount of the same name.
+    pub fn conversation_delegate(mut self, value: Arc<dyn ConversationDelegate>) -> Self {
+        self.options.conversation_delegate = Some(value);
+        self
+    }
     /// Installs the typed tool policy used ahead of `HostDelegate` in Desktop mode.
     pub fn tool_permission_handler(mut self, value: Arc<dyn ToolPermissionHandler>) -> Self {
         self.options.tool_permission_handler = Some(value);
@@ -146,6 +155,7 @@ impl RuntimeBuilder {
         self
     }
     pub async fn start(self) -> Result<(Runtime, mpsc::UnboundedReceiver<Event>), Error> {
+        let conversation = self.options.conversation_delegate.clone();
         private::Runtime::start_with_stores(
             self.config,
             self.options,
@@ -154,6 +164,14 @@ impl RuntimeBuilder {
             self.session_state_store,
         )
         .await
-        .map(|(inner, events)| (Runtime { inner }, events))
+        .map(|(inner, events)| {
+            (
+                Runtime {
+                    inner,
+                    conversation,
+                },
+                events,
+            )
+        })
     }
 }

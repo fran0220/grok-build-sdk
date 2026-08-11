@@ -23,6 +23,12 @@ pub struct SessionLedgerEntry {
     pub prompt_digest: String,
     pub runtime_prompt_index: u64,
     pub state: LedgerTurnState,
+    /// Where this Turn's prompt came from. Absent means the user, which is
+    /// what every entry written before the input-source contract meant; a
+    /// stated source this build does not know fails the read instead of being
+    /// attributed to the user.
+    #[serde(default, skip_serializing_if = "InputSource::is_user")]
+    pub source: InputSource,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

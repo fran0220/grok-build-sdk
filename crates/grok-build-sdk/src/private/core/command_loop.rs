@@ -22,7 +22,7 @@ impl Core {
                 Command::SessionCapabilities(i, r) => {
                     let _ = r.send(self.session_capabilities(&i));
                 }
-                Command::Prompt(i, t, x, r) => {
+                Command::Prompt(i, t, x, source, r) => {
                     if t.trim().is_empty() {
                         let _ = r.send(Err(Error::InvalidConfig("turn id is required".into())));
                         continue;
@@ -45,7 +45,7 @@ impl Core {
                     };
                     let task = tokio::task::spawn_local(async move {
                         let _reservation = reservation;
-                        let result = this.prompt(i, t, x).await;
+                        let result = this.prompt(i, t, x, source).await;
                         this.prompt_tasks.borrow_mut().remove(&task_session_id);
                         let _ = r.send(result);
                     });
@@ -53,7 +53,7 @@ impl Core {
                         .borrow_mut()
                         .insert(task_key, task.abort_handle());
                 }
-                Command::PromptContent(i, t, x, r) => {
+                Command::PromptContent(i, t, x, source, r) => {
                     if t.trim().is_empty() {
                         let _ = r.send(Err(Error::InvalidConfig("turn id is required".into())));
                         continue;
@@ -76,7 +76,7 @@ impl Core {
                     };
                     let task = tokio::task::spawn_local(async move {
                         let _reservation = reservation;
-                        let result = this.prompt_content(i, t, x).await;
+                        let result = this.prompt_content(i, t, x, source).await;
                         this.prompt_tasks.borrow_mut().remove(&task_session_id);
                         let _ = r.send(result);
                     });

@@ -8,6 +8,7 @@
 mod activation;
 mod artifact;
 mod autonomous;
+mod conversation;
 mod evidence;
 mod harness;
 mod prime;
@@ -36,6 +37,16 @@ pub use artifact::{
     run_artifact_vault_conformance,
 };
 pub use autonomous::{AutonomousActivation, AutonomousActivationResult, AutonomousTurnLoop};
+pub use conversation::{
+    CONVERSATION_TOOL_SERVER, ConversationAcceptance, ConversationCreate, ConversationDelegate,
+    ConversationDelivery, ConversationDigest, ConversationError, ConversationId,
+    ConversationIdentity, ConversationLabel, ConversationRead, ConversationSend, ConversationTitle,
+    ConversationToolCall, ConversationToolDescriptor, ConversationToolOutcome, DigestFocus,
+    IdempotencyKey, InputSource, MAX_CONVERSATION_DIGEST_BYTES, MAX_CONVERSATION_ID_BYTES,
+    MAX_CONVERSATION_LABEL_BYTES, MAX_CONVERSATION_TITLE_BYTES, MAX_DIGEST_FOCUS_BYTES,
+    MAX_IDEMPOTENCY_KEY_BYTES, MAX_PEER_MESSAGE_BYTES, MAX_PROJECT_NAME_BYTES, PeerMessage,
+    ProjectName, conversation_tool_descriptors,
+};
 pub use evidence::{
     LocalSessionEvidenceStore, MAX_SESSION_EVIDENCE_BYTES, SESSION_EVIDENCE_SCHEMA_MARKER,
     SESSION_EVIDENCE_SCHEMA_VERSION, SessionEvidenceCommit, SessionEvidenceDocument,
@@ -151,6 +162,9 @@ pub use runtime::*;
 pub use session::*;
 
 pub(crate) use capability::{ResolvedCapabilities, resolve_capabilities};
+pub(crate) use conversation::{
+    conversation_tool_server, dispatch_create, dispatch_read, dispatch_send, dispatch_tool_call,
+};
 pub(crate) use mcp::InProcessMcpOutbound;
 pub(crate) use mcp::parsing::{parse_mcp_servers, parse_task_status};
 pub(crate) use provenance::canonicalize_json;

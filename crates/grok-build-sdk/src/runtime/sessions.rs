@@ -10,7 +10,24 @@ impl Runtime {
         turn_id: impl Into<String>,
         prompt: Prompt,
     ) -> Result<PromptReceipt, Error> {
-        self.inner.prompt_content(id, turn_id.into(), prompt).await
+        self.inner
+            .prompt_content(id, turn_id.into(), prompt, InputSource::User)
+            .await
+    }
+    /// Rich-content Turn whose prompt states where it came from. A peer source
+    /// carries the originating conversation's identity, which is recorded in
+    /// this Session's durable ledger and is visible on replay. Stating
+    /// [`InputSource::User`] is exactly [`Self::prompt_content`].
+    pub async fn prompt_content_from(
+        &self,
+        id: &SessionId,
+        turn_id: impl Into<String>,
+        prompt: Prompt,
+        source: InputSource,
+    ) -> Result<PromptReceipt, Error> {
+        self.inner
+            .prompt_content(id, turn_id.into(), prompt, source)
+            .await
     }
     pub async fn prompt_blocks(
         &self,
@@ -192,7 +209,23 @@ impl Runtime {
         turn_id: impl Into<String>,
         text: impl Into<String>,
     ) -> Result<PromptReceipt, Error> {
-        self.inner.prompt(id, turn_id.into(), text.into()).await
+        self.inner
+            .prompt(id, turn_id.into(), text.into(), InputSource::User)
+            .await
+    }
+    /// Text Turn whose prompt states where it came from. This is the delivery
+    /// path a Host uses for a peer message: the target Session runs an
+    /// ordinary Turn, and its ledger records which conversation sent it.
+    pub async fn prompt_from(
+        &self,
+        id: &SessionId,
+        turn_id: impl Into<String>,
+        text: impl Into<String>,
+        source: InputSource,
+    ) -> Result<PromptReceipt, Error> {
+        self.inner
+            .prompt(id, turn_id.into(), text.into(), source)
+            .await
     }
     /// Executes a native text Turn and issues a receipt only after the complete
     /// live event range through the terminal event has been retained and

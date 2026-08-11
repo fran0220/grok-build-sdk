@@ -33,12 +33,14 @@ impl Runtime {
 
     pub async fn start_with_stores(
         input: RuntimeConfig,
-        options: RuntimeOptions,
+        mut options: RuntimeOptions,
         run_store: Option<Arc<dyn xai_agent_lifecycle::run::RunStore>>,
         evidence_store: Option<Arc<dyn SessionEvidenceStore>>,
         session_state_store: Option<Arc<dyn crate::SessionStateStore>>,
     ) -> Result<(Self, mpsc::UnboundedReceiver<Event>), Error> {
         validate(&input, &options)?;
+        mount_conversation_tools(&mut options)?;
+        let options = options;
         if options.event_journal_capacity == 0 {
             return Err(Error::InvalidConfig(
                 "event journal capacity must be positive".into(),
@@ -632,16 +634,19 @@ impl Runtime {
         id: &SessionId,
         t: String,
         x: String,
+        source: InputSource,
     ) -> Result<PromptReceipt, Error> {
-        self.call(|r| Command::Prompt(id.clone(), t, x, r)).await
+        self.call(|r| Command::Prompt(id.clone(), t, x, source, r))
+            .await
     }
     pub async fn prompt_content(
         &self,
         id: &SessionId,
         t: String,
         p: Prompt,
+        source: InputSource,
     ) -> Result<PromptReceipt, Error> {
-        self.call(|r| Command::PromptContent(id.clone(), t, p, r))
+        self.call(|r| Command::PromptContent(id.clone(), t, p, source, r))
             .await
     }
     pub async fn prompt_content_with_harness(
