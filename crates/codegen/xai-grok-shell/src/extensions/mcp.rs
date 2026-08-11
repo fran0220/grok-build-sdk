@@ -1300,9 +1300,13 @@ pub enum McpModernOperation {
         client_id: u64,
         task_id: String,
     },
+    RecoverTask {
+        task_id: String,
+    },
     UpdateTask {
         client_id: u64,
         task_id: String,
+        expected_task: serde_json::Value,
         input_responses: std::collections::BTreeMap<String, serde_json::Value>,
     },
     CancelTask {
@@ -1477,12 +1481,14 @@ pub(crate) async fn run_mcp_modern_operation(
         McpModernOperation::GetTask { client_id, task_id } => {
             client.get_task_json(client_id, task_id).await
         }
+        McpModernOperation::RecoverTask { task_id } => client.recover_task_json(task_id).await,
         McpModernOperation::UpdateTask {
             client_id,
             task_id,
+            expected_task,
             input_responses,
         } => client
-            .update_task(client_id, task_id, input_responses)
+            .update_task_if_current(client_id, task_id, expected_task, input_responses)
             .await
             .map(|()| serde_json::json!({"clientId": client_id})),
         McpModernOperation::CancelTask { client_id, task_id } => client

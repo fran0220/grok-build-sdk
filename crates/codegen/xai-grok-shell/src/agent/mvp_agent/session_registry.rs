@@ -6,6 +6,22 @@ use super::*;
 pub(super) struct SessionRegistry {
     sessions: Rc<RefCell<HashMap<acp::SessionId, SessionResources>>>,
 }
+/// Identity and serialization gate for one bounded unload attempt. A retry
+/// clones the exact ticket stored with the retained actor thread; stale work
+/// cannot complete or unregister a later presence for the same session id.
+#[derive(Clone)]
+pub(super) struct UnloadTicket {
+    gate: Rc<tokio::sync::Mutex<()>>,
+}
+impl UnloadTicket {
+    pub(super) async fn lock(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.gate.lock().await
+    }
+
+    fn same(&self, other: &Self) -> bool {
+        Rc::ptr_eq(&self.gate, &other.gate)
+    }
+}
 /// Turn activity of a resident actor. Split from [`SessionLiveState`] so a
 /// reader cannot observe `Working` without a resident actor: that combination
 /// was representable when liveness was a parallel field.
@@ -61,6 +77,13 @@ pub(super) enum SessionPresence {
     Dormant {
         thread: Option<SessionThread>,
     },
+    /// An embedded Host detached the actor, but its bounded drain has not yet
+    /// been positively confirmed. The exact thread, capability layer, and
+    /// session-tree registrations remain under reconciliation custody.
+    Unloading {
+        thread: Option<SessionThread>,
+        ticket: UnloadTicket,
+    },
 }
 impl SessionPresence {
     /// Roster/telemetry projection. `None` on [`Self::Evicted`]: `release`
@@ -81,6 +104,7 @@ impl SessionPresence {
             Self::Closed { .. } => Some(SessionLiveState::Completed),
             Self::Dead { .. } => Some(SessionLiveState::DeadFailed),
             Self::Dormant { .. } => Some(SessionLiveState::Dormant),
+            Self::Unloading { .. } => None,
         }
     }
     fn from_live(
@@ -151,7 +175,8 @@ impl SessionPresence {
             | Self::Evicted { thread }
             | Self::Closed { thread }
             | Self::Dead { thread }
-            | Self::Dormant { thread } => thread,
+            | Self::Dormant { thread }
+            | Self::Unloading { thread, .. } => thread,
         }
     }
     fn thread_slot_mut(&mut self) -> &mut Option<SessionThread> {
@@ -161,7 +186,8 @@ impl SessionPresence {
             | Self::Evicted { thread }
             | Self::Closed { thread }
             | Self::Dead { thread }
-            | Self::Dormant { thread } => thread,
+            | Self::Dormant { thread }
+            | Self::Unloading { thread, .. } => thread,
         }
     }
     fn hosted_handle(&self) -> Option<&SessionHandle> {
@@ -170,7 +196,8 @@ impl SessionPresence {
             Self::Evicted { .. }
             | Self::Closed { .. }
             | Self::Dead { .. }
-            | Self::Dormant { .. } => None,
+            | Self::Dormant { .. }
+            | Self::Unloading { .. } => None,
         }
     }
     fn hosted_handle_mut(&mut self) -> Option<&mut SessionHandle> {
@@ -179,7 +206,8 @@ impl SessionPresence {
             Self::Evicted { .. }
             | Self::Closed { .. }
             | Self::Dead { .. }
-            | Self::Dormant { .. } => None,
+            | Self::Dormant { .. }
+            | Self::Unloading { .. } => None,
         }
     }
     fn take_hosted_handle(&mut self) -> Option<SessionHandle> {
@@ -188,7 +216,8 @@ impl SessionPresence {
             Self::Evicted { .. }
             | Self::Closed { .. }
             | Self::Dead { .. }
-            | Self::Dormant { .. } => None,
+            | Self::Dormant { .. }
+            | Self::Unloading { .. } => None,
         }
     }
     /// True when this presence holds nothing `drop_if_empty` should keep: an
@@ -235,6 +264,10 @@ impl SessionRegistry {
         let Some(mut released) = entries.remove(id) else {
             return;
         };
+        if matches!(released.presence, Some(SessionPresence::Unloading { .. })) {
+            entries.insert(id.clone(), released);
+            return;
+        }
         let running = released
             .presence
             .as_mut()
@@ -313,7 +346,9 @@ impl SessionRegistry {
     }
     pub(super) fn clear_exited_thread(&self, id: &acp::SessionId) {
         self.clear(id, |e| {
-            e.presence = None;
+            if !matches!(e.presence, Some(SessionPresence::Unloading { .. })) {
+                e.presence = None;
+            }
         });
     }
     pub(super) fn set_live(&self, id: &acp::SessionId, state: SessionLiveState) {
@@ -322,6 +357,14 @@ impl SessionRegistry {
             return;
         }
         self.edit(id, |e| {
+            if matches!(e.presence, Some(SessionPresence::Unloading { .. })) {
+                tracing::warn!(
+                    session_id = %id.0,
+                    ?state,
+                    "set_live ignored a write while unload reconciliation is pending"
+                );
+                return;
+            }
             if let Some(SessionPresence::Attaching {
                 settled_activity, ..
             }) = &mut e.presence
@@ -374,6 +417,86 @@ impl SessionRegistry {
                 .is_some()
         })
         .unwrap_or(false)
+    }
+    pub(super) fn is_unloading(&self, id: &acp::SessionId) -> bool {
+        self.with(id, |e| {
+            matches!(e.presence, Some(SessionPresence::Unloading { .. }))
+        })
+        .unwrap_or(false)
+    }
+    /// Move an evicted actor thread into exclusive unload custody before the
+    /// first drain await. `None` means there is no retained thread to drain.
+    pub(super) fn begin_unloading(&self, id: &acp::SessionId) -> Option<UnloadTicket> {
+        let mut entries = self.sessions.borrow_mut();
+        let entry = entries.get_mut(id)?;
+        match entry.presence.take() {
+            Some(SessionPresence::Unloading { thread, ticket }) => {
+                let result = ticket.clone();
+                entry.presence = Some(SessionPresence::Unloading { thread, ticket });
+                Some(result)
+            }
+            Some(SessionPresence::Evicted {
+                thread: Some(thread),
+            }) => {
+                let ticket = UnloadTicket {
+                    gate: Rc::new(tokio::sync::Mutex::new(())),
+                };
+                entry.presence = Some(SessionPresence::Unloading {
+                    thread: Some(thread),
+                    ticket: ticket.clone(),
+                });
+                Some(ticket)
+            }
+            other => {
+                entry.presence = other;
+                None
+            }
+        }
+    }
+    pub(super) fn unloading_ticket(&self, id: &acp::SessionId) -> Option<UnloadTicket> {
+        self.with(id, |e| match &e.presence {
+            Some(SessionPresence::Unloading { ticket, .. }) => Some(ticket.clone()),
+            _ => None,
+        })
+        .flatten()
+    }
+    pub(super) fn unloading_matches(&self, id: &acp::SessionId, ticket: &UnloadTicket) -> bool {
+        self.with(id, |e| match &e.presence {
+            Some(SessionPresence::Unloading {
+                ticket: current, ..
+            }) => current.same(ticket),
+            _ => false,
+        })
+        .unwrap_or(false)
+    }
+    /// Remove exactly the unload state represented by `ticket`. The caller
+    /// may release session-tree authority only when this compare-and-complete
+    /// succeeds.
+    pub(super) fn complete_unloading(
+        &self,
+        id: &acp::SessionId,
+        ticket: &UnloadTicket,
+    ) -> bool {
+        let removed = {
+            let mut entries = self.sessions.borrow_mut();
+            let Some(entry) = entries.get_mut(id) else {
+                return false;
+            };
+            let matches = match &entry.presence {
+                Some(SessionPresence::Unloading {
+                    ticket: current, ..
+                }) => current.same(ticket),
+                _ => false,
+            };
+            if matches {
+                entry.presence = None;
+            }
+            matches
+        };
+        if removed {
+            self.drop_if_empty(id);
+        }
+        removed
     }
     pub(super) fn resident_count(&self) -> usize {
         self.sessions
@@ -769,6 +892,73 @@ impl SessionRegistry {
         let mut entries = self.sessions.borrow_mut();
         if entries.get(id).is_some_and(SessionResources::is_empty) {
             entries.remove(id);
+        }
+    }
+}
+
+type ReapRequest = (String, SessionThread);
+
+fn thread_reaper() -> Option<&'static std::sync::mpsc::Sender<ReapRequest>> {
+    static REAPER: std::sync::OnceLock<Option<std::sync::mpsc::Sender<ReapRequest>>> =
+        std::sync::OnceLock::new();
+    REAPER
+        .get_or_init(|| {
+            let (tx, rx) = std::sync::mpsc::channel::<ReapRequest>();
+            std::thread::Builder::new()
+                .name("grok-session-thread-reaper".into())
+                .spawn(move || {
+                    while let Ok((session_id, thread)) = rx.recv() {
+                        thread.join();
+                        super::session_lifecycle::finalize_origin_session_unload(&session_id);
+                    }
+                })
+                .ok()
+                .map(|_| tx)
+        })
+        .as_ref()
+}
+
+fn reap_after_exit(session_id: String, thread: SessionThread) {
+    if let Some(reaper) = thread_reaper() {
+        match reaper.send((session_id, thread)) {
+            Ok(()) => return,
+            Err(std::sync::mpsc::SendError((session_id, thread))) => {
+                thread.join();
+                super::session_lifecycle::finalize_origin_session_unload(&session_id);
+                return;
+            }
+        }
+    }
+    // Failure to create the process reaper must not detach the actor. Joining
+    // synchronously is slower but preserves custody and root lifetime.
+    thread.join();
+    super::session_lifecycle::finalize_origin_session_unload(&session_id);
+}
+
+impl Drop for SessionRegistry {
+    fn drop(&mut self) {
+        if Rc::strong_count(&self.sessions) != 1 {
+            return;
+        }
+        let mut entries = std::mem::take(&mut *self.sessions.borrow_mut());
+        let mut running = Vec::new();
+        for (id, mut resources) in entries.drain() {
+            let thread = resources
+                .presence
+                .as_mut()
+                .and_then(SessionPresence::take_thread);
+            if let Some(thread) = thread {
+                if thread.is_finished() {
+                    thread.join();
+                    super::session_lifecycle::finalize_origin_session_unload(id.0.as_ref());
+                } else {
+                    running.push((id.0.to_string(), thread));
+                }
+            }
+        }
+        drop(entries);
+        for (session_id, thread) in running {
+            reap_after_exit(session_id, thread);
         }
     }
 }

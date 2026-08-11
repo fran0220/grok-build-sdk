@@ -3,6 +3,35 @@
 
 use crate::*;
 
+fn validate_non_ui_responses(
+    input: &McpInputRequired,
+    responses: &McpInputResponses,
+) -> Result<(), Error> {
+    validate_mcp_input_responses(responses)?;
+    let requests = input.validated_requests()?;
+    for key in responses.keys() {
+        let request = requests
+            .iter()
+            .find(|request| request.id == *key)
+            .ok_or_else(|| {
+                Error::InvalidConfig("MCP input responses contain an unrequested identity".into())
+            })?;
+        if request.kind == McpInputRequestKind::Elicitation {
+            return Err(Error::InvalidConfig(
+                "MCP elicitation answers are accepted only from the product UI channel".into(),
+            ));
+        }
+    }
+    if requests.iter().any(|request| {
+        request.kind != McpInputRequestKind::Elicitation && !responses.contains_key(&request.id)
+    }) {
+        return Err(Error::InvalidConfig(
+            "every non-elicitation MCP input request must be answered exactly once".into(),
+        ));
+    }
+    Ok(())
+}
+
 impl Runtime {
     async fn mcp_ext(
         &self,
@@ -267,6 +296,7 @@ impl Runtime {
     }
     /// Reads the latest state for a generation-bound MCP Task.
     pub async fn get_mcp_task(&self, handle: &McpTaskHandle) -> Result<McpTask, Error> {
+        handle.durable_identity()?;
         let value = self
             .inner
             .mcp_modern(
@@ -287,13 +317,83 @@ impl Runtime {
             .ok_or_else(|| Error::Operation("MCP Task response omitted result".into()))?;
         parse_task(&handle.session_id, &handle.server, client_id, raw)
     }
+    /// Reconciles one Host-persisted stable Task identity against the current
+    /// Session/server connection without replaying the operation that created
+    /// it. Success returns a fresh generation-bound handle; any unavailable or
+    /// ambiguous answer remains explicitly recovery-required.
+    pub async fn recover_mcp_task(
+        &self,
+        identity: &McpTaskIdentity,
+    ) -> Result<McpTaskRecovery, Error> {
+        let value = match self
+            .inner
+            .mcp_modern(
+                identity.session_id(),
+                identity.server().to_owned(),
+                xai_grok_shell::extensions::mcp::McpModernOperation::RecoverTask {
+                    task_id: identity.task_id().to_owned(),
+                },
+            )
+            .await
+        {
+            Ok(value) => value,
+            Err(_) => {
+                return Ok(McpTaskRecovery::RecoveryRequired {
+                    identity: identity.clone(),
+                });
+            }
+        };
+        let client_id = value["clientId"].as_u64().ok_or_else(|| {
+            Error::Operation("MCP Task recovery omitted client generation".into())
+        })?;
+        let raw = value
+            .get("result")
+            .cloned()
+            .ok_or_else(|| Error::Operation("MCP Task recovery omitted result".into()))?;
+        let task = parse_task(identity.session_id(), identity.server(), client_id, raw)?;
+        if task.handle.durable_identity()? != *identity {
+            return Err(Error::Operation(
+                "MCP Task recovery returned a different stable identity".into(),
+            ));
+        }
+        Ok(McpTaskRecovery::Reattached {
+            task: Box::new(task),
+        })
+    }
     /// Supplies responses to an input_required MCP Task. Task state is read
-    /// separately with [`Runtime::get_mcp_task`].
+    /// first and every non-elicitation request must be answered exactly once.
+    /// Elicitation is refused; use [`Runtime::resolve_mcp_task_input_with_ui`].
     pub async fn update_mcp_task(
         &self,
         handle: &McpTaskHandle,
         input_responses: McpInputResponses,
     ) -> Result<(), Error> {
+        let task = self.get_mcp_task(handle).await?;
+        let input = task.input_required.as_ref().ok_or_else(|| {
+            Error::Operation("MCP Task is not waiting for structured input".into())
+        })?;
+        if input
+            .requests
+            .iter()
+            .any(|request| request.kind == McpInputRequestKind::Elicitation)
+        {
+            return Err(Error::InvalidConfig(
+                "MCP elicitation answers are accepted only from the product UI channel".into(),
+            ));
+        }
+        validate_non_ui_responses(input, &input_responses)?;
+        self.update_mcp_task_bound(handle, task.raw, input_responses)
+            .await
+    }
+
+    async fn update_mcp_task_bound(
+        &self,
+        handle: &McpTaskHandle,
+        expected_task: serde_json::Value,
+        input_responses: McpInputResponses,
+    ) -> Result<(), Error> {
+        handle.durable_identity()?;
+        validate_mcp_input_responses(&input_responses)?;
         self.inner
             .mcp_modern(
                 &handle.session_id,
@@ -301,14 +401,124 @@ impl Runtime {
                 xai_grok_shell::extensions::mcp::McpModernOperation::UpdateTask {
                     client_id: handle.client_id,
                     task_id: handle.task_id.clone(),
+                    expected_task,
                     input_responses,
                 },
             )
             .await
             .map(drop)
     }
+    /// Obtains every elicitation answer from the installed product UI and
+    /// updates the exact generation-bound Task. Callers may provide responses
+    /// only for non-elicitation requests in the same round.
+    pub async fn resolve_mcp_task_input_with_ui(
+        &self,
+        handle: &McpTaskHandle,
+        non_ui_responses: McpInputResponses,
+    ) -> Result<(), Error> {
+        let task = self.get_mcp_task(handle).await?;
+        let input = task.input_required.as_ref().ok_or_else(|| {
+            Error::Operation("MCP Task is not waiting for structured input".into())
+        })?;
+        let identity = handle.durable_identity()?;
+        let responses = self
+            .resolve_elicitation_responses(
+                input,
+                non_ui_responses,
+                McpElicitationOrigin::Task {
+                    identity,
+                    client_id: handle.client_id,
+                },
+            )
+            .await?;
+        self.update_mcp_task_bound(handle, task.raw, responses)
+            .await
+    }
+    /// Obtains elicitation answers for one direct MRTR round from the installed
+    /// product UI and returns the bound continuation. Callers may supply only
+    /// roots/sampling responses; supplying an elicitation key fails closed.
+    pub async fn resolve_mcp_input_with_ui(
+        &self,
+        input: &McpInputRequired,
+        non_ui_responses: McpInputResponses,
+    ) -> Result<McpContinuation, Error> {
+        let identity = input.continuation_identity.as_ref().ok_or_else(|| {
+            Error::Operation(
+                "this MCP input requirement belongs to a Task; use resolve_mcp_task_input_with_ui"
+                    .into(),
+            )
+        })?;
+        let responses = self
+            .resolve_elicitation_responses(
+                input,
+                non_ui_responses,
+                McpElicitationOrigin::Operation {
+                    session_id: identity.session_id.clone(),
+                    server: identity.server.clone(),
+                    client_id: identity.client_id,
+                },
+            )
+            .await?;
+        input.bound_response(responses)
+    }
+
+    async fn resolve_elicitation_responses(
+        &self,
+        input: &McpInputRequired,
+        mut responses: McpInputResponses,
+        origin: McpElicitationOrigin,
+    ) -> Result<McpInputResponses, Error> {
+        let ui = self.mcp_elicitation_ui.as_ref().ok_or_else(|| {
+            Error::Operation("no MCP product UI elicitation channel is installed".into())
+        })?;
+        validate_non_ui_responses(input, &responses)?;
+        let mut found_elicitation = false;
+        let requests = input.validated_requests()?.to_vec();
+        for request in &requests {
+            if request.kind != McpInputRequestKind::Elicitation {
+                continue;
+            }
+            found_elicitation = true;
+            let params = request
+                .raw
+                .get("params")
+                .cloned()
+                .ok_or_else(|| Error::Operation("MCP elicitation omitted params".into()))?;
+            let params = serde_json::from_value(params).map_err(|error| {
+                Error::Operation(format!("invalid MCP elicitation params: {error}"))
+            })?;
+            let request_for_ui =
+                checked_elicitation_request(origin.clone(), request.id.clone(), params)?;
+            let result = ui
+                .elicit(request_for_ui)
+                .await
+                .map_err(|source| Error::Host {
+                    method: "mcp/elicitation".into(),
+                    source: HostError {
+                        code: source.code,
+                        message: source.message,
+                        data: source.data.unwrap_or(serde_json::Value::Null),
+                    },
+                })?;
+            validate_elicitation_result(&result)?;
+            responses.insert(
+                request.id.clone(),
+                serde_json::to_value(result).map_err(|error| {
+                    Error::Operation(format!("invalid MCP elicitation answer: {error}"))
+                })?,
+            );
+        }
+        if !found_elicitation {
+            return Err(Error::InvalidConfig(
+                "the MCP input round contains no elicitation request".into(),
+            ));
+        }
+        validate_mcp_input_responses(&responses)?;
+        Ok(responses)
+    }
     /// Requests cancellation of a generation-bound MCP Task.
     pub async fn cancel_mcp_task(&self, handle: &McpTaskHandle) -> Result<(), Error> {
+        handle.durable_identity()?;
         self.inner
             .mcp_modern(
                 &handle.session_id,

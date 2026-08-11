@@ -212,13 +212,29 @@ pub(crate) fn parse_resource_result(v: serde_json::Value) -> Result<McpReadResou
 }
 
 pub(crate) fn parse_input_required(v: serde_json::Value) -> Result<McpInputRequired, Error> {
-    let requests = v
-        .get("inputRequests")
-        .and_then(serde_json::Value::as_object)
-        .map(|requests| {
+    let encoded = serde_json::to_vec(&v)
+        .map_err(|error| Error::Operation(format!("invalid MCP input requirement: {error}")))?;
+    if encoded.len() > MAX_MCP_INPUT_PAYLOAD_BYTES {
+        return Err(Error::Operation(format!(
+            "MCP input requirement exceeds {MAX_MCP_INPUT_PAYLOAD_BYTES} bytes"
+        )));
+    }
+    let requests = match v.get("inputRequests") {
+        None | Some(serde_json::Value::Null) => Vec::new(),
+        Some(serde_json::Value::Object(requests)) => {
+            if requests.len() > MAX_MCP_INPUT_REQUESTS {
+                return Err(Error::Operation(format!(
+                    "MCP input requirement exceeds {MAX_MCP_INPUT_REQUESTS} requests"
+                )));
+            }
             requests
                 .iter()
                 .map(|(id, request)| {
+                    if !valid_bounded_line(id, MAX_MCP_INPUT_REQUEST_ID_BYTES) {
+                        return Err(Error::Operation(
+                            "MCP input request identity is invalid".into(),
+                        ));
+                    }
                     let kind = match request.get("method").and_then(serde_json::Value::as_str) {
                         Some("sampling/createMessage") => McpInputRequestKind::Sampling,
                         Some("elicitation/create") => McpInputRequestKind::Elicitation,
@@ -240,25 +256,43 @@ pub(crate) fn parse_input_required(v: serde_json::Value) -> Result<McpInputRequi
                         raw: request.clone(),
                     })
                 })
-                .collect::<Result<Vec<_>, Error>>()
-        })
-        .transpose()?
-        .unwrap_or_default();
-    let request_state = v
-        .get("requestState")
-        .and_then(serde_json::Value::as_str)
-        .map(str::to_owned);
+                .collect::<Result<Vec<_>, Error>>()?
+        }
+        Some(_) => {
+            return Err(Error::Operation(
+                "MCP inputRequests must be an object".into(),
+            ));
+        }
+    };
+    let request_state = match v.get("requestState") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::String(state)) => Some(state.clone()),
+        Some(_) => {
+            return Err(Error::Operation("MCP requestState must be a string".into()));
+        }
+    };
+    if request_state
+        .as_deref()
+        .is_some_and(|state| state.len() > MAX_MCP_INPUT_PAYLOAD_BYTES)
+    {
+        return Err(Error::Operation(
+            "MCP input request state exceeds its bound".into(),
+        ));
+    }
     if requests.is_empty() && request_state.is_none() {
         return Err(Error::Operation(
             "invalid MCP input_required response: no requests or request state".into(),
         ));
     }
-    Ok(McpInputRequired {
+    let mut input = McpInputRequired {
         requests,
         request_state,
         raw: v,
         continuation_identity: None,
-    })
+        round_binding: None,
+    };
+    input.round_binding = Some(Box::new(McpInputRoundBinding::capture(&input)));
+    Ok(input)
 }
 
 pub(crate) fn parse_task_status(value: &serde_json::Value) -> Result<McpTaskStatus, Error> {
@@ -278,11 +312,19 @@ pub(crate) fn parse_task(
     client_id: u64,
     raw: serde_json::Value,
 ) -> Result<McpTask, Error> {
+    let encoded = serde_json::to_vec(&raw)
+        .map_err(|error| Error::Operation(format!("invalid MCP Task: {error}")))?;
+    if encoded.len() > MAX_MCP_TASK_PAYLOAD_BYTES {
+        return Err(Error::Operation(format!(
+            "MCP Task exceeds {MAX_MCP_TASK_PAYLOAD_BYTES} bytes"
+        )));
+    }
     let task_id = raw
         .get("taskId")
         .and_then(serde_json::Value::as_str)
         .ok_or_else(|| Error::Operation("MCP Task omitted taskId".into()))?
         .to_owned();
+    let identity = McpTaskIdentity::new(session_id.clone(), server, task_id)?;
     let status = parse_task_status(&raw["status"])?;
     let input_required = if status == McpTaskStatus::InputRequired {
         Some(parse_input_required(serde_json::json!({
@@ -292,17 +334,36 @@ pub(crate) fn parse_task(
     } else {
         None
     };
+    let status_message = raw["statusMessage"].as_str().map(str::to_owned);
+    if status_message
+        .as_deref()
+        .is_some_and(|message| message.len() > MAX_MCP_TASK_STATUS_MESSAGE_BYTES)
+    {
+        return Err(Error::Operation(format!(
+            "MCP Task status message exceeds {MAX_MCP_TASK_STATUS_MESSAGE_BYTES} bytes"
+        )));
+    }
+    let created_at = raw["createdAt"]
+        .as_str()
+        .filter(|value| valid_bounded_line(value, 128))
+        .ok_or_else(|| Error::Operation("MCP Task has an invalid createdAt".into()))?
+        .to_owned();
+    let last_updated_at = raw["lastUpdatedAt"]
+        .as_str()
+        .filter(|value| valid_bounded_line(value, 128))
+        .ok_or_else(|| Error::Operation("MCP Task has an invalid lastUpdatedAt".into()))?
+        .to_owned();
     Ok(McpTask {
         handle: McpTaskHandle {
-            session_id: session_id.clone(),
-            server: server.to_owned(),
+            session_id: identity.session_id().clone(),
+            server: identity.server().to_owned(),
             client_id,
-            task_id,
+            task_id: identity.task_id().to_owned(),
         },
         status,
-        status_message: raw["statusMessage"].as_str().map(str::to_owned),
-        created_at: raw["createdAt"].as_str().unwrap_or_default().to_owned(),
-        last_updated_at: raw["lastUpdatedAt"].as_str().unwrap_or_default().to_owned(),
+        status_message,
+        created_at,
+        last_updated_at,
         ttl_ms: raw["ttl"].as_u64().or_else(|| raw["ttlMs"].as_u64()),
         poll_interval_ms: raw["pollInterval"]
             .as_u64()

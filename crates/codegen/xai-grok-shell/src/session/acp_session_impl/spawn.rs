@@ -2196,6 +2196,11 @@ impl SessionThread {
     pub fn is_finished(&self) -> bool {
         self.join_handle.is_finished()
     }
+    /// Consume and join the actor thread. Teardown custody uses this rather
+    /// than dropping an unfinished `JoinHandle`, which would detach the actor.
+    pub(crate) fn join(self) {
+        let _ = self.join_handle.join();
+    }
     /// Construct from a raw `JoinHandle`. Used in tests.
     #[cfg(test)]
     pub fn from_handle(handle: std::thread::JoinHandle<()>) -> Self {

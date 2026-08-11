@@ -104,11 +104,20 @@ impl RuntimeBuilder {
         self.options.in_process_mcp_servers = value.into_iter().collect();
         self
     }
-    /// Installs typed roots, sampling, and elicitation services used to
-    /// fulfill MCP 2026 MRTR input requests. Capability advertisement is
-    /// derived from the installed services and cannot be enabled separately.
+    /// Installs typed roots and sampling services used to fulfill MCP 2026
+    /// MRTR input requests. Generic elicitation services are rejected at
+    /// startup; use [`RuntimeBuilder::mcp_elicitation_ui`] so only the product
+    /// UI can supply an elicitation answer.
     pub fn mcp_host_services(mut self, value: McpHostServices) -> Self {
         self.options.mcp_host_services = value;
+        self
+    }
+    /// Installs the sole MCP elicitation answer authority. The SDK advertises
+    /// form and URL elicitation with schema validation, invokes this delegate
+    /// with the bound operation/Task identity, and never accepts an elicitation
+    /// answer through generic continuation or Task-update arguments.
+    pub fn mcp_elicitation_ui(mut self, value: Arc<dyn McpElicitationUi>) -> Self {
+        self.options.mcp_elicitation_ui = Some(value);
         self
     }
     /// Registers typed reverse-channel hooks. Hooks are enabled only by the
@@ -156,6 +165,7 @@ impl RuntimeBuilder {
     }
     pub async fn start(self) -> Result<(Runtime, mpsc::UnboundedReceiver<Event>), Error> {
         let conversation = self.options.conversation_delegate.clone();
+        let mcp_elicitation_ui = self.options.mcp_elicitation_ui.clone();
         private::Runtime::start_with_stores(
             self.config,
             self.options,
@@ -169,6 +179,7 @@ impl RuntimeBuilder {
                 Runtime {
                     inner,
                     conversation,
+                    mcp_elicitation_ui,
                 },
                 events,
             )

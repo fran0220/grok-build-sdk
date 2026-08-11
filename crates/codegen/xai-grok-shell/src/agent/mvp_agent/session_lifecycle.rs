@@ -2,6 +2,15 @@
 //! Co-located `#[path]`-style child of `mvp_agent` (`use super::*`) so the `impl`
 //! block keeps access to `MvpAgent`'s private fields.
 use super::*;
+
+/// Release every process-global authority owned by an embedded session, but
+/// only after its actor has positively exited. Normal unload retries and the
+/// final thread reaper share this ordering so they cannot drift.
+pub(super) fn finalize_origin_session_unload(session_id: &str) {
+    crate::agent::session_capabilities::release(session_id);
+    xai_grok_shared::session::unregister_session_tree(session_id);
+    crate::origin_runtime::unregister_session_tree(session_id);
+}
 /// Bound on close's wait for a prompt still in intake.
 pub(super) const CLOSE_INTAKE_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 /// Bound on close's wait for an in-flight attach.
@@ -81,6 +90,15 @@ impl MvpAgent {
         let deadline = tokio::time::Instant::now() + CLOSE_TOTAL_BUDGET;
         self.wait_for_load_to_settle(id, stage_budget(deadline, CLOSE_ATTACH_SETTLE_WAIT))
             .await;
+        if !self.is_resident(id) {
+            let ticket = self
+                .session_registry
+                .unloading_ticket(id)
+                .ok_or("session is not resident or awaiting unload reconciliation")?;
+            return self
+                .drain_unloading_session(id, ticket, deadline)
+                .await;
+        }
         let Some(target) = self.resident_handle(id).map(|h| h.cmd_tx.clone()) else {
             return Err("session is not resident");
         };
@@ -101,11 +119,37 @@ impl MvpAgent {
         }
         drop(intake_guard);
         self.remove_session(id);
-        let drained = self
-            .drain_old_session_thread_within(id, stage_budget(deadline, DRAIN_OLD_THREAD_WAIT))
-            .await;
-        xai_grok_shared::session::unregister_session_tree(id.0.as_ref());
-        Ok(drained)
+        let Some(ticket) = self.session_registry.begin_unloading(id) else {
+            finalize_origin_session_unload(id.0.as_ref());
+            return Ok(true);
+        };
+        self.drain_unloading_session(id, ticket, deadline).await
+    }
+    /// Drain the exact actor generation held by one unload attempt. The
+    /// ticket serializes retries and compare-and-complete prevents stale work
+    /// from clearing or unregistering a replacement.
+    async fn drain_unloading_session(
+        &self,
+        id: &acp::SessionId,
+        ticket: super::session_registry::UnloadTicket,
+        deadline: tokio::time::Instant,
+    ) -> Result<bool, &'static str> {
+        let _guard = match tokio::time::timeout_at(deadline, ticket.lock()).await {
+            Ok(guard) => guard,
+            Err(_) => return Ok(false),
+        };
+        if !self.session_registry.unloading_matches(id, &ticket) {
+            return Err("session unload attempt was superseded");
+        }
+        let budget = stage_budget(deadline, DRAIN_OLD_THREAD_WAIT);
+        if !self.drain_old_session_thread_within(id, budget).await {
+            return Ok(false);
+        }
+        if !self.session_registry.complete_unloading(id, &ticket) {
+            return Err("session unload attempt was superseded");
+        }
+        finalize_origin_session_unload(id.0.as_ref());
+        Ok(true)
     }
     /// ACP `session/close` and its pre-ACP spelling. Orders behind prompt
     /// intake; every wait spends from [`CLOSE_TOTAL_BUDGET`].
@@ -113,6 +157,9 @@ impl MvpAgent {
         let deadline = tokio::time::Instant::now() + CLOSE_TOTAL_BUDGET;
         self.wait_for_load_to_settle(id, stage_budget(deadline, CLOSE_ATTACH_SETTLE_WAIT))
             .await;
+        if self.session_registry.is_unloading(id) {
+            return CloseOutcome::DrainTimedOut;
+        }
         let Some(target) = self.resident_handle(id).map(|h| h.cmd_tx.clone()) else {
             return if self
                 .drain_old_session_thread_within(
@@ -213,6 +260,9 @@ impl MvpAgent {
         &self,
         id: &acp::SessionId,
     ) -> Result<(), &'static str> {
+        if self.session_registry.is_unloading(id) {
+            return Err("session unload reconciliation must complete before deletion");
+        }
         let deadline = tokio::time::Instant::now() + DELETE_TOTAL_BUDGET;
         let resident = self.hard_stop_resident(id, CancelTrigger::SessionDelete);
         if resident {
@@ -507,6 +557,9 @@ impl MvpAgent {
     pub(super) fn sweep_dead_sessions(&self) {
         let dead = self.session_registry.finished_threads();
         for id in dead {
+            if self.session_registry.is_unloading(&id) {
+                continue;
+            }
             if self.session_registry.live(&id) == Some(SessionLiveState::Attaching)
                 && !self.is_resident(&id)
             {

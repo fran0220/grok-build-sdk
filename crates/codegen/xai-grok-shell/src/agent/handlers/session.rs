@@ -84,16 +84,10 @@ async fn handle_origin_session_unload(
     let req: UnloadRequest = serde_json::from_str(args.params.get())
         .map_err(|e| acp::Error::invalid_params().data(format!("invalid params: {e}")))?;
     let sid = acp::SessionId::new(req.session_id);
-    if !agent.is_resident(&sid) {
-        return Err(acp::Error::resource_not_found(Some(
-            "session is not resident".into(),
-        )));
-    }
     let drained = agent
         .unload_session(&sid)
         .await
         .map_err(|reason| acp::Error::internal_error().data(reason))?;
-    crate::agent::session_capabilities::release(sid.0.as_ref());
     crate::extensions::to_raw_response(&serde_json::json!({
         "success": true,
         "drained": drained,

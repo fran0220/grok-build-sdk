@@ -785,6 +785,10 @@ impl MvpAgent {
         arguments: acp::LoadSessionRequest,
         op: AttachOperation,
     ) -> Result<acp::LoadSessionResponse, acp::Error> {
+        if self.session_registry.is_unloading(&arguments.session_id) {
+            return Err(acp::Error::internal_error()
+                .data("native session unload reconciliation is still pending"));
+        }
         let _load_guard = self.begin_session_load(&arguments.session_id);
         reject_chat_kind_without_feature(arguments.meta.as_ref())?;
         self.sweep_dead_sessions();

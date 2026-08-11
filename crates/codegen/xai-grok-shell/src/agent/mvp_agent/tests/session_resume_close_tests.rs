@@ -184,6 +184,163 @@ fn close_does_not_report_superseded_until_the_old_actor_drains() {
     });
 }
 
+/// A bounded embedded unload is not permission to forget its actor. The first
+/// timeout keeps the exact thread, storage/correlation roots, and capability
+/// layer under custody; even a supervisor sweep cannot consume that evidence.
+/// A later retry drains the same actor and performs cleanup exactly then.
+#[test]
+fn unload_timeout_retains_custody_until_retry_succeeds() {
+    super::run_local_for_bridge_test(|| async {
+        tokio::time::pause();
+        let agent = super::build_minimal_agent_for_tests();
+        let sid = acp::SessionId::new(format!("unload-retry-{}", uuid::Uuid::now_v7()));
+        let (handle, _tx, _rx) = super::make_live_session_handle(&sid, None);
+        agent.insert_resident(&sid, handle);
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let (exited_tx, exited_rx) = std::sync::mpsc::channel::<()>();
+        agent.session_registry.set_thread(
+            &sid,
+            crate::session::SessionThread::from_handle(std::thread::spawn(move || {
+                let _ = release_rx.recv();
+                let _ = exited_tx.send(());
+            })),
+        );
+
+        let storage = tempfile::tempdir().expect("storage root");
+        assert_eq!(
+            xai_grok_shared::session::register_session_root(sid.0.as_ref(), storage.path()),
+            Some(true)
+        );
+        assert!(crate::origin_runtime::register_root_session(sid.0.as_ref()));
+        crate::origin_runtime::bind_session_capabilities(
+            sid.0.as_ref(),
+            Some(&serde_json::json!({"agentServices": {"probe": "model"}})),
+        );
+
+        let mut first = std::pin::pin!(agent.unload_session(&sid));
+        assert!(
+            futures::poll!(first.as_mut()).is_pending(),
+            "the blocked actor must hold the first unload pending"
+        );
+        assert!(
+            agent.session_registry.is_unloading(&sid),
+            "unload custody must be published before the first drain await"
+        );
+        tokio::time::advance(CLOSE_TOTAL_BUDGET + std::time::Duration::from_secs(1)).await;
+        assert_eq!(
+            first.await.expect("bounded unload responds"),
+            false,
+            "the deadline must be reported rather than swallowed"
+        );
+        assert!(agent.session_registry.has_thread(&sid));
+        assert_eq!(
+            xai_grok_shared::session::register_session_root(sid.0.as_ref(), storage.path()),
+            Some(false),
+            "the storage root must remain registered while the actor is unfinished"
+        );
+        assert_eq!(
+            crate::origin_runtime::resolve_root_session(sid.0.as_ref(), None),
+            Some(sid.0.to_string()),
+            "the correlation root must remain registered while unload is pending"
+        );
+        assert_eq!(
+            crate::agent::session_capabilities::agent_services_for(sid.0.as_ref())
+                .get("probe")
+                .map(String::as_str),
+            Some("model"),
+            "the actor's capability authority must outlive its bounded drain"
+        );
+
+        drop(release_tx);
+        exited_rx.recv().expect("actor exits after release");
+        agent.sweep_dead_sessions();
+        assert!(
+            agent.session_registry.is_unloading(&sid),
+            "the generic supervisor must leave completed unload evidence for retry"
+        );
+        assert!(
+            agent.unload_session(&sid).await.expect("retry is accepted"),
+            "retry must positively reconcile the retained actor"
+        );
+        assert!(!agent.session_registry.has_thread(&sid));
+        assert_eq!(
+            crate::origin_runtime::resolve_root_session(sid.0.as_ref(), None),
+            None
+        );
+        assert!(
+            crate::agent::session_capabilities::agent_services_for(sid.0.as_ref()).is_empty()
+        );
+        assert_eq!(
+            xai_grok_shared::session::register_session_root(sid.0.as_ref(), storage.path()),
+            Some(true),
+            "successful retry must finally release the storage root"
+        );
+        xai_grok_shared::session::unregister_session_tree(sid.0.as_ref());
+    });
+}
+
+/// Runtime teardown cannot synchronously retain the shell registry after it
+/// has reported an aggregated shutdown failure. Its final drop therefore
+/// transfers the exact actor JoinHandle to the process reaper, which keeps all
+/// roots live until it joins that actor and only then releases authority.
+#[test]
+fn final_registry_drop_reaps_instead_of_detaching_an_unfinished_actor() {
+    super::run_local_for_bridge_test(|| async {
+        let sid = acp::SessionId::new(format!("unload-reaper-{}", uuid::Uuid::now_v7()));
+        let storage = tempfile::tempdir().expect("storage root");
+        assert_eq!(
+            xai_grok_shared::session::register_session_root(sid.0.as_ref(), storage.path()),
+            Some(true)
+        );
+        assert!(crate::origin_runtime::register_root_session(sid.0.as_ref()));
+        crate::origin_runtime::bind_session_capabilities(
+            sid.0.as_ref(),
+            Some(&serde_json::json!({"agentServices": {"probe": "model"}})),
+        );
+
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let (exited_tx, exited_rx) = std::sync::mpsc::channel::<()>();
+        let agent = super::build_minimal_agent_for_tests();
+        agent.session_registry.set_thread(
+            &sid,
+            crate::session::SessionThread::from_handle(std::thread::spawn(move || {
+                let _ = release_rx.recv();
+                let _ = exited_tx.send(());
+            })),
+        );
+        assert!(agent.session_registry.begin_unloading(&sid).is_some());
+        drop(agent);
+
+        assert_eq!(
+            crate::origin_runtime::resolve_root_session(sid.0.as_ref(), None),
+            Some(sid.0.to_string()),
+            "final registry drop must not release roots before actor exit"
+        );
+        drop(release_tx);
+        exited_rx.recv().expect("reaper-owned actor exits");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while crate::origin_runtime::resolve_root_session(sid.0.as_ref(), None).is_some()
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(
+            crate::origin_runtime::resolve_root_session(sid.0.as_ref(), None),
+            None,
+            "the reaper must release correlation authority after join"
+        );
+        assert!(
+            crate::agent::session_capabilities::agent_services_for(sid.0.as_ref()).is_empty()
+        );
+        assert_eq!(
+            xai_grok_shared::session::register_session_root(sid.0.as_ref(), storage.path()),
+            Some(true),
+            "the reaper must release storage authority after join"
+        );
+        xai_grok_shared::session::unregister_session_tree(sid.0.as_ref());
+    });
+}
+
 /// A target can disappear while close waits for intake. The old actor must be
 /// positively drained before this post-observation NotResident is successful.
 #[test]

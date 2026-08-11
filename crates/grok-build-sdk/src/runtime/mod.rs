@@ -50,6 +50,7 @@ pub(crate) fn run_reconcile_command_id(
 pub struct Runtime {
     pub(crate) inner: private::Runtime,
     pub(crate) conversation: Option<Arc<dyn ConversationDelegate>>,
+    pub(crate) mcp_elicitation_ui: Option<Arc<dyn McpElicitationUi>>,
 }
 
 impl Runtime {
@@ -63,6 +64,7 @@ impl Runtime {
                     Self {
                         inner,
                         conversation: None,
+                        mcp_elicitation_ui: None,
                     },
                     events,
                 )
@@ -82,6 +84,7 @@ impl Runtime {
                     Self {
                         inner,
                         conversation: None,
+                        mcp_elicitation_ui: None,
                     },
                     events,
                 )
@@ -107,6 +110,7 @@ impl Runtime {
                 Self {
                     inner,
                     conversation: None,
+                    mcp_elicitation_ui: None,
                 },
                 events,
             )

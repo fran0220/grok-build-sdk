@@ -147,6 +147,17 @@ pub struct McpHostContext {
     pub client_id: u64,
 }
 
+/// Complete identity for an elicitation routed through an embedding product's
+/// UI authority. Kept separate from [`McpHostContext`] so adding UI-specific
+/// fields does not break roots or sampling service implementations.
+#[doc(hidden)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct McpUiElicitationContext {
+    pub host: McpHostContext,
+    pub task_id: Option<String>,
+    pub request_id: String,
+}
+
 /// Error returned by a typed host-side MCP service. It is converted to a
 /// JSON-RPC error without exposing transport or credential state.
 #[derive(Clone, Debug, thiserror::Error)]
@@ -193,6 +204,19 @@ pub trait McpElicitationService: Send + Sync + 'static {
     ) -> Result<ElicitResult, McpHostServiceError>;
 }
 
+/// Dedicated embedding-UI elicitation service. This is distinct from the
+/// generic MCP host service so an SDK façade can reserve answers for one
+/// product-owned channel while preserving the legacy lower-level API.
+#[doc(hidden)]
+#[async_trait::async_trait]
+pub trait McpUiElicitationService: Send + Sync + 'static {
+    async fn create_ui_elicitation(
+        &self,
+        context: McpUiElicitationContext,
+        request: ElicitRequestParams,
+    ) -> Result<ElicitResult, McpHostServiceError>;
+}
+
 /// Immutable host services and the exact client capabilities they authorize.
 /// A capability is absent unless the corresponding typed service is installed.
 #[derive(Clone, Default)]
@@ -200,6 +224,7 @@ pub struct McpHostServices {
     roots: Option<(Arc<dyn McpRootsService>, RootsCapabilities)>,
     sampling: Option<(Arc<dyn McpSamplingService>, SamplingCapability)>,
     elicitation: Option<(Arc<dyn McpElicitationService>, ElicitationCapability)>,
+    ui_elicitation: Option<(Arc<dyn McpUiElicitationService>, ElicitationCapability)>,
 }
 
 impl McpHostServices {
@@ -239,8 +264,45 @@ impl McpHostServices {
         self
     }
 
+    /// Installs the embedding product's authoritative UI elicitation channel.
+    /// When present, the generic elicitation service is never advertised or
+    /// invoked.
+    #[doc(hidden)]
+    pub fn with_ui_elicitation(
+        mut self,
+        service: Arc<dyn McpUiElicitationService>,
+        form: bool,
+        url: bool,
+        schema_validation: bool,
+    ) -> Self {
+        let mut capability = ElicitationCapability::default();
+        capability.form = form.then(|| {
+            FormElicitationCapability::default().with_schema_validation(schema_validation)
+        });
+        capability.url = url.then(UrlElicitationCapability::default);
+        self.ui_elicitation = Some((service, capability));
+        self
+    }
+
     pub fn is_empty(&self) -> bool {
-        self.roots.is_none() && self.sampling.is_none() && self.elicitation.is_none()
+        self.roots.is_none()
+            && self.sampling.is_none()
+            && self.elicitation.is_none()
+            && self.ui_elicitation.is_none()
+    }
+
+    /// Whether the legacy generic elicitation service was installed.
+    #[doc(hidden)]
+    pub fn has_generic_elicitation(&self) -> bool {
+        self.elicitation.is_some()
+    }
+
+    /// Whether an embedding-specific UI authority was installed directly.
+    /// SDK façades use this to reject lower-layer injection and install their
+    /// own identity-binding adapter only after configuration validation.
+    #[doc(hidden)]
+    pub fn has_ui_elicitation(&self) -> bool {
+        self.ui_elicitation.is_some()
     }
 
     fn client_capabilities(&self) -> ClientCapabilities {
@@ -254,9 +316,14 @@ impl McpHostServices {
             .as_ref()
             .map(|(_, capability)| capability.clone());
         capabilities.elicitation = self
-            .elicitation
+            .ui_elicitation
             .as_ref()
-            .map(|(_, capability)| capability.clone());
+            .map(|(_, capability)| capability.clone())
+            .or_else(|| {
+                self.elicitation
+                    .as_ref()
+                    .map(|(_, capability)| capability.clone())
+            });
         capabilities
     }
 }
@@ -279,6 +346,7 @@ impl BoundMcpHostServices {
     async fn fulfill_input_requests(
         &self,
         connection_generation: u64,
+        task_id: Option<&str>,
         requests: InputRequests,
     ) -> Result<InputResponses, rmcp::ErrorData> {
         let mut context = self.context.clone();
@@ -300,17 +368,33 @@ impl BoundMcpHostServices {
                     )
                 }
                 InputRequest::Elicitation(request) => {
-                    let Some((service, _)) = &self.services.elicitation else {
-                        return Err(rmcp::ErrorData::method_not_found::<
-                            rmcp::model::ElicitationCreateRequestMethod,
-                        >());
-                    };
-                    serde_json::to_value(
-                        service
-                            .create_elicitation(context.clone(), request.params)
-                            .await
-                            .map_err(Self::error)?,
-                    )
+                    if let Some((service, _)) = &self.services.ui_elicitation {
+                        serde_json::to_value(
+                            service
+                                .create_ui_elicitation(
+                                    McpUiElicitationContext {
+                                        host: context.clone(),
+                                        task_id: task_id.map(str::to_owned),
+                                        request_id: key.clone(),
+                                    },
+                                    request.params,
+                                )
+                                .await
+                                .map_err(Self::error)?,
+                        )
+                    } else {
+                        let Some((service, _)) = &self.services.elicitation else {
+                            return Err(rmcp::ErrorData::method_not_found::<
+                                rmcp::model::ElicitationCreateRequestMethod,
+                            >());
+                        };
+                        serde_json::to_value(
+                            service
+                                .create_elicitation(context.clone(), request.params)
+                                .await
+                                .map_err(Self::error)?,
+                        )
+                    }
                 }
                 InputRequest::ListRoots(_) => {
                     let Some((service, _)) = &self.services.roots else {
@@ -2943,6 +3027,9 @@ pub struct McpClient {
     /// shared slot lets all transport constructors stay uniform while still
     /// making capability advertisement depend on real host authorization.
     host_services: Arc<parking_lot::Mutex<Option<BoundMcpHostServices>>>,
+    /// Serializes Task input snapshot checks and updates on this client. MCP
+    /// has no Task-round CAS field, so two local answer paths must not race.
+    task_input_gate: Mutex<()>,
 }
 
 /// Shared sender slot type — the same Arc lives on the [`McpClient`]
@@ -3196,14 +3283,54 @@ impl McpClient {
         }))
     }
 
-    pub async fn update_task(
+    /// Reattaches a server-assigned Task identity to the current connection
+    /// generation. Unlike `get_task_json`, this deliberately does not accept
+    /// an old generation: callers use it only after independently deciding to
+    /// recover a previously recorded stable Task identity.
+    pub async fn recover_task_json(&self, task_id: String) -> Result<serde_json::Value, McpError> {
+        let service = self.ensure_initialized().await?;
+        let result = service
+            .peer()
+            .get_task(rmcp::model::GetTaskParams::new(task_id))
+            .await
+            .map_err(|error| McpError::ClientError(error.to_string()))?;
+        Ok(serde_json::json!({
+            "clientId": service.connection_generation(),
+            "result": result,
+        }))
+    }
+
+    pub async fn update_task_if_current(
         &self,
         expected_client_id: u64,
         task_id: String,
+        expected_task: serde_json::Value,
         input_responses: InputResponses,
     ) -> Result<(), McpError> {
+        let _guard = self.task_input_gate.lock().await;
         let service = self.ensure_initialized().await?;
         Self::require_client_generation(&service, expected_client_id)?;
+        let current = service
+            .peer()
+            .get_task(rmcp::model::GetTaskParams::new(task_id.clone()))
+            .await
+            .map_err(|error| McpError::ClientError(error.to_string()))?;
+        let current = serde_json::to_value(current.task)
+            .map_err(|error| McpError::ClientError(error.to_string()))?;
+        let same_round = [
+            "taskId",
+            "status",
+            "lastUpdatedAt",
+            "inputRequests",
+            "requestState",
+        ]
+        .into_iter()
+        .all(|field| current.get(field) == expected_task.get(field));
+        if !same_round {
+            return Err(McpError::ClientError(
+                "MCP task input changed before its answers were submitted".to_owned(),
+            ));
+        }
         service
             .peer()
             .update_task(rmcp::model::UpdateTaskParams::new(task_id, input_responses))
@@ -3382,6 +3509,7 @@ impl McpClient {
             notify_tx: Arc::new(parking_lot::Mutex::new(None)),
             liveness_handle: Arc::new(parking_lot::Mutex::new(None)),
             host_services: Arc::new(parking_lot::Mutex::new(None)),
+            task_input_gate: Mutex::new(()),
         }
     }
 
@@ -4667,6 +4795,7 @@ impl McpClient {
                     params.input_responses = Some(
                         host.fulfill_input_requests(
                             mcp_service.connection_generation(),
+                            None,
                             input.input_requests.unwrap_or_default(),
                         )
                         .await
@@ -4706,6 +4835,22 @@ impl McpClient {
             match result.task.payload {
                 rmcp::model::TaskPayload::Working => {}
                 rmcp::model::TaskPayload::InputRequired { input_requests } => {
+                    let _guard = self.task_input_gate.lock().await;
+                    let input_snapshot = rmcp::model::DetailedTask::new(
+                        task.clone(),
+                        rmcp::model::TaskPayload::InputRequired {
+                            input_requests: input_requests.clone(),
+                        },
+                    );
+                    let current = service
+                        .peer()
+                        .get_task(rmcp::model::GetTaskParams::new(task.task_id.clone()))
+                        .await?;
+                    if current.task != input_snapshot {
+                        return Err(McpError::ClientError(
+                            "MCP task input changed before the product UI could answer".to_owned(),
+                        ));
+                    }
                     let host = self.host_services.lock().clone().ok_or_else(|| {
                         McpError::ClientError(
                             "MCP task requested host input but no typed host service is installed"
@@ -4713,9 +4858,22 @@ impl McpClient {
                         )
                     })?;
                     let responses = host
-                        .fulfill_input_requests(service.connection_generation(), input_requests)
+                        .fulfill_input_requests(
+                            service.connection_generation(),
+                            Some(&task.task_id),
+                            input_requests,
+                        )
                         .await
                         .map_err(|error| McpError::ClientError(error.to_string()))?;
+                    let current = service
+                        .peer()
+                        .get_task(rmcp::model::GetTaskParams::new(task.task_id.clone()))
+                        .await?;
+                    if current.task != input_snapshot {
+                        return Err(McpError::ClientError(
+                            "MCP task input changed while the product UI was answering".to_owned(),
+                        ));
+                    }
                     service
                         .peer()
                         .update_task(rmcp::model::UpdateTaskParams::new(

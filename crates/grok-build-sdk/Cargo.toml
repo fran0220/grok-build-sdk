@@ -17,6 +17,7 @@ agent-client-protocol = { workspace = true }
 async-trait = { workspace = true }
 base64 = { workspace = true }
 fs2 = { workspace = true }
+http = { workspace = true }
 indexmap = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
@@ -24,6 +25,7 @@ sha2 = { workspace = true }
 rusqlite = { version = "0.37", features = ["bundled"] }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["rt", "sync", "time"] }
+url = { workspace = true }
 uuid = { workspace = true }
 xai-acp-lib = { workspace = true }
 xai-agent-lifecycle = { workspace = true }

@@ -608,18 +608,30 @@ pub(super) fn typed_mcp_notification(
             let client_id = payload["clientId"].as_u64()?;
             let task = payload.get("task")?.as_object()?;
             let task_id = task.get("taskId")?.as_str()?.to_owned();
+            let identity = crate::McpTaskIdentity::new(session_id, server, task_id).ok()?;
             let status = crate::parse_task_status(task.get("status")?).ok()?;
             let status_message = match task.get("statusMessage") {
                 Some(serde_json::Value::Null) | None => None,
-                Some(value) => Some(value.as_str()?.to_owned()),
+                Some(value) => Some(
+                    value
+                        .as_str()
+                        .filter(|message| {
+                            message.len() <= crate::MAX_MCP_TASK_STATUS_MESSAGE_BYTES
+                        })?
+                        .to_owned(),
+                ),
             };
-            let last_updated_at = task.get("lastUpdatedAt")?.as_str()?.to_owned();
+            let last_updated_at = task
+                .get("lastUpdatedAt")?
+                .as_str()
+                .filter(|value| crate::valid_bounded_line(value, 128))?
+                .to_owned();
             Some(EventUpdate::McpTaskStatus(crate::McpTaskStatusEvent {
                 handle: crate::McpTaskHandle {
-                    session_id,
-                    server: server.to_owned(),
+                    session_id: identity.session_id().clone(),
+                    server: identity.server().to_owned(),
                     client_id,
-                    task_id,
+                    task_id: identity.task_id().to_owned(),
                 },
                 status,
                 status_message,

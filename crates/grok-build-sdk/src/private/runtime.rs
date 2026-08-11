@@ -40,6 +40,15 @@ impl Runtime {
     ) -> Result<(Self, mpsc::UnboundedReceiver<Event>), Error> {
         validate(&input, &options)?;
         mount_conversation_tools(&mut options)?;
+        if let Some(ui) = options.mcp_elicitation_ui.clone() {
+            options.mcp_host_services = std::mem::take(&mut options.mcp_host_services)
+                .with_ui_elicitation(
+                    Arc::new(crate::McpElicitationUiAdapter(ui)),
+                    true,
+                    true,
+                    true,
+                );
+        }
         let options = options;
         if options.event_journal_capacity == 0 {
             return Err(Error::InvalidConfig(

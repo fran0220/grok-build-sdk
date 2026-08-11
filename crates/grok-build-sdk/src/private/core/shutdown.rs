@@ -95,8 +95,8 @@ impl Core {
                 "native session unload did not detach the actor".into(),
             ));
         }
-        self.finish_close(&id, release_lease && response.drained);
         if response.drained {
+            self.finish_close(&id, release_lease);
             Ok(())
         } else {
             Err(Error::Operation(

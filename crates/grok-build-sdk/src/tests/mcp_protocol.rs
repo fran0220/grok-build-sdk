@@ -210,6 +210,29 @@ fn modern_mcp_mrtr_and_task_parsers_reject_unknown_protocol_variants() {
         )
         .is_err()
     );
+    for malformed in [
+        serde_json::json!({
+            "resultType":"input_required",
+            "inputRequests":[]
+        }),
+        serde_json::json!({
+            "resultType":"input_required",
+            "requestState":7
+        }),
+    ] {
+        assert!(
+            parse_input_required(malformed).is_err(),
+            "present fields with the wrong protocol type must fail closed"
+        );
+    }
+    assert!(
+        parse_input_required(serde_json::json!({
+            "resultType":"input_required",
+            "requestState":"x".repeat(MAX_MCP_INPUT_PAYLOAD_BYTES)
+        }))
+        .is_err(),
+        "the encoded structured-input round is bounded"
+    );
 }
 
 #[test]
@@ -288,4 +311,58 @@ fn modern_mcp_continuations_are_bound_to_the_exact_origin() {
             "cross-origin continuation must fail closed"
         );
     }
+}
+
+#[test]
+fn modern_mcp_continuations_reject_mutated_rounds_and_oversized_answers() {
+    let session = SessionId("continuation-session".into());
+    let operation = McpOperationIdentity::Tool {
+        name: "tool-a".into(),
+        arguments: serde_json::json!({}),
+    };
+    let parse = || {
+        parse_mcp_operation_outcome(
+            &session,
+            "server-a",
+            serde_json::json!({
+                "clientId": 41,
+                "outcome": "input_required",
+                "result": {
+                    "resultType": "input_required",
+                    "inputRequests": {"request-1": {"method": "roots/list"}},
+                    "requestState": "opaque-state"
+                }
+            }),
+            operation.clone(),
+            parse_tool_result,
+        )
+        .expect("input requirement parses")
+    };
+
+    let McpOperationOutcome::InputRequired { mut input, .. } = parse() else {
+        panic!("expected input requirement");
+    };
+    input.request_state = Some("caller-mutated-state".into());
+    assert!(
+        input
+            .respond(BTreeMap::from([(
+                "request-1".into(),
+                serde_json::json!({"roots": []}),
+            )]))
+            .is_err(),
+        "a public projection cannot mutate the SDK-bound round"
+    );
+
+    let McpOperationOutcome::InputRequired { input, .. } = parse() else {
+        panic!("expected input requirement");
+    };
+    assert!(
+        input
+            .respond(BTreeMap::from([(
+                "request-1".into(),
+                serde_json::json!({"roots": ["x".repeat(MAX_MCP_INPUT_PAYLOAD_BYTES)]}),
+            )]))
+            .is_err(),
+        "structured-input answers have an aggregate encoded-byte bound"
+    );
 }

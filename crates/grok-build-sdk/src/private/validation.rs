@@ -121,6 +121,23 @@ pub(super) fn validate(c: &RuntimeConfig, options: &RuntimeOptions) -> Result<()
         ));
     }
     validate_mcp_servers(&options.services.mcp_servers)?;
+    if options.mcp_host_services.has_generic_elicitation() {
+        return Err(Error::InvalidConfig(
+            "generic MCP elicitation services are forbidden; install the product UI channel with mcp_elicitation_ui"
+                .into(),
+        ));
+    }
+    if options.mcp_host_services.has_ui_elicitation() {
+        return Err(Error::InvalidConfig(
+            "lower-layer MCP UI elicitation services are forbidden; install the product UI channel with mcp_elicitation_ui"
+                .into(),
+        ));
+    }
+    if options.mcp_elicitation_ui.is_some() && options.profile != crate::RuntimeProfile::Desktop {
+        return Err(Error::InvalidConfig(
+            "the MCP elicitation UI channel requires the Desktop profile".into(),
+        ));
+    }
     let mut names: HashSet<&str> = options
         .services
         .mcp_servers
@@ -158,25 +175,20 @@ pub(super) fn validate(c: &RuntimeConfig, options: &RuntimeOptions) -> Result<()
     Ok(())
 }
 pub(super) fn validate_mcp_servers(servers: &[crate::McpServerConfig]) -> Result<(), Error> {
+    if servers.len() > crate::MAX_MCP_MOUNTS {
+        return Err(Error::InvalidConfig(format!(
+            "a Runtime may configure at most {} MCP mounts",
+            crate::MAX_MCP_MOUNTS
+        )));
+    }
     let mut mcp_names = HashSet::new();
-    if servers.iter().any(|server| {
-        let (name, target, key_values) = match server {
-            crate::McpServerConfig::Stdio {
-                name, command, env, ..
-            } => (name.as_str(), command.to_str().unwrap_or(""), env),
-            crate::McpServerConfig::Http { name, url, headers }
-            | crate::McpServerConfig::Sse { name, url, headers } => {
-                (name.as_str(), url.as_str(), headers)
-            }
-        };
-        name.trim().is_empty()
-            || target.trim().is_empty()
-            || !mcp_names.insert(name)
-            || key_values.keys().any(|key| key.trim().is_empty())
-    }) {
-        return Err(Error::InvalidConfig(
-            "MCP servers require unique non-empty names, targets, and variable/header names".into(),
-        ));
+    for server in servers {
+        server.validate()?;
+        if !mcp_names.insert(server.name()) {
+            return Err(Error::InvalidConfig(
+                "MCP server names must be unique".into(),
+            ));
+        }
     }
     Ok(())
 }

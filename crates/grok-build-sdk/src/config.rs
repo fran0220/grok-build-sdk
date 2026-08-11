@@ -1,6 +1,30 @@
 // Copyright 2026 OriginGame contributors
 // Licensed under the Apache License, Version 2.0.
+use crate::capability::validate_capability_name;
 use crate::*;
+
+/// Maximum remote or stdio MCP mounts accepted in one Runtime-owned list.
+pub const MAX_MCP_MOUNTS: usize = 64;
+/// Maximum byte length of one remote MCP endpoint.
+pub const MAX_MCP_ENDPOINT_BYTES: usize = 2 * 1024;
+/// Maximum number of host-injected headers on one remote MCP mount.
+pub const MAX_MCP_HEADERS: usize = 32;
+/// Maximum byte length of one MCP HTTP header name.
+pub const MAX_MCP_HEADER_NAME_BYTES: usize = 128;
+/// Maximum byte length of one MCP HTTP header value.
+pub const MAX_MCP_HEADER_VALUE_BYTES: usize = 8 * 1024;
+/// Maximum byte length of a stdio MCP command path.
+pub const MAX_MCP_STDIO_COMMAND_BYTES: usize = 4 * 1024;
+/// Maximum number of arguments supplied to one stdio MCP process.
+pub const MAX_MCP_STDIO_ARGS: usize = 256;
+/// Maximum byte length of one stdio MCP argument.
+pub const MAX_MCP_STDIO_ARG_BYTES: usize = 8 * 1024;
+/// Maximum number of host-injected environment entries for one stdio MCP process.
+pub const MAX_MCP_STDIO_ENV: usize = 128;
+/// Maximum byte length of one stdio MCP environment name.
+pub const MAX_MCP_STDIO_ENV_NAME_BYTES: usize = 256;
+/// Maximum byte length of one stdio MCP environment value.
+pub const MAX_MCP_STDIO_ENV_VALUE_BYTES: usize = 32 * 1024;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -88,9 +112,29 @@ pub struct MediaServiceConfig {
 
 /// Host-supplied MCP transport. HTTP/SSE headers and stdio environment values
 /// can contain secrets, so this type deliberately does not implement `Debug`.
-#[derive(Clone, PartialEq, serde::Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[derive(Clone, PartialEq)]
 pub enum McpServerConfig {
+    Stdio {
+        name: String,
+        command: PathBuf,
+        args: Vec<String>,
+        env: BTreeMap<String, String>,
+    },
+    Http {
+        name: String,
+        url: String,
+        headers: BTreeMap<String, String>,
+    },
+    Sse {
+        name: String,
+        url: String,
+        headers: BTreeMap<String, String>,
+    },
+}
+
+#[derive(serde::Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+enum McpServerConfigWire {
     Stdio {
         name: String,
         command: PathBuf,
@@ -111,6 +155,157 @@ pub enum McpServerConfig {
         #[serde(default)]
         headers: BTreeMap<String, String>,
     },
+}
+
+impl<'de> serde::Deserialize<'de> for McpServerConfig {
+    fn deserialize<Deserializer>(deserializer: Deserializer) -> Result<Self, Deserializer::Error>
+    where
+        Deserializer: serde::Deserializer<'de>,
+    {
+        let wire = <McpServerConfigWire as serde::Deserialize>::deserialize(deserializer)?;
+        let value = match wire {
+            McpServerConfigWire::Stdio {
+                name,
+                command,
+                args,
+                env,
+            } => Self::Stdio {
+                name,
+                command,
+                args,
+                env,
+            },
+            McpServerConfigWire::Http { name, url, headers } => Self::Http { name, url, headers },
+            McpServerConfigWire::Sse { name, url, headers } => Self::Sse { name, url, headers },
+        };
+        value.validate().map_err(serde::de::Error::custom)?;
+        Ok(value)
+    }
+}
+
+impl McpServerConfig {
+    /// Constructs a bounded Streamable HTTP mount. Headers are supplied by the
+    /// embedding Host and are never present in catalog summaries or events.
+    pub fn http(
+        name: impl Into<String>,
+        url: impl Into<String>,
+        headers: BTreeMap<String, String>,
+    ) -> Result<Self, Error> {
+        let value = Self::Http {
+            name: name.into(),
+            url: url.into(),
+            headers,
+        };
+        value.validate()?;
+        Ok(value)
+    }
+
+    /// Constructs a bounded `Sse` compatibility mount with the same host-owned
+    /// header boundary as [`McpServerConfig::http`]. The current runtime treats
+    /// this variant as a modern Streamable HTTP endpoint; it does not implement
+    /// the legacy SSE lifecycle.
+    pub fn sse(
+        name: impl Into<String>,
+        url: impl Into<String>,
+        headers: BTreeMap<String, String>,
+    ) -> Result<Self, Error> {
+        let value = Self::Sse {
+            name: name.into(),
+            url: url.into(),
+            headers,
+        };
+        value.validate()?;
+        Ok(value)
+    }
+
+    /// Validates the public transport contract before it reaches ACP or a
+    /// helper process. Unknown serde variants/fields are rejected by the type
+    /// itself; malformed URLs and header material fail here.
+    pub fn validate(&self) -> Result<(), Error> {
+        match self {
+            Self::Stdio {
+                name,
+                command,
+                args,
+                env,
+            } => {
+                validate_capability_name(name)?;
+                let command_bytes = command.as_os_str().to_string_lossy().len();
+                if command_bytes == 0 || command_bytes > MAX_MCP_STDIO_COMMAND_BYTES {
+                    return Err(Error::InvalidConfig(format!(
+                        "stdio MCP command paths must be 1..={MAX_MCP_STDIO_COMMAND_BYTES} bytes"
+                    )));
+                }
+                if args.len() > MAX_MCP_STDIO_ARGS
+                    || args.iter().any(|arg| arg.len() > MAX_MCP_STDIO_ARG_BYTES)
+                {
+                    return Err(Error::InvalidConfig(format!(
+                        "stdio MCP mounts accept at most {MAX_MCP_STDIO_ARGS} arguments of at most {MAX_MCP_STDIO_ARG_BYTES} bytes"
+                    )));
+                }
+                if env.len() > MAX_MCP_STDIO_ENV
+                    || env.iter().any(|(key, value)| {
+                        key.is_empty()
+                            || key.len() > MAX_MCP_STDIO_ENV_NAME_BYTES
+                            || key.contains(['=', '\0'])
+                            || value.len() > MAX_MCP_STDIO_ENV_VALUE_BYTES
+                            || value.contains('\0')
+                    })
+                {
+                    return Err(Error::InvalidConfig(format!(
+                        "stdio MCP mounts accept at most {MAX_MCP_STDIO_ENV} valid environment entries with names up to {MAX_MCP_STDIO_ENV_NAME_BYTES} bytes and values up to {MAX_MCP_STDIO_ENV_VALUE_BYTES} bytes"
+                    )));
+                }
+            }
+            Self::Http { name, url, headers } | Self::Sse { name, url, headers } => {
+                validate_capability_name(name)?;
+                if url.is_empty() || url.len() > MAX_MCP_ENDPOINT_BYTES {
+                    return Err(Error::InvalidConfig(format!(
+                        "remote MCP endpoint must be 1..={MAX_MCP_ENDPOINT_BYTES} bytes"
+                    )));
+                }
+                let parsed = url::Url::parse(url).map_err(|_| {
+                    Error::InvalidConfig("remote MCP endpoint must be an absolute URL".into())
+                })?;
+                if !matches!(parsed.scheme(), "http" | "https")
+                    || parsed.host_str().is_none()
+                    || !parsed.username().is_empty()
+                    || parsed.password().is_some()
+                    || parsed.fragment().is_some()
+                {
+                    return Err(Error::InvalidConfig(
+                        "remote MCP endpoint must be an http(s) URL without userinfo or a fragment"
+                            .into(),
+                    ));
+                }
+                if headers.len() > MAX_MCP_HEADERS {
+                    return Err(Error::InvalidConfig(format!(
+                        "remote MCP mounts accept at most {MAX_MCP_HEADERS} headers"
+                    )));
+                }
+                let mut normalized_names = std::collections::HashSet::new();
+                for (name, value) in headers {
+                    let parsed_name = http::HeaderName::from_bytes(name.as_bytes());
+                    if name.is_empty()
+                        || name.len() > MAX_MCP_HEADER_NAME_BYTES
+                        || parsed_name.is_err()
+                        || value.len() > MAX_MCP_HEADER_VALUE_BYTES
+                        || value.parse::<http::HeaderValue>().is_err()
+                    {
+                        return Err(Error::InvalidConfig(format!(
+                            "remote MCP headers require valid names up to {MAX_MCP_HEADER_NAME_BYTES} bytes and values up to {MAX_MCP_HEADER_VALUE_BYTES} bytes"
+                        )));
+                    }
+                    if !normalized_names.insert(parsed_name.expect("validated header name")) {
+                        return Err(Error::InvalidConfig(
+                            "remote MCP header names must be unique ignoring case".into(),
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Complete explicit external-service selection for an embedded runtime.
@@ -146,6 +341,7 @@ pub struct RuntimeOptions {
     pub conversation_delegate: Option<Arc<dyn ConversationDelegate>>,
     pub tool_permission_handler: Option<Arc<dyn ToolPermissionHandler>>,
     pub mcp_host_services: xai_grok_mcp::servers::McpHostServices,
+    pub mcp_elicitation_ui: Option<Arc<dyn McpElicitationUi>>,
     pub in_process_mcp_servers: Vec<InProcessMcpServer>,
     pub agent_hooks: Vec<AgentHookRegistration>,
 }
@@ -165,6 +361,7 @@ impl Default for RuntimeOptions {
             conversation_delegate: None,
             tool_permission_handler: None,
             mcp_host_services: xai_grok_mcp::servers::McpHostServices::default(),
+            mcp_elicitation_ui: None,
             in_process_mcp_servers: Vec::new(),
             agent_hooks: Vec::new(),
         }

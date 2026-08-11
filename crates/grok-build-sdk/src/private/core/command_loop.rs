@@ -286,18 +286,41 @@ impl Core {
                         .map(|(_, lease)| lease)
                         .collect();
                     quarantine_session_leases(uncertain_leases);
-                    let result = if failures.is_empty() {
-                        Ok(())
-                    } else {
-                        Err(Error::Operation(format!(
-                            "native runtime shutdown was incomplete: {}",
-                            failures.join("; ")
-                        )))
-                    };
+                    let result = shutdown_result(failures);
                     let _ = r.send(result);
                     break;
                 }
             }
         }
+    }
+}
+
+fn shutdown_result(failures: Vec<String>) -> Result<(), Error> {
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(Error::Operation(format!(
+            "native runtime shutdown was incomplete: {}",
+            failures.join("; ")
+        )))
+    }
+}
+
+#[cfg(test)]
+mod shutdown_tests {
+    use super::*;
+
+    #[test]
+    fn shutdown_aggregates_every_incomplete_session_teardown() {
+        let error = shutdown_result(vec![
+            "unload session-a: actor drain timed out".into(),
+            "unload session-b: actor drain timed out".into(),
+        ])
+        .expect_err("incomplete shutdown must fail");
+        assert!(matches!(
+            error,
+            Error::Operation(message)
+                if message == "native runtime shutdown was incomplete: unload session-a: actor drain timed out; unload session-b: actor drain timed out"
+        ));
     }
 }
