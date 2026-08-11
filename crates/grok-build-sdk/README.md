@@ -156,7 +156,7 @@ The default `LocalRunStore` is a standalone/reference SQLite authority with tran
 `SessionEvidenceStore` is the separate, host-agnostic single authority for SDK-origin `SessionLedger`, rewind intent/receipt, and immutable harness Turn-binding documents. Payload schemas, bounded parsing, identity, settlement digests and transition decisions remain SDK-owned; the Host implementation owns connections/paths, transactions, migrations, encryption, backup and lifecycle. The current marker/version is `grok-build-sdk.session-evidence`/1. CAS compares revision and digest: absence advances to revision 1, otherwise checked `current + 1`; the digest is `sha256:` plus lowercase SHA-256 of the exact payload bytes. Implementations must return the exact value produced by `SessionEvidenceVersion::successor`. `Conflict`, a malformed successor, or `CommitUnknown` always fails closed. Pending is acknowledged before native prompt dispatch, rewind intent before native rewind, intent-to-receipt is one CAS replacement, and binding evidence is acknowledged before ledger settlement. `RuntimeBuilder::session_evidence_store` replaces the local reference store without mirroring. `Runtime::start_with_stores` avoids startup API combinations when both production authorities are injected. Current-only schemas require an explicit offline migration or deliberate discard before startup.
 
 `SessionStateStore` is the chunked native persistence boundary without shell
-protocol types. Its current-only `grok-build-sdk.session-log`/1 contract
+protocol types. Its current-only `grok-build-sdk.session-log`/2 contract
 stores immutable SHA-256-addressed Session objects scoped by validated
 `SessionKey` + `SessionGeneration`: chain transcript segments and publication
 records, and separately referenced checkpoint/rewind payloads. Publication records
@@ -190,6 +190,56 @@ partial forks receive fresh generations. `Runtime::create_session_with_id`
 derives a generation from the exact `SessionConfig`, so retrying the same UUID
 and config after an unknown acknowledgement reopens idempotently, while config
 drift and tombstones are rejected.
+
+### Native Session compaction evidence
+
+`RuntimeBuilder::compaction_observer` installs one typed, asynchronous audit
+observer for native Session compaction. It requires `session_state_store`; the
+SDK remains the sole recovery, retry, checkpoint-publication, and in-memory
+installation authority. The Host acknowledges content-free `CompactionIntent`
+and `CompactionOutcome` values for long-term audit only. Generic
+`PreCompact`/`PostCompact` hooks remain informational and are never accepted as
+intent, publication, or outcome evidence.
+
+An applying compaction is serialized per Session. The shell first freezes the
+exact credential-free semantic model request, including the selected single-
+or two-pass path. The SDK durably fences the exact base manifest and awaits an
+intent acknowledgement before the first applying model call. Rejection makes
+no model call. Cancellation, model failure, invalid output, or a changed input
+produces an acknowledged `NotApplied` outcome and no checkpoint publication or
+conversation replacement. A successful summary is sanitized, fallback-checked,
+and fork-prefix-resolved before the final checkpoint is serialized. The SDK
+then atomically publishes the checkpoint plus its typed compaction record,
+installs those exact published conversation items, and awaits the Host's
+`Applied` acknowledgement before ancillary resets, `PostCompact`, or Turn
+continuation. Unknown publication or unresolved outcome evidence fences the
+Session. Restart replays published evidence and repeats idempotent callbacks;
+it never asks the Host to reconstruct Session state or autonomous ownership.
+
+All digest hashes use SHA-256 over `domain || NUL || u64_be(byte_length) ||
+bytes`. The canonical v1 domains are exported as
+`COMPACTION_INPUT_DIGEST_DOMAIN`,
+`COMPACTION_INPUT_MESSAGES_DIGEST_DOMAIN`,
+`COMPACTION_INPUT_TOOLS_DIGEST_DOMAIN`,
+`COMPACTION_INPUT_HOSTED_TOOLS_DIGEST_DOMAIN`,
+`COMPACTION_INPUT_MODEL_DIGEST_DOMAIN`,
+`COMPACTION_SUMMARY_DIGEST_DOMAIN`, `COMPACTION_STATE_DIGEST_DOMAIN`, and
+`COMPACTION_CHECKPOINT_DIGEST_DOMAIN`. The input root is a length-delimited
+sequence of the request-path discriminator and each leaf's exact byte count,
+item count, and digest. API keys, authorization/extra headers, endpoints,
+paths, tracing fields, and generated request/session/client IDs are added only
+at dispatch and are absent from every digest leaf. Observer DTOs can represent
+only bounded identities/enums, digests, sizes, counts, and references; observer
+errors are coded and content-free.
+
+`Runtime::probe_compaction` is non-mutating. `Applied` means the immutable
+chain contains the exact compaction ID, intent digest, publication record, and
+integrity-checked checkpoint; rewind, supersession, following records, and fork
+replay are reported only as timeline relations. `NotPublished` is returned
+only when the exact origin generation and base manifest can be reconstructed
+from a complete, stable, integrity-checked ancestry. Missing objects, gaps,
+counter or generation mismatches, corruption, conflicting IDs, unstable reads,
+and store failures return `Uncertain`.
 
 Startup still creates `grok_home` and `session_storage` for uncovered shell
 sidecars and native tool/process/terminal state. In Host Session-state mode it
@@ -472,7 +522,7 @@ it can be acknowledged.
 
 Durable wake intent, timer deadline, worker lease/takeover, child reservation/callbacks, mailbox delivery, immutable Harness activation pins, and `ProgramRuntime` execution/reconciliation now run through the authoritative reducer and public façade. Production residency must claim a lease and invoke `AutonomousTurnLoop::activate_claimed`; shell scheduler/subagent mechanisms are adapters only. Program execution is product-connectable when the Host supplies `ProgramRuntime` and `ArtifactStore`; the short-lived opaque credential is passed only to the Host driver while the Run stores its non-secret key identity/generation/scope.
 
-The remaining explicit gaps are a built-in persistent kernel, a native bounded Rhai Run driver, and direct adaptation of native shell compaction into Run effects. `PersistentKernelDriver` is a Host contract only: a VM/kernel checkpoint is evidence, never durable truth. `ProgramContext` durably pins versioned skill descriptors and compaction continuity, but this does not claim that shell skill reload or native compaction already uses that path. All pre-v4 Run databases/envelopes are rejected rather than silently upgraded; migration requires an explicit offline policy. Consumer integration requirements and product-wiring status are machine-readable in `consumer-integration.json`.
+The remaining explicit gaps are a built-in persistent kernel and a native bounded Rhai Run driver. `PersistentKernelDriver` is a Host contract only: a VM/kernel checkpoint is evidence, never durable truth. `ProgramContext` durably pins versioned skill descriptors and compaction continuity; native compaction now receives the already-claimed Run/iteration/operation correlation directly from the autonomous SessionTurn path, while shell skill reload remains separate. All pre-v4 Run databases/envelopes and pre-v2 native Session object encodings are rejected rather than silently upgraded; migration requires an explicit offline policy. Consumer integration requirements and product-wiring status are machine-readable in `consumer-integration.json`.
 
 The Run API uses non-exhaustive public enums/DTO constructors, checked identifier deserialization, conservative unknown-value handling, and a checked-in fixture documenting the current v4 shape. Durable JSON must enter through bounded, validated `RunEnvelope::from_json_slice` or `RunEnvelope::from_json_reader`; generic serde deserialization performs recursive schema validation but cannot impose a source-byte limit. The same-revision fixture is not described as historical compatibility evidence; release fixtures become immutable only after their originating release ships.
 

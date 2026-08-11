@@ -2119,6 +2119,10 @@ impl SessionActor {
                 if Self::is_auth_compact_error(&e) {
                     return Err(self.surface_compact_auth_failure(e).await);
                 }
+                // Ordinary model-failure behavior may continue only after the
+                // native authority proves that no intent/outcome evidence is
+                // still fenced (or completes its exact idempotent recovery).
+                self.recover_native_compaction().await?;
             }
             let backend_search_active = self.backend_search_active();
             tracing::debug!(
@@ -2722,6 +2726,7 @@ impl SessionActor {
                     if Self::is_auth_compact_error(&e) {
                         return Err(self.surface_compact_auth_failure(e).await);
                     }
+                    self.recover_native_compaction().await?;
                 }
                 continue;
             }

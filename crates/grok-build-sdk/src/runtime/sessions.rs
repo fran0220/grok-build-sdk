@@ -4,6 +4,14 @@
 use crate::*;
 
 impl Runtime {
+    /// Inspects the authoritative Session publication chain without loading or
+    /// mutating the Session. Absence is returned only after the exact base and
+    /// every descendant object have been integrity-checked; all incomplete
+    /// observations are [`CompactionProbeResult::Uncertain`].
+    pub fn probe_compaction(&self, probe: CompactionProbe) -> CompactionProbeResult {
+        self.inner.probe_compaction(probe)
+    }
+
     pub async fn prompt_content(
         &self,
         id: &SessionId,

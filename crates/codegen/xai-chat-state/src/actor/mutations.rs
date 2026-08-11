@@ -434,6 +434,20 @@ impl ChatStateActor {
         items: Vec<ConversationItem>,
         is_compaction: bool,
     ) {
+        self.replace_conversation_inner(items, is_compaction, true);
+    }
+
+    /// Install an already-published compaction without writing persistence.
+    pub(super) fn install_published_compaction(&mut self, items: Vec<ConversationItem>) {
+        self.replace_conversation_inner(items, true, false);
+    }
+
+    fn replace_conversation_inner(
+        &mut self,
+        items: Vec<ConversationItem>,
+        is_compaction: bool,
+        persist: bool,
+    ) {
         self.snapshot_turn_slice();
         if is_compaction && let Some(cap) = &mut self.state.turn_capture {
             cap.compaction_occurred = true;
@@ -442,7 +456,9 @@ impl ChatStateActor {
         // `harness_trace_buffer` / `harness_trace_turns` intentionally untouched:
         // the planner/verifier subagents ran, so their sealed trace turns survive
         // a conversation replace (same intent as the `TruncateToPromptIndex` arm).
-        self.persistence.replace_history(&items);
+        if persist {
+            self.persistence.replace_history(&items);
+        }
         let base_estimate = super::state::estimate_conversation_tokens(&items);
         let mut estimated_tokens =
             if is_compaction && pre_replace_total > 0 && self.state.estimate_at_last_response > 0 {

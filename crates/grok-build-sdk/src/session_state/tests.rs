@@ -186,6 +186,28 @@ fn local_session_lease_fences_independent_store_handles() {
     drop(lease);
     second.acquire_session_lease(&key).unwrap();
 }
+
+#[test]
+fn local_store_rejects_previous_schema_before_session_admission() {
+    let d = tempfile::tempdir().unwrap();
+    drop(LocalSessionStateStore::new(d.path()).unwrap());
+    let connection =
+        rusqlite::Connection::open(d.path().join("native-session-log.sqlite3")).unwrap();
+    connection
+        .execute(
+            "UPDATE metadata SET value='1' WHERE key='schema_version'",
+            [],
+        )
+        .unwrap();
+    drop(connection);
+
+    assert!(matches!(
+        LocalSessionStateStore::new(d.path()),
+        Err(SessionStateStoreError::Corrupt(message))
+            if message == "schema marker/version mismatch"
+    ));
+}
+
 #[test]
 fn local_fault_conformance() {
     run_session_state_fault_conformance(&mut LocalFaultHarness::new()).unwrap();

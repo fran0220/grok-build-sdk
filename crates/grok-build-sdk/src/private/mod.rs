@@ -78,6 +78,14 @@ enum CapturedTurnUsage {
 }
 
 type TurnUsageMap = Rc<RefCell<HashMap<(String, String), CapturedTurnUsage>>>;
+#[derive(Clone)]
+struct AutonomousCompactionCorrelation {
+    run: crate::run::RunId,
+    iteration: crate::run::IterationId,
+    operation: crate::run::OperationId,
+}
+type CompactionCorrelationMap =
+    Arc<std::sync::Mutex<HashMap<(String, String), AutonomousCompactionCorrelation>>>;
 enum Command {
     Create(
         SessionConfig,
@@ -103,6 +111,13 @@ enum Command {
     SetCapabilities(SessionId, CapabilityLayer, Reply<CapabilityResolution>),
     SessionCapabilities(SessionId, Reply<CapabilityResolution>),
     Prompt(SessionId, String, String, InputSource, Reply<PromptReceipt>),
+    PromptAutonomous(
+        SessionId,
+        String,
+        String,
+        AutonomousCompactionCorrelation,
+        Reply<PromptReceipt>,
+    ),
     PromptContent(SessionId, String, Prompt, InputSource, Reply<PromptReceipt>),
     PromptBound(
         SessionId,

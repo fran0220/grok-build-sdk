@@ -16,8 +16,10 @@ use crate::session::helpers::CompactionStateContext;
 use crate::session::helpers::compaction_context::CompactionInputs;
 use crate::session::helpers::compaction_context::to_system_reminder;
 use crate::session::helpers::session_compact::{
-    CompactOutput, CompactionOutcome, build_compaction_chat_history,
-    build_two_pass_compaction_prompt, generate_session_compact, is_context_length_error,
+    CompactFailure, CompactOutput, CompactionOutcome, PreparedCompactionRequest,
+    build_compaction_chat_history, build_two_pass_compaction_prompt,
+    generate_prepared_session_compact, generate_session_compact, is_context_length_error,
+    prepare_compaction_request,
 };
 use crate::session::persistence::PersistenceMsg;
 use crate::session::two_pass::{
@@ -32,6 +34,38 @@ use xai_chat_state::compaction_utils::{
     validate_compacted_history,
 };
 use xai_grok_sampling_types::{ApiBackend, ConversationItem};
+
+const NATIVE_INPUT_MESSAGES_DOMAIN: &str = "grok-build-sdk.session-compaction.input.messages.v1";
+const NATIVE_INPUT_TOOLS_DOMAIN: &str = "grok-build-sdk.session-compaction.input.tools.v1";
+const NATIVE_INPUT_HOSTED_TOOLS_DOMAIN: &str =
+    "grok-build-sdk.session-compaction.input.hosted-tools.v1";
+const NATIVE_INPUT_MODEL_DOMAIN: &str =
+    "grok-build-sdk.session-compaction.input.model-parameters.v1";
+const NATIVE_SUMMARY_DOMAIN: &str = "grok-build-sdk.session-compaction.summary.v1";
+const NATIVE_STATE_DOMAIN: &str = "grok-build-sdk.session-compaction.state.v1";
+const NATIVE_CHECKPOINT_DOMAIN: &str = "grok-build-sdk.session-compaction.checkpoint.v1";
+
+fn native_digest_facts(
+    domain: &str,
+    bytes: &[u8],
+    item_count: usize,
+) -> Result<crate::session::state_authority::NativeCompactionDigestFacts, acp::Error> {
+    use sha2::{Digest as _, Sha256};
+    let item_count = u32::try_from(item_count)
+        .map_err(|_| acp::Error::internal_error().data("compaction fact count exceeds bound"))?;
+    let mut digest = Sha256::new();
+    digest.update(domain.as_bytes());
+    digest.update([0]);
+    digest.update((bytes.len() as u64).to_be_bytes());
+    digest.update(bytes);
+    Ok(
+        crate::session::state_authority::NativeCompactionDigestFacts {
+            digest: format!("sha256:{:x}", digest.finalize()),
+            size_bytes: bytes.len() as u64,
+            item_count,
+        },
+    )
+}
 /// Default percentage points below the auto-compact threshold at which prefire
 /// (background pass-1) starts, giving pass-1 runway to finish before the limit.
 /// Override with `GROK_PREFIRE_LEAD_PERCENT`.
@@ -99,6 +133,21 @@ struct PrefirePass1Run {
     prefix_est_tokens: Option<u64>,
     pass1_latency_ms: Option<u64>,
     note1_chars: Option<usize>,
+}
+
+struct PreparedTwoPassFinal {
+    history: Vec<ConversationItem>,
+    prefix_len: usize,
+    tail_len: usize,
+    prefire_waited_ms: u64,
+    pass1_background_latency_ms: u64,
+}
+
+#[derive(Clone, Copy)]
+enum PreparedTwoPassFailure {
+    Cancelled,
+    ModelFailed,
+    InvalidOutput,
 }
 impl From<PrefireOutcome> for PrefirePass1Run {
     /// A run that exited before splitting/sampling — outcome only.
@@ -350,11 +399,11 @@ impl SessionActor {
     ///   user is blocked on it;
     /// - `stream_ms` / `delta_count` / `itl_max_ms` are always pass-2 only
     ///   (the only sample that streams the successor-visible summary).
-    async fn try_two_pass_pass2_apply(
+    async fn prepare_two_pass_pass2(
         &self,
         user_context: Option<&str>,
         strips_reasoning: bool,
-    ) -> Option<CompactOutput> {
+    ) -> Option<PreparedTwoPassFinal> {
         if !self.two_pass_active() {
             return None;
         }
@@ -401,19 +450,65 @@ impl SessionActor {
         let prompt = build_two_pass_compaction_prompt(user_context);
         let pass2_history =
             build_two_pass_pass2_history(prefix, &prepared_tail, &cache.note1, &prompt);
+        Some(PreparedTwoPassFinal {
+            history: pass2_history,
+            prefix_len: cache.prefix_len,
+            tail_len: tail.len(),
+            prefire_waited_ms,
+            pass1_background_latency_ms: cache.pass1_latency_ms,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn sample_prepared_two_pass(
+        &self,
+        prepared: &PreparedTwoPassFinal,
+        request: PreparedCompactionRequest,
+        client: crate::sampling::Client,
+        cancel: &tokio_util::sync::CancellationToken,
+    ) -> Result<CompactOutput, PreparedTwoPassFailure> {
+        let wall_clock_budget_secs = self
+            .agent
+            .borrow()
+            .compaction_policy()
+            .wall_clock_budget_secs;
         let started = std::time::Instant::now();
-        let mut out = self.two_pass_sample(pass2_history).await?;
+        let mut out = match generate_prepared_session_compact(
+            request,
+            client,
+            self.session_info.id.clone(),
+            self.inference_idle_timeout,
+            wall_clock_budget_secs,
+            cancel,
+        )
+        .await
+        {
+            Ok(output) => output,
+            Err(error) => {
+                tracing::warn!(?error, "two_pass: pass2 summarization sample failed");
+                return Err(match error {
+                    CompactFailure::Cancelled => PreparedTwoPassFailure::Cancelled,
+                    CompactFailure::Deterministic(_) | CompactFailure::Transient(_) => {
+                        PreparedTwoPassFailure::ModelFailed
+                    }
+                });
+            }
+        };
         if is_degenerate_summary(&out.content) {
             tracing::Span::current().record("compaction_prefire_stale", true);
             tracing::info!(
                 target: "two_pass",
                 "two_pass: pass2 summary empty/degenerate; falling back to single-pass"
             );
-            return None;
+            return Err(PreparedTwoPassFailure::InvalidOutput);
         }
         let pass2_latency_ms = started.elapsed().as_millis() as u64;
-        if prefire_waited_ms > 0 {
-            out.ttft_ms = Some(out.ttft_ms.unwrap_or(0).saturating_add(prefire_waited_ms));
+        if prepared.prefire_waited_ms > 0 {
+            out.ttft_ms = Some(
+                out.ttft_ms
+                    .unwrap_or(0)
+                    .saturating_add(prepared.prefire_waited_ms),
+            );
         }
         let span = tracing::Span::current();
         span.record("compaction_two_pass_used", true);
@@ -421,14 +516,14 @@ impl SessionActor {
         span.record("compaction_pass2_latency_ms", pass2_latency_ms as i64);
         tracing::info!(
             target: "two_pass",
-            prefix_len = cache.prefix_len,
-            tail_len = tail.len(),
-            prefire_waited_ms,
+            prefix_len = prepared.prefix_len,
+            tail_len = prepared.tail_len,
+            prefire_waited_ms = prepared.prefire_waited_ms,
             pass2_latency_ms,
-            pass1_bg_latency_ms = cache.pass1_latency_ms,
+            pass1_bg_latency_ms = prepared.pass1_background_latency_ms,
             "two_pass: pass2 applied cached NOTE1 (prefire hit)"
         );
-        Some(out)
+        Ok(out)
     }
 }
 /// Trigger info for auto-compact decisions.
@@ -586,8 +681,20 @@ impl SessionActor {
             span.record("detail", tracing::field::display(detail));
         }
     }
-    /// Runs the compact operation over here which compresses the current conversation
-    /// and helps with saving the context for the model
+    /// Runs a manual compaction after synchronously claiming the Session's one
+    /// applying-compaction slot.
+    pub(crate) async fn run_compact(
+        self: &Arc<Self>,
+        user_context: Option<String>,
+    ) -> Result<(), acp::Error> {
+        let permit = self.compaction.cancel.try_begin_apply().ok_or_else(|| {
+            acp::Error::internal_error().data("another Session compaction is already in progress")
+        })?;
+        self.run_compact_claimed(user_context, permit).await
+    }
+
+    /// Manual actor-command path. The permit is claimed by the serialized
+    /// command loop before it spawns this cancellable task.
     #[tracing::instrument(
         name = "session.compact",
         skip_all,
@@ -602,9 +709,10 @@ impl SessionActor {
             error = tracing::field::Empty,
         )
     )]
-    pub(crate) async fn run_compact(
+    pub(super) async fn run_compact_claimed(
         self: &Arc<Self>,
         user_context: Option<String>,
+        _permit: crate::session::compaction_config::CompactApplyPermit,
     ) -> Result<(), acp::Error> {
         let (_cancel, _cancel_scope) = self.compaction.cancel.enter();
         self.record_compaction_variant();
@@ -821,7 +929,7 @@ impl SessionActor {
         prefix_len: usize,
         tokens_before: u64,
         context_window: u64,
-    ) -> Vec<ConversationItem> {
+    ) -> (Vec<ConversationItem>, bool) {
         let full_conv = self.chat_state_handle.get_conversation().await;
         let compacted_len = compacted_history.len();
         let release_candidate = compacted_history.clone();
@@ -837,9 +945,6 @@ impl SessionActor {
                     context_window,
                     self.compaction.threshold_percent.get(),
                 ) {
-                    self.compaction
-                        .prefix_released
-                        .store(true, std::sync::atomic::Ordering::Relaxed);
                     tracing::Span::current().record("compaction_prefix_released", true);
                     tracing::info!(
                         session_id = %self.session_info.id.0,
@@ -847,7 +952,7 @@ impl SessionActor {
                         projected_preserved,
                         "compaction: releasing inherited prefix under pressure"
                     );
-                    release_candidate
+                    (release_candidate, true)
                 } else {
                     tracing::info!(
                         session_id = %self.session_info.id.0,
@@ -855,7 +960,7 @@ impl SessionActor {
                         compacted_len,
                         "Preserving inherited prefix across compaction"
                     );
-                    preserved
+                    (preserved, false)
                 }
             }
             Err(original) => {
@@ -865,10 +970,236 @@ impl SessionActor {
                     conversation_len = full_conv.len(),
                     "Inherited prefix invalid, using compacted history as-is"
                 );
-                original
+                (original, false)
             }
         }
     }
+
+    fn native_compaction_owner(
+        &self,
+    ) -> Result<crate::session::state_authority::NativeCompactionOwner, acp::Error> {
+        let prompt = self.current_prompt_id.lock().map_err(|_| {
+            acp::Error::internal_error().data("native compaction owner is unavailable")
+        })?;
+        Ok(prompt.clone().map_or(
+            crate::session::state_authority::NativeCompactionOwner::Session,
+            |turn_id| crate::session::state_authority::NativeCompactionOwner::Turn { turn_id },
+        ))
+    }
+
+    fn native_compaction_input(
+        &self,
+        path: crate::session::state_authority::NativeCompactionRequestPath,
+        trigger: xai_grok_telemetry::events::CompactionTrigger,
+        prepared: &PreparedCompactionRequest,
+    ) -> Result<crate::session::state_authority::NativeCompactionInput, acp::Error> {
+        let exact = prepared.digest_bytes().map_err(|error| {
+            acp::Error::internal_error()
+                .data(format!("failed to finalize compaction request: {error}"))
+        })?;
+        Ok(crate::session::state_authority::NativeCompactionInput {
+            owner: self.native_compaction_owner()?,
+            reason: match trigger {
+                xai_grok_telemetry::events::CompactionTrigger::Manual => {
+                    crate::session::state_authority::NativeCompactionReason::Manual
+                }
+                xai_grok_telemetry::events::CompactionTrigger::Auto => {
+                    crate::session::state_authority::NativeCompactionReason::AutomaticThreshold
+                }
+            },
+            path,
+            messages: native_digest_facts(
+                NATIVE_INPUT_MESSAGES_DOMAIN,
+                &exact.messages,
+                exact.message_count,
+            )?,
+            tool_definitions: native_digest_facts(
+                NATIVE_INPUT_TOOLS_DOMAIN,
+                &exact.tools,
+                exact.tool_count,
+            )?,
+            hosted_tool_declarations: native_digest_facts(
+                NATIVE_INPUT_HOSTED_TOOLS_DOMAIN,
+                &exact.hosted_tools,
+                exact.hosted_tool_count,
+            )?,
+            model_parameters: native_digest_facts(
+                NATIVE_INPUT_MODEL_DOMAIN,
+                &exact.model_parameters,
+                1,
+            )?,
+        })
+    }
+
+    async fn begin_native_compaction(
+        &self,
+        input: crate::session::state_authority::NativeCompactionInput,
+    ) -> Result<Option<String>, acp::Error> {
+        let (respond_to, response) = tokio::sync::oneshot::channel();
+        self.notifications
+            .persistence_tx
+            .send(PersistenceMsg::BeginNativeCompaction { input, respond_to })
+            .map_err(|_| {
+                acp::Error::internal_error().data("native compaction authority stopped")
+            })?;
+        match response.await.map_err(|_| {
+            acp::Error::internal_error().data("native compaction intent acknowledgement was lost")
+        })? {
+            Ok(crate::session::state_authority::NativeCompactionBegin::Disabled) => Ok(None),
+            Ok(crate::session::state_authority::NativeCompactionBegin::Acknowledged {
+                compaction_id,
+            }) => Ok(Some(compaction_id)),
+            Err(error) => Err(acp::Error::internal_error().data(format!(
+                "native compaction intent failed ({:?})",
+                error.kind
+            ))),
+        }
+    }
+
+    async fn native_compaction_not_applied(
+        &self,
+        compaction_id: Option<String>,
+        reason: crate::session::state_authority::NativeCompactionNotAppliedReason,
+    ) -> Result<(), acp::Error> {
+        let Some(compaction_id) = compaction_id else {
+            return Ok(());
+        };
+        let (respond_to, response) = tokio::sync::oneshot::channel();
+        self.notifications
+            .persistence_tx
+            .send(PersistenceMsg::NativeCompactionNotApplied {
+                compaction_id,
+                reason,
+                respond_to,
+            })
+            .map_err(|_| {
+                acp::Error::internal_error().data("native compaction authority stopped")
+            })?;
+        response
+            .await
+            .map_err(|_| {
+                acp::Error::internal_error().data("native NotApplied acknowledgement was lost")
+            })?
+            .map_err(|error| {
+                acp::Error::internal_error().data(format!(
+                    "native NotApplied outcome failed ({:?})",
+                    error.kind
+                ))
+            })
+    }
+
+    async fn publish_native_compaction(
+        &self,
+        publication: crate::session::state_authority::NativeCompactionPublication,
+    ) -> Result<(), acp::Error> {
+        let (respond_to, response) = tokio::sync::oneshot::channel();
+        self.notifications
+            .persistence_tx
+            .send(PersistenceMsg::PublishNativeCompaction {
+                publication,
+                respond_to,
+            })
+            .map_err(|_| {
+                acp::Error::internal_error().data("native compaction authority stopped")
+            })?;
+        response
+            .await
+            .map_err(|_| {
+                acp::Error::internal_error()
+                    .data("native checkpoint publication acknowledgement was lost")
+            })?
+            .map_err(|error| {
+                acp::Error::internal_error().data(format!(
+                    "native checkpoint publication failed ({:?})",
+                    error.kind
+                ))
+            })
+    }
+
+    async fn acknowledge_native_compaction_applied(
+        &self,
+        compaction_id: String,
+    ) -> Result<(), acp::Error> {
+        let (respond_to, response) = tokio::sync::oneshot::channel();
+        self.notifications
+            .persistence_tx
+            .send(PersistenceMsg::NativeCompactionApplied {
+                compaction_id,
+                respond_to,
+            })
+            .map_err(|_| {
+                acp::Error::internal_error().data("native compaction authority stopped")
+            })?;
+        response
+            .await
+            .map_err(|_| {
+                acp::Error::internal_error().data("native Applied acknowledgement was lost")
+            })?
+            .map_err(|error| {
+                acp::Error::internal_error()
+                    .data(format!("native Applied outcome failed ({:?})", error.kind))
+            })
+    }
+
+    pub(crate) async fn recover_native_compaction(&self) -> Result<(), acp::Error> {
+        let (respond_to, response) = tokio::sync::oneshot::channel();
+        self.notifications
+            .persistence_tx
+            .send(PersistenceMsg::RecoverNativeCompaction { respond_to })
+            .map_err(|_| {
+                acp::Error::internal_error().data("native compaction authority stopped")
+            })?;
+        let recovery = response
+            .await
+            .map_err(|_| {
+                acp::Error::internal_error().data("native compaction recovery response was lost")
+            })?
+            .map_err(|error| {
+                acp::Error::internal_error().data(format!(
+                    "native compaction recovery failed ({:?})",
+                    error.kind
+                ))
+            })?;
+        match recovery {
+            crate::session::state_authority::NativeCompactionRecovery::None => Ok(()),
+            crate::session::state_authority::NativeCompactionRecovery::EvidencePending {
+                compaction_id,
+                checkpoint_payload,
+                installed_state,
+            } => {
+                let checkpoint: crate::extensions::notification::CompactionCheckpointFile =
+                    serde_json::from_slice(&checkpoint_payload).map_err(|_| {
+                        acp::Error::internal_error()
+                            .data("published compaction checkpoint is corrupt; Session fenced")
+                    })?;
+                let installed_bytes =
+                    serde_json::to_vec(&checkpoint.compacted_history).map_err(|_| {
+                        acp::Error::internal_error()
+                            .data("published compaction state cannot be verified; Session fenced")
+                    })?;
+                let exact_installed_state = native_digest_facts(
+                    NATIVE_STATE_DOMAIN,
+                    &installed_bytes,
+                    checkpoint.compacted_history.len(),
+                )?;
+                if exact_installed_state != installed_state {
+                    return Err(acp::Error::internal_error().data(
+                        "published compaction state differs from its receipt; Session fenced",
+                    ));
+                }
+                self.chat_state_handle
+                    .install_published_compaction(checkpoint.compacted_history)
+                    .await
+                    .ok_or_else(|| {
+                        acp::Error::internal_error()
+                            .data("published compaction recovery install failed; Session fenced")
+                    })?;
+                self.acknowledge_native_compaction_applied(compaction_id)
+                    .await
+            }
+        }
+    }
+
     /// Inner implementation of compaction that supports an optional `auto_continue`
     /// payload for the checkpoint.
     #[tracing::instrument(
@@ -1086,7 +1417,7 @@ impl SessionActor {
             user_context.clone(),
             compaction_tools.clone(),
             compaction_hosted_tools.clone(),
-            sampling_client,
+            sampling_client.clone(),
             self.session_info.id.clone(),
             sampling_config.clone(),
             self.inference_idle_timeout,
@@ -1110,9 +1441,74 @@ impl SessionActor {
         };
         let mut request_turns = simplified_messages.clone();
         let mut input_overflow_rejections: u32 = 0;
-        let two_pass_output = self
-            .try_two_pass_pass2_apply(user_context.as_deref(), summary_strips_reasoning)
+        let prepared_two_pass = self
+            .prepare_two_pass_pass2(user_context.as_deref(), summary_strips_reasoning)
             .await;
+        let (two_pass_output, mut native_compaction_id) = if let Some(prepared) = prepared_two_pass
+        {
+            let request = prepare_compaction_request(
+                prepared.history.clone(),
+                compaction_tools.clone(),
+                compaction_hosted_tools.clone(),
+                &sampling_config,
+                self.compaction.tool_choice,
+            );
+            let mut id = self
+                .begin_native_compaction(self.native_compaction_input(
+                    crate::session::state_authority::NativeCompactionRequestPath::TwoPassFinal,
+                    trigger,
+                    &request,
+                )?)
+                .await?;
+            let output = self
+                .sample_prepared_two_pass(&prepared, request, sampling_client.clone(), &cancel)
+                .await;
+            let output = match output {
+                Ok(output) => Some(output),
+                Err(failure) => {
+                    let reason = match failure {
+                            PreparedTwoPassFailure::Cancelled => crate::session::state_authority::NativeCompactionNotAppliedReason::Cancelled,
+                            PreparedTwoPassFailure::ModelFailed => crate::session::state_authority::NativeCompactionNotAppliedReason::ModelFailed,
+                            PreparedTwoPassFailure::InvalidOutput => crate::session::state_authority::NativeCompactionNotAppliedReason::InvalidModelOutput,
+                        };
+                    self.native_compaction_not_applied(id.take(), reason)
+                        .await?;
+                    if matches!(failure, PreparedTwoPassFailure::Cancelled) {
+                        return self.emit_compact_cancelled(auto_trigger).await;
+                    }
+                    None
+                }
+            };
+            if output.is_none() {
+                let request = sampler.prepare_request(request_turns.clone());
+                id = self
+                        .begin_native_compaction(self.native_compaction_input(
+                            match input_stage {
+                                InputStage::Verbatim => crate::session::state_authority::NativeCompactionRequestPath::SinglePassVerbatim,
+                                InputStage::VerbatimFitted => crate::session::state_authority::NativeCompactionRequestPath::SinglePassFitted,
+                                InputStage::Lossy => crate::session::state_authority::NativeCompactionRequestPath::SinglePassLossy,
+                            },
+                            trigger,
+                            &request,
+                        )?)
+                        .await?;
+            }
+            (output, id)
+        } else {
+            let request = sampler.prepare_request(request_turns.clone());
+            let id = self
+                    .begin_native_compaction(self.native_compaction_input(
+                        match input_stage {
+                            InputStage::Verbatim => crate::session::state_authority::NativeCompactionRequestPath::SinglePassVerbatim,
+                            InputStage::VerbatimFitted => crate::session::state_authority::NativeCompactionRequestPath::SinglePassFitted,
+                            InputStage::Lossy => crate::session::state_authority::NativeCompactionRequestPath::SinglePassLossy,
+                        },
+                        trigger,
+                        &request,
+                    )?)
+                    .await?;
+            (None, id)
+        };
         let mut compact_summary: Option<String> =
             two_pass_output.as_ref().map(|o| o.content.clone());
         while compact_summary.is_none() {
@@ -1158,6 +1554,11 @@ impl SessionActor {
                             crate::session::helpers::session_compact::COMPACT_CANCELLED_MSG,
                         )
                     {
+                        self.native_compaction_not_applied(
+                            native_compaction_id.take(),
+                            crate::session::state_authority::NativeCompactionNotAppliedReason::Cancelled,
+                        )
+                        .await?;
                         return self.emit_compact_cancelled(auto_trigger).await;
                     }
                     if context_overflow {
@@ -1215,6 +1616,22 @@ impl SessionActor {
                                 }
                             };
                             input_stage = stage;
+                            self.native_compaction_not_applied(
+                                native_compaction_id.take(),
+                                crate::session::state_authority::NativeCompactionNotAppliedReason::InputChanged,
+                            )
+                            .await?;
+                            let path = match input_stage {
+                                InputStage::Verbatim => crate::session::state_authority::NativeCompactionRequestPath::SinglePassVerbatim,
+                                InputStage::VerbatimFitted => crate::session::state_authority::NativeCompactionRequestPath::SinglePassFitted,
+                                InputStage::Lossy => crate::session::state_authority::NativeCompactionRequestPath::SinglePassLossy,
+                            };
+                            let request = sampler.prepare_request(request_turns.clone());
+                            native_compaction_id = self
+                                .begin_native_compaction(
+                                    self.native_compaction_input(path, trigger, &request)?,
+                                )
+                                .await?;
                             continue;
                         }
                         last_failure_outcome = CompactionOutcome::Deterministic;
@@ -1280,6 +1697,17 @@ impl SessionActor {
                     .expect("a successful full-replace sample stashes its CompactOutput"),
             },
             None => {
+                self.native_compaction_not_applied(
+                    native_compaction_id.take(),
+                    if cancel.is_cancelled() {
+                        crate::session::state_authority::NativeCompactionNotAppliedReason::Cancelled
+                    } else if matches!(last_failure_outcome, CompactionOutcome::Degenerate) {
+                        crate::session::state_authority::NativeCompactionNotAppliedReason::InvalidModelOutput
+                    } else {
+                        crate::session::state_authority::NativeCompactionNotAppliedReason::ModelFailed
+                    },
+                )
+                .await?;
                 let span = tracing::Span::current();
                 span.record("compaction_attempts", telemetry.attempts as i64);
                 span.record(
@@ -1668,17 +2096,13 @@ impl SessionActor {
                 _ => None,
             });
         if cancel.is_cancelled() {
+            self.native_compaction_not_applied(
+                native_compaction_id.take(),
+                crate::session::state_authority::NativeCompactionNotAppliedReason::Cancelled,
+            )
+            .await?;
             return self.emit_compact_cancelled(auto_trigger).await;
         }
-        self.persist_compaction_segment(&segment_messages, &generate_session_compact);
-        self.chat_state_handle
-            .record_compaction_at(prompt_index_at_compaction);
-        self.persist_compaction_checkpoint(
-            &compacted_history,
-            prompt_index_at_compaction,
-            auto_continue,
-            original_user_info,
-        );
         let prefix_len = if self
             .compaction
             .prefix_released
@@ -1688,8 +2112,8 @@ impl SessionActor {
         } else {
             self.startup_hints.inherited_prefix_len.unwrap_or(0)
         };
-        let compacted_history = if prefix_len == 0 {
-            compacted_history
+        let (compacted_history, release_inherited_prefix) = if prefix_len == 0 {
+            (compacted_history, false)
         } else {
             self.resolve_forked_compacted_history(
                 compacted_history,
@@ -1700,8 +2124,112 @@ impl SessionActor {
             .await
         };
         let new_len = compacted_history.len();
+        if let Some(compaction_id) = native_compaction_id.take() {
+            use crate::extensions::notification::{
+                CompactionCheckpointFile, CompactionCheckpointInfo,
+                SessionUpdate as XaiSessionUpdate,
+            };
+            let checkpoint_id = uuid::Uuid::new_v4().to_string();
+            let checkpoint_file = format!("compaction_checkpoints/{checkpoint_id}.json");
+            let created_at = chrono::Utc::now().to_rfc3339();
+            let file_data = CompactionCheckpointFile {
+                checkpoint_id: checkpoint_id.clone(),
+                prompt_index_at_compaction,
+                compacted_history: compacted_history.clone(),
+                schema_version: 1,
+                created_at: created_at.clone(),
+                original_user_info,
+                reread_file_paths: vec![],
+            };
+            let checkpoint_payload = serde_json::to_vec(&file_data).map_err(|error| {
+                acp::Error::internal_error().data(format!(
+                    "failed to serialize compaction checkpoint: {error}"
+                ))
+            })?;
+            let info = CompactionCheckpointInfo {
+                checkpoint_id,
+                prompt_index_at_compaction,
+                checkpoint_file: checkpoint_file.clone(),
+                auto_continue,
+                schema_version: 1,
+                created_at,
+            };
+            let marker = crate::session::storage::SessionUpdate::Xai(Box::new(
+                crate::extensions::notification::SessionNotification {
+                    session_id: self.session_info.id.clone(),
+                    update: XaiSessionUpdate::CompactionCheckpoint(Box::new(info)),
+                    meta: Some(self.build_notification_meta()),
+                },
+            ));
+            let marker = serde_json::to_vec(&marker).map_err(|error| {
+                acp::Error::internal_error()
+                    .data(format!("failed to serialize compaction marker: {error}"))
+            })?;
+            let installed_state = serde_json::to_vec(&compacted_history).map_err(|error| {
+                acp::Error::internal_error().data(format!(
+                    "failed to serialize installed compaction state: {error}"
+                ))
+            })?;
+            self.publish_native_compaction(
+                crate::session::state_authority::NativeCompactionPublication {
+                    record: crate::session::state_authority::NativeCompactionPublicationRecord {
+                        compaction_id: compaction_id.clone(),
+                        summary: native_digest_facts(
+                            NATIVE_SUMMARY_DOMAIN,
+                            generate_session_compact.as_bytes(),
+                            1,
+                        )?,
+                        checkpoint: native_digest_facts(
+                            NATIVE_CHECKPOINT_DOMAIN,
+                            &checkpoint_payload,
+                            compacted_history.len(),
+                        )?,
+                        installed_state: native_digest_facts(
+                            NATIVE_STATE_DOMAIN,
+                            &installed_state,
+                            compacted_history.len(),
+                        )?,
+                        prompt_index: u64::try_from(prompt_index_at_compaction).map_err(|_| {
+                            acp::Error::internal_error()
+                                .data("compaction prompt index exceeds bound")
+                        })?,
+                    },
+                    name: checkpoint_file,
+                    payload: checkpoint_payload,
+                    marker,
+                },
+            )
+            .await?;
+            self.chat_state_handle
+                .install_published_compaction(compacted_history.clone())
+                .await
+                .ok_or_else(|| {
+                    acp::Error::internal_error()
+                        .data("published compaction could not be installed; Session fenced")
+                })?;
+            self.acknowledge_native_compaction_applied(compaction_id)
+                .await?;
+        } else {
+            self.persist_compaction_checkpoint(
+                &compacted_history,
+                prompt_index_at_compaction,
+                auto_continue,
+                original_user_info,
+            );
+            self.chat_state_handle
+                .replace_conversation_for_compaction(compacted_history.clone());
+        }
+        if release_inherited_prefix {
+            self.compaction
+                .prefix_released
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        // Everything below is ancillary. Native mode reaches this point only
+        // after durable publication, exact in-memory installation, and the
+        // Host's Applied acknowledgement.
+        self.persist_compaction_segment(&segment_messages, &generate_session_compact);
         self.chat_state_handle
-            .replace_conversation_for_compaction(compacted_history);
+            .record_compaction_at(prompt_index_at_compaction);
         if self.startup_hints.inherited_prefix_len.is_some() {
             let post_replace_tokens = self.chat_state_handle.get_total_tokens().await;
             if xai_token_estimation::exceeds_threshold(
@@ -2001,6 +2529,7 @@ impl SessionActor {
             if Self::is_auth_compact_error(&e) {
                 return Err(self.surface_compact_auth_failure(e).await);
             }
+            self.recover_native_compaction().await?;
         }
         Ok(())
     }
@@ -2036,6 +2565,9 @@ impl SessionActor {
         trigger_info: AutoCompactTriggerInfo,
     ) -> Result<(), acp::Error> {
         use crate::extensions::notification::SessionUpdate as XaiSessionUpdate;
+        let _permit = self.compaction.cancel.try_begin_apply().ok_or_else(|| {
+            acp::Error::internal_error().data("another Session compaction is already in progress")
+        })?;
         let (_cancel, _cancel_scope) = self.compaction.cancel.enter();
         self.record_compaction_variant();
         let tokens_before = self.chat_state_handle.get_total_tokens().await;
@@ -2264,6 +2796,36 @@ mod inline_auto_compact_flow_tests {
         gateway_tx: mpsc::UnboundedSender<xai_acp_lib::AcpClientMessage>,
         persistence_tx: mpsc::UnboundedSender<PersistenceMsg>,
     ) -> SessionActor {
+        // Most shell tests exercise the legacy/no-observer path without a
+        // persistence actor. Keep that path explicit while still driving the
+        // same request/ack channel used in production.
+        let (actor_persistence_tx, mut actor_persistence_rx) = mpsc::unbounded_channel();
+        tokio::task::spawn_local(async move {
+            while let Some(message) = actor_persistence_rx.recv().await {
+                match message {
+                    PersistenceMsg::BeginNativeCompaction { respond_to, .. } => {
+                        let _ = respond_to.send(Ok(
+                            crate::session::state_authority::NativeCompactionBegin::Disabled,
+                        ));
+                    }
+                    PersistenceMsg::RecoverNativeCompaction { respond_to } => {
+                        let _ = respond_to.send(Ok(
+                            crate::session::state_authority::NativeCompactionRecovery::None,
+                        ));
+                    }
+                    PersistenceMsg::NativeCompactionNotApplied { respond_to, .. }
+                    | PersistenceMsg::PublishNativeCompaction { respond_to, .. }
+                    | PersistenceMsg::NativeCompactionApplied { respond_to, .. } => {
+                        let _ = respond_to.send(Err(
+                            crate::session::state_authority::NativeCompactionError::disabled(),
+                        ));
+                    }
+                    message => {
+                        let _ = persistence_tx.send(message);
+                    }
+                }
+            }
+        });
         let cwd = AbsPathBuf::new(std::path::PathBuf::from("/tmp")).unwrap();
         let fs = Arc::new(MockFs::new(cwd.to_path_buf()));
         let terminal = Arc::new(DummyTerminal {});
@@ -2328,7 +2890,7 @@ mod inline_auto_compact_flow_tests {
             notifications: NotificationSender {
                 gateway: GatewaySender::new(gateway_tx),
                 gateway_enabled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
-                persistence_tx,
+                persistence_tx: actor_persistence_tx,
                 disk_full: crate::session::notifications::idle_disk_full_rx(),
             },
             permissions: PermissionHandle::allow_all(),
@@ -3409,6 +3971,191 @@ mod inline_auto_compact_flow_tests {
                 assert!(
                     !saw_failure,
                     "successful compaction must not emit AutoCompactFailed"
+                );
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn native_intent_rejection_prevents_the_first_model_call_and_state_change() {
+        use xai_grok_test_support::MockInferenceServer;
+
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (gateway_tx, _gateway_rx) = mpsc::unbounded_channel();
+                let (persistence_tx, _persistence_rx) = mpsc::unbounded_channel();
+                let mut actor =
+                    create_test_actor(10_000, 200_000, 85, gateway_tx, persistence_tx).await;
+                let server = MockInferenceServer::start().await.unwrap();
+                server.set_response("summary that must never be requested");
+                let mut config = actor.chat_state_handle.get_sampling_config().await.unwrap();
+                config.base_url = server.url();
+                actor.chat_state_handle.update_sampling_config(config);
+                let original = vec![
+                    ConversationItem::system("system"),
+                    ConversationItem::user("work to compact"),
+                ];
+                actor.chat_state_handle.replace_conversation(original.clone());
+                let (native_tx, mut native_rx) = mpsc::unbounded_channel();
+                actor.notifications.persistence_tx = native_tx;
+                let actor = Arc::new(actor);
+                let authority = tokio::task::spawn_local(async move {
+                    let Some(PersistenceMsg::BeginNativeCompaction { input, respond_to }) =
+                        native_rx.recv().await
+                    else {
+                        panic!("intent must be the first native authority operation")
+                    };
+                    assert!(matches!(
+                        input.owner,
+                        crate::session::state_authority::NativeCompactionOwner::Session
+                    ));
+                    let _ = respond_to.send(Err(
+                        crate::session::state_authority::NativeCompactionError {
+                            kind: crate::session::state_authority::NativeCompactionErrorKind::Rejected,
+                            message: "rejected by test observer".into(),
+                        },
+                    ));
+                    assert!(
+                        native_rx.recv().await.is_none(),
+                        "rejection must not publish or report an outcome"
+                    );
+                });
+
+                assert!(actor.run_compact(None).await.is_err());
+                assert_eq!(
+                    serde_json::to_value(actor.chat_state_handle.get_conversation().await)
+                        .unwrap(),
+                    serde_json::to_value(&original).unwrap(),
+                    "intent rejection must not mutate the Session conversation"
+                );
+                drop(actor);
+                authority.await.unwrap();
+                assert!(!server.has_chat_completion_request());
+                assert!(!server.has_responses_request());
+                assert_eq!(server.messages_request_count(), 0);
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn native_checkpoint_is_prefix_finalized_before_publish_and_exactly_installed() {
+        use crate::extensions::notification::CompactionCheckpointFile;
+        use xai_grok_test_support::MockInferenceServer;
+
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (gateway_tx, _gateway_rx) = mpsc::unbounded_channel();
+                let (persistence_tx, _persistence_rx) = mpsc::unbounded_channel();
+                let mut actor =
+                    create_test_actor(0, 200_000, 85, gateway_tx, persistence_tx).await;
+                let server = MockInferenceServer::start().await.unwrap();
+                server.set_response("Authoritative compacted summary. ".repeat(30));
+                let mut config = actor.chat_state_handle.get_sampling_config().await.unwrap();
+                config.base_url = server.url();
+                actor.chat_state_handle.update_sampling_config(config);
+                let original = vec![
+                    ConversationItem::system("system"),
+                    ConversationItem::user("inherited parent"),
+                    ConversationItem::assistant("parent answer"),
+                    ConversationItem::user("child work"),
+                ];
+                actor.startup_hints.inherited_prefix_len = Some(3);
+                actor.chat_state_handle.replace_conversation(original.clone());
+
+                let state = actor.chat_state_handle.clone();
+                let expected: Arc<
+                    std::sync::Mutex<Option<Vec<ConversationItem>>>,
+                > = Arc::new(std::sync::Mutex::new(None));
+                let expected_for_authority = expected.clone();
+                let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+                let (native_tx, mut native_rx) = mpsc::unbounded_channel();
+                actor.notifications.persistence_tx = native_tx;
+                let actor = Arc::new(actor);
+                let original_for_authority = original.clone();
+                tokio::task::spawn_local(async move {
+                    while let Some(message) = native_rx.recv().await {
+                        match message {
+                            PersistenceMsg::BeginNativeCompaction { respond_to, .. } => {
+                                events_tx.send("intent").unwrap();
+                                let _ = respond_to.send(Ok(
+                                    crate::session::state_authority::NativeCompactionBegin::Acknowledged {
+                                        compaction_id: "cmp-shell-order".into(),
+                                    },
+                                ));
+                            }
+                            PersistenceMsg::PublishNativeCompaction {
+                                publication,
+                                respond_to,
+                            } => {
+                                assert_eq!(
+                                    serde_json::to_value(state.get_conversation().await).unwrap(),
+                                    serde_json::to_value(&original_for_authority).unwrap(),
+                                );
+                                let checkpoint: CompactionCheckpointFile =
+                                    serde_json::from_slice(&publication.payload).unwrap();
+                                *expected_for_authority.lock().unwrap() =
+                                    Some(checkpoint.compacted_history);
+                                events_tx.send("publication").unwrap();
+                                let _ = respond_to.send(Ok(()));
+                            }
+                            PersistenceMsg::NativeCompactionApplied { respond_to, .. } => {
+                                let installed = state.get_conversation().await;
+                                assert_eq!(
+                                    serde_json::to_value(&installed).unwrap(),
+                                    serde_json::to_value(
+                                        expected_for_authority
+                                            .lock()
+                                            .unwrap()
+                                            .as_ref()
+                                            .unwrap(),
+                                    )
+                                    .unwrap(),
+                                    "the exact proven checkpoint state must be installed"
+                                );
+                                assert_eq!(
+                                    state.get_last_compaction_prompt_index().await,
+                                    None,
+                                    "ancillary continuation must wait for the Host outcome ack"
+                                );
+                                events_tx.send("outcome").unwrap();
+                                let _ = respond_to.send(Ok(()));
+                            }
+                            PersistenceMsg::NativeCompactionNotApplied {
+                                reason,
+                                respond_to,
+                                ..
+                            } => {
+                                let _ = respond_to.send(Ok(()));
+                                panic!("model attempt unexpectedly ended NotApplied: {reason:?}");
+                            }
+                            _ => {}
+                        }
+                    }
+                });
+
+                actor.run_compact(None).await.unwrap();
+                assert_eq!(events_rx.recv().await, Some("intent"));
+                assert_eq!(events_rx.recv().await, Some("publication"));
+                assert_eq!(events_rx.recv().await, Some("outcome"));
+                let installed = actor.chat_state_handle.get_conversation().await;
+                assert_eq!(
+                    serde_json::to_value(&installed).unwrap(),
+                    serde_json::to_value(expected.lock().unwrap().as_ref().unwrap()).unwrap(),
+                );
+                assert_eq!(
+                    serde_json::to_value(&installed[1]).unwrap(),
+                    serde_json::to_value(&original[1]).unwrap(),
+                );
+                assert_eq!(
+                    serde_json::to_value(&installed[2]).unwrap(),
+                    serde_json::to_value(&original[2]).unwrap(),
+                );
+                assert_eq!(
+                    actor.chat_state_handle.get_last_compaction_prompt_index().await,
+                    Some(0),
+                    "ancillary continuation runs only after outcome acknowledgement"
                 );
             })
             .await;

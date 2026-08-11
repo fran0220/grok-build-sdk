@@ -1,5 +1,42 @@
 use super::*;
 
+struct CompactionCorrelationGuard {
+    correlations: CompactionCorrelationMap,
+    key: (String, String),
+}
+
+impl CompactionCorrelationGuard {
+    fn register(
+        correlations: CompactionCorrelationMap,
+        session: &SessionId,
+        turn: &str,
+        correlation: AutonomousCompactionCorrelation,
+    ) -> Result<Self, Error> {
+        let key = (session.0.clone(), turn.to_owned());
+        let mut locked = correlations.lock().map_err(op)?;
+        match locked.entry(key.clone()) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(correlation);
+            }
+            std::collections::hash_map::Entry::Occupied(_) => {
+                return Err(Error::Operation(
+                    "autonomous compaction correlation already exists".into(),
+                ));
+            }
+        }
+        drop(locked);
+        Ok(Self { correlations, key })
+    }
+}
+
+impl Drop for CompactionCorrelationGuard {
+    fn drop(&mut self) {
+        if let Ok(mut correlations) = self.correlations.lock() {
+            correlations.remove(&self.key);
+        }
+    }
+}
+
 impl Core {
     pub(in crate::private) async fn run(self: Rc<Self>, mut rx: mpsc::UnboundedReceiver<Command>) {
         while let Some(c) = rx.recv().await {
@@ -46,6 +83,45 @@ impl Core {
                     let task = tokio::task::spawn_local(async move {
                         let _reservation = reservation;
                         let result = this.prompt(i, t, x, source).await;
+                        this.prompt_tasks.borrow_mut().remove(&task_session_id);
+                        let _ = r.send(result);
+                    });
+                    self.prompt_tasks
+                        .borrow_mut()
+                        .insert(task_key, task.abort_handle());
+                }
+                Command::PromptAutonomous(i, t, x, correlation, r) => {
+                    if t.trim().is_empty() {
+                        let _ = r.send(Err(Error::InvalidConfig("turn id is required".into())));
+                        continue;
+                    }
+                    if self.turns.borrow().contains_key(&i.0) {
+                        let _ = r.send(Err(Error::Operation(
+                            "session already has an active prompt".into(),
+                        )));
+                        continue;
+                    }
+                    self.turns.borrow_mut().insert(i.0.clone(), t.clone());
+                    let this = self.clone();
+                    let task_key = i.0.clone();
+                    let task_session_id = task_key.clone();
+                    let reservation = TurnReservation {
+                        turns: self.turns.clone(),
+                        turn_usages: self.turn_usages.clone(),
+                        session_id: task_session_id.clone(),
+                        turn_id: t.clone(),
+                    };
+                    let task = tokio::task::spawn_local(async move {
+                        let _reservation = reservation;
+                        let result = match CompactionCorrelationGuard::register(
+                            this.compaction_correlations.clone(),
+                            &i,
+                            &t,
+                            correlation,
+                        ) {
+                            Ok(_correlation) => this.prompt(i, t, x, InputSource::User).await,
+                            Err(error) => Err(error),
+                        };
                         this.prompt_tasks.borrow_mut().remove(&task_session_id);
                         let _ = r.send(result);
                     });

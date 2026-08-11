@@ -219,6 +219,7 @@ pub(super) struct Core {
     replay: Rc<RefCell<HashMap<String, ReplayMode>>>,
     evidence_store: Arc<dyn SessionEvidenceStore>,
     evidence_versions: RefCell<HashMap<SessionEvidenceKey, SessionEvidenceVersion>>,
+    compaction_correlations: CompactionCorrelationMap,
 }
 
 pub(super) struct SessionLeaseAdmission<'a> {

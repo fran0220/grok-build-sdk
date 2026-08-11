@@ -7,6 +7,7 @@ impl Core {
         events: mpsc::UnboundedSender<Event>,
         evidence_store: Arc<dyn SessionEvidenceStore>,
         session_state_store: Option<Arc<dyn crate::SessionStateStore>>,
+        compaction_observer: Option<Arc<dyn crate::CompactionObserver>>,
     ) -> Result<(Self, RuntimeCapabilities), Error> {
         std::fs::create_dir_all(&input.grok_home).map_err(op)?;
         std::fs::create_dir_all(&input.session_storage).map_err(op)?;
@@ -154,10 +155,14 @@ impl Core {
                 xai_grok_shell::agent::config::OriginEmbeddedProfile::Desktop
             }
         };
+        let compaction_correlations: CompactionCorrelationMap =
+            Arc::new(std::sync::Mutex::new(HashMap::new()));
         let session_state_authority: Option<Arc<ShellAuthority>> =
             session_state_store.as_ref().map(|store| {
                 Arc::new(SessionStateAuthorityBridge {
                     store: store.clone(),
+                    observer: compaction_observer.clone(),
+                    correlations: compaction_correlations.clone(),
                 }) as Arc<ShellAuthority>
             });
         let agent = Rc::new(
@@ -293,6 +298,7 @@ impl Core {
                 replay,
                 evidence_store,
                 evidence_versions: RefCell::new(HashMap::new()),
+                compaction_correlations,
             },
             capabilities,
         ))

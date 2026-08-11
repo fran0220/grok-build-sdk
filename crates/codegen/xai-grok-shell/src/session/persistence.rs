@@ -372,6 +372,42 @@ pub enum PersistenceMsg {
     },
     /// Persist a compaction checkpoint file to `compaction_checkpoints/{id}.json`.
     CompactionCheckpoint(crate::extensions::notification::CompactionCheckpointFile),
+    BeginNativeCompaction {
+        input: crate::session::state_authority::NativeCompactionInput,
+        respond_to: tokio::sync::oneshot::Sender<
+            Result<
+                crate::session::state_authority::NativeCompactionBegin,
+                crate::session::state_authority::NativeCompactionError,
+            >,
+        >,
+    },
+    NativeCompactionNotApplied {
+        compaction_id: String,
+        reason: crate::session::state_authority::NativeCompactionNotAppliedReason,
+        respond_to: tokio::sync::oneshot::Sender<
+            Result<(), crate::session::state_authority::NativeCompactionError>,
+        >,
+    },
+    PublishNativeCompaction {
+        publication: crate::session::state_authority::NativeCompactionPublication,
+        respond_to: tokio::sync::oneshot::Sender<
+            Result<(), crate::session::state_authority::NativeCompactionError>,
+        >,
+    },
+    NativeCompactionApplied {
+        compaction_id: String,
+        respond_to: tokio::sync::oneshot::Sender<
+            Result<(), crate::session::state_authority::NativeCompactionError>,
+        >,
+    },
+    RecoverNativeCompaction {
+        respond_to: tokio::sync::oneshot::Sender<
+            Result<
+                crate::session::state_authority::NativeCompactionRecovery,
+                crate::session::state_authority::NativeCompactionError,
+            >,
+        >,
+    },
     /// Persist a compaction request+response artifact to
     /// `compaction_requests/{request_id}.json`. Used for offline prompt
     /// iteration — captures the exact ConversationItem list sent to the
@@ -1631,6 +1667,96 @@ impl PersistenceHandle {
         self.projects_chat_history
     }
 
+    pub(crate) async fn begin_native_compaction(
+        &self,
+        input: crate::session::state_authority::NativeCompactionInput,
+    ) -> Result<
+        crate::session::state_authority::NativeCompactionBegin,
+        crate::session::state_authority::NativeCompactionError,
+    > {
+        let (respond_to, response) = tokio::sync::oneshot::channel();
+        self.tx
+            .send(PersistenceMsg::BeginNativeCompaction { input, respond_to })
+            .map_err(|_| crate::session::state_authority::NativeCompactionError {
+                kind: crate::session::state_authority::NativeCompactionErrorKind::Uncertain,
+                message: "persistence stopped before compaction intent".into(),
+            })?;
+        response
+            .await
+            .map_err(|_| crate::session::state_authority::NativeCompactionError {
+                kind: crate::session::state_authority::NativeCompactionErrorKind::Uncertain,
+                message: "compaction intent acknowledgement was lost".into(),
+            })?
+    }
+
+    pub(crate) async fn native_compaction_not_applied(
+        &self,
+        compaction_id: String,
+        reason: crate::session::state_authority::NativeCompactionNotAppliedReason,
+    ) -> Result<(), crate::session::state_authority::NativeCompactionError> {
+        let (respond_to, response) = tokio::sync::oneshot::channel();
+        self.tx
+            .send(PersistenceMsg::NativeCompactionNotApplied {
+                compaction_id,
+                reason,
+                respond_to,
+            })
+            .map_err(|_| crate::session::state_authority::NativeCompactionError {
+                kind: crate::session::state_authority::NativeCompactionErrorKind::Uncertain,
+                message: "persistence stopped before NotApplied acknowledgement".into(),
+            })?;
+        response
+            .await
+            .map_err(|_| crate::session::state_authority::NativeCompactionError {
+                kind: crate::session::state_authority::NativeCompactionErrorKind::Uncertain,
+                message: "NotApplied acknowledgement was lost".into(),
+            })?
+    }
+
+    pub(crate) async fn publish_native_compaction(
+        &self,
+        publication: crate::session::state_authority::NativeCompactionPublication,
+    ) -> Result<(), crate::session::state_authority::NativeCompactionError> {
+        let (respond_to, response) = tokio::sync::oneshot::channel();
+        self.tx
+            .send(PersistenceMsg::PublishNativeCompaction {
+                publication,
+                respond_to,
+            })
+            .map_err(|_| crate::session::state_authority::NativeCompactionError {
+                kind: crate::session::state_authority::NativeCompactionErrorKind::Uncertain,
+                message: "persistence stopped before checkpoint publication".into(),
+            })?;
+        response
+            .await
+            .map_err(|_| crate::session::state_authority::NativeCompactionError {
+                kind: crate::session::state_authority::NativeCompactionErrorKind::Uncertain,
+                message: "checkpoint publication acknowledgement was lost".into(),
+            })?
+    }
+
+    pub(crate) async fn native_compaction_applied(
+        &self,
+        compaction_id: String,
+    ) -> Result<(), crate::session::state_authority::NativeCompactionError> {
+        let (respond_to, response) = tokio::sync::oneshot::channel();
+        self.tx
+            .send(PersistenceMsg::NativeCompactionApplied {
+                compaction_id,
+                respond_to,
+            })
+            .map_err(|_| crate::session::state_authority::NativeCompactionError {
+                kind: crate::session::state_authority::NativeCompactionErrorKind::Uncertain,
+                message: "persistence stopped before Applied acknowledgement".into(),
+            })?;
+        response
+            .await
+            .map_err(|_| crate::session::state_authority::NativeCompactionError {
+                kind: crate::session::state_authority::NativeCompactionErrorKind::Uncertain,
+                message: "Applied acknowledgement was lost".into(),
+            })?
+    }
+
     pub(crate) async fn replay_authority_to_prompt(
         &self,
         target_index: usize,
@@ -2406,6 +2532,37 @@ impl SessionPersistence {
                     {
                         tracing::warn!(?e, "failed to write compaction checkpoint file");
                     }
+                }
+                PersistenceMsg::BeginNativeCompaction { input, respond_to } => {
+                    let _ = respond_to.send(self.storage.begin_native_compaction(input).await);
+                }
+                PersistenceMsg::NativeCompactionNotApplied {
+                    compaction_id,
+                    reason,
+                    respond_to,
+                } => {
+                    let _ = respond_to.send(
+                        self.storage
+                            .native_compaction_not_applied(compaction_id, reason)
+                            .await,
+                    );
+                }
+                PersistenceMsg::PublishNativeCompaction {
+                    publication,
+                    respond_to,
+                } => {
+                    let _ =
+                        respond_to.send(self.storage.publish_native_compaction(publication).await);
+                }
+                PersistenceMsg::NativeCompactionApplied {
+                    compaction_id,
+                    respond_to,
+                } => {
+                    let _ = respond_to
+                        .send(self.storage.native_compaction_applied(compaction_id).await);
+                }
+                PersistenceMsg::RecoverNativeCompaction { respond_to } => {
+                    let _ = respond_to.send(self.storage.recover_native_compaction().await);
                 }
                 PersistenceMsg::CompactionRequest(request) => {
                     if let Err(e) = self

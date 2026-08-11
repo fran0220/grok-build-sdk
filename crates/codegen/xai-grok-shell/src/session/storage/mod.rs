@@ -1255,6 +1255,47 @@ pub trait StorageAdapter: Send + Sync {
         checkpoint: &crate::extensions::notification::CompactionCheckpointFile,
     ) -> io::Result<()>;
 
+    async fn begin_native_compaction(
+        &self,
+        _input: crate::session::state_authority::NativeCompactionInput,
+    ) -> Result<
+        crate::session::state_authority::NativeCompactionBegin,
+        crate::session::state_authority::NativeCompactionError,
+    > {
+        Ok(crate::session::state_authority::NativeCompactionBegin::Disabled)
+    }
+
+    async fn native_compaction_not_applied(
+        &self,
+        _compaction_id: String,
+        _reason: crate::session::state_authority::NativeCompactionNotAppliedReason,
+    ) -> Result<(), crate::session::state_authority::NativeCompactionError> {
+        Err(crate::session::state_authority::NativeCompactionError::disabled())
+    }
+
+    async fn publish_native_compaction(
+        &self,
+        _publication: crate::session::state_authority::NativeCompactionPublication,
+    ) -> Result<(), crate::session::state_authority::NativeCompactionError> {
+        Err(crate::session::state_authority::NativeCompactionError::disabled())
+    }
+
+    async fn native_compaction_applied(
+        &self,
+        _compaction_id: String,
+    ) -> Result<(), crate::session::state_authority::NativeCompactionError> {
+        Err(crate::session::state_authority::NativeCompactionError::disabled())
+    }
+
+    async fn recover_native_compaction(
+        &self,
+    ) -> Result<
+        crate::session::state_authority::NativeCompactionRecovery,
+        crate::session::state_authority::NativeCompactionError,
+    > {
+        Ok(crate::session::state_authority::NativeCompactionRecovery::None)
+    }
+
     /// Write a compaction request artifact to `compaction_requests/{request_id}.json`.
     /// Captures the exact request sent to the compaction model and the response
     /// (or final error) it produced. Used for offline prompt iteration.

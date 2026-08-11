@@ -178,6 +178,19 @@ pub(super) async fn run_session(
 ) {
     let (completion_tx, mut completion_rx) =
         mpsc::unbounded_channel::<(String, PromptTurnResult)>();
+    // Native compaction replay is a startup fence. In particular, install an
+    // already-published checkpoint before watchers, MCP startup, prompt-wake
+    // admission, or any command can observe or mutate the resumed Session.
+    // An uncertain observer/store outcome leaves the actor closed rather than
+    // manufacturing an ordinary resumed Session.
+    if let Err(error) = session.recover_native_compaction().await {
+        tracing::error!(
+            session_id = %session.session_info.id.0,
+            error = %error,
+            "native compaction recovery fenced Session startup"
+        );
+        return;
+    }
     tracing::debug!("fs_notify_config: {:?}", fs_notify_config);
     let mut replay_buffer = ReplayBuffer::new(session.buffering_settings.clone());
     let event_tx_for_flush_timer = session.event_tx.clone();
@@ -596,6 +609,19 @@ pub(super) async fn run_session(
                         }
                         SessionCommand::Prompt { prompt_id, prompt_blocks, prompt_mode, artifact_upload_ctx, client_identifier, screen_mode, verbatim, traceparent, json_schema, send_now, admission, tool_overrides_update, respond_to, persist_ack, parsed_prompt_tx } => {
                             let origin = super::PromptOrigin::from_prompt_id(&prompt_id);
+                            if session.compaction.cancel.is_applying() {
+                                if let Some(admission) = admission {
+                                    let _ = admission.respond_to.send(false);
+                                }
+                                let _ = respond_to.send(Err(acp::Error::internal_error().data(
+                                    "Session compaction is in progress",
+                                )));
+                                continue;
+                            }
+                            if let Err(error) = session.recover_native_compaction().await {
+                                let _ = respond_to.send(Err(error));
+                                continue;
+                            }
                             let (actor_admitted, task_wake_fallback) = match admission {
                                 Some(admission) => {
                                     let fallback = session
@@ -1029,11 +1055,36 @@ pub(super) async fn run_session(
                             }
                         }
                         SessionCommand::CompactSession { user_context, respond_to } => {
-                            let s = session.clone();
-                            tokio::task::spawn_local(async move {
-                                let compact_session = s.run_compact(user_context).await;
-                                let _ = respond_to.send(compact_session);
-                            });
+                            // This extension is the out-of-Turn/manual ownership
+                            // path. A slash-command compaction runs inside the
+                            // claimed Turn itself; starting this detached path
+                            // while that task is live would both race Session
+                            // state and misattribute the compaction to that Turn.
+                            if session.state.lock().await.running_task.is_some() {
+                                let _ = respond_to.send(Err(acp::Error::internal_error().data(
+                                    "cannot start manual Session compaction while a Turn is running",
+                                )));
+                                continue;
+                            }
+                            if let Err(error) = session.recover_native_compaction().await {
+                                let _ = respond_to.send(Err(error));
+                                continue;
+                            }
+                            match session.compaction.cancel.try_begin_apply() {
+                                Some(permit) => {
+                                    let s = session.clone();
+                                    tokio::task::spawn_local(async move {
+                                        let compact_session =
+                                            s.run_compact_claimed(user_context, permit).await;
+                                        let _ = respond_to.send(compact_session);
+                                    });
+                                }
+                                None => {
+                                    let _ = respond_to.send(Err(acp::Error::internal_error().data(
+                                        "another Session compaction is already in progress",
+                                    )));
+                                }
+                            }
                         }
                         SessionCommand::ReloadPlugins { registry } => {
                             // Eager fan-out: a plugin was added/removed/reloaded

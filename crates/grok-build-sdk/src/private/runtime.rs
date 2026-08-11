@@ -13,6 +13,329 @@ struct RuntimeShared {
     >,
     shutdown: AtomicBool,
     capabilities: RuntimeCapabilities,
+    session_state_store: Option<Arc<dyn crate::SessionStateStore>>,
+}
+
+fn probe_uncertain(reason: crate::CompactionProbeUncertainty) -> crate::CompactionProbeResult {
+    crate::CompactionProbeResult::Uncertain { reason }
+}
+
+fn probe_store_error(error: crate::SessionStateStoreError) -> crate::CompactionProbeResult {
+    probe_uncertain(match error {
+        crate::SessionStateStoreError::Storage(_) => {
+            crate::CompactionProbeUncertainty::StoreFailure
+        }
+        crate::SessionStateStoreError::Corrupt(_)
+        | crate::SessionStateStoreError::Validation(_) => {
+            crate::CompactionProbeUncertainty::CorruptObject
+        }
+    })
+}
+
+fn probe_chain_bytes(object: &crate::SessionObject) -> Option<u64> {
+    match object.kind() {
+        crate::SessionObjectKind::TranscriptSegment { bytes, .. } => Some(bytes.len() as u64),
+        crate::SessionObjectKind::CheckpointPublication { marker_bytes, .. }
+        | crate::SessionObjectKind::CompactionPublication { marker_bytes, .. }
+        | crate::SessionObjectKind::RewindPublication { marker_bytes, .. } => {
+            Some(marker_bytes.len() as u64)
+        }
+        _ => None,
+    }
+}
+
+pub(super) fn probe_compaction(
+    store: &dyn crate::SessionStateStore,
+    probe: crate::CompactionProbe,
+) -> crate::CompactionProbeResult {
+    if probe.id.validate().is_err()
+        || probe.base.manifest_digest.validate().is_err()
+        || probe.intent_digest.validate().is_err()
+        || probe.base.manifest_revision == 0
+    {
+        return probe_uncertain(crate::CompactionProbeUncertainty::ConflictingPublication);
+    }
+    let key = match crate::SessionKey::new(probe.session.as_str()) {
+        Ok(key) => key,
+        Err(error) => return probe_store_error(error),
+    };
+    let first = match store.inspect_slot(&key) {
+        Ok(crate::SessionSlot::Live(document)) => document,
+        Ok(crate::SessionSlot::Vacant | crate::SessionSlot::Tombstoned { .. }) => {
+            return probe_uncertain(crate::CompactionProbeUncertainty::GenerationMismatch);
+        }
+        Err(error) => return probe_store_error(error),
+    };
+    if first.manifest().generation() != &probe.generation {
+        return probe_uncertain(crate::CompactionProbeUncertainty::GenerationMismatch);
+    }
+    let same_origin =
+        probe.session == probe.base.session && probe.generation == probe.base.generation;
+    if same_origin && probe.base.manifest_revision > first.version().revision() {
+        return probe_uncertain(crate::CompactionProbeUncertainty::GenerationMismatch);
+    }
+    let mut reverse = Vec::new();
+    let mut next = first.manifest().head().cloned();
+    while let Some(id) = next {
+        if reverse.len() >= 1_000_000 {
+            return probe_uncertain(crate::CompactionProbeUncertainty::UnstableManifest);
+        }
+        let object = match store.load_object(&key, &probe.generation, &id) {
+            Ok(Some(object)) => object,
+            Ok(None) => {
+                return probe_uncertain(crate::CompactionProbeUncertainty::MissingObject);
+            }
+            Err(error) => return probe_store_error(error),
+        };
+        if object.id() != &id
+            || object.session() != &key
+            || object.generation() != &probe.generation
+        {
+            return probe_uncertain(crate::CompactionProbeUncertainty::CorruptObject);
+        }
+        next = object.previous().cloned();
+        reverse.push(object);
+    }
+    reverse.reverse();
+    if reverse.len() as u64 != first.manifest().segment_count()
+        || reverse
+            .iter()
+            .enumerate()
+            .any(|(index, object)| object.sequence() != Some(index as u64 + 1))
+    {
+        return probe_uncertain(crate::CompactionProbeUncertainty::CorruptObject);
+    }
+    let Some(chain_bytes) = reverse.iter().try_fold(0u64, |total, object| {
+        total.checked_add(probe_chain_bytes(object)?)
+    }) else {
+        return probe_uncertain(crate::CompactionProbeUncertainty::CorruptObject);
+    };
+    if chain_bytes != first.manifest().transcript_bytes() {
+        return probe_uncertain(crate::CompactionProbeUncertainty::CorruptObject);
+    }
+    // A publication chain is not complete merely because its linked-list
+    // objects are present. Verify every compound publication's side object as
+    // well; otherwise a missing historical checkpoint/rewind could still
+    // yield NotPublished or an apparently authoritative timeline relation.
+    for object in &reverse {
+        let (side_id, expected_compaction) = match object.kind() {
+            crate::SessionObjectKind::CheckpointPublication { checkpoint, .. } => {
+                (checkpoint, None)
+            }
+            crate::SessionObjectKind::CompactionPublication {
+                checkpoint, record, ..
+            } => {
+                if record.validate().is_err() {
+                    return probe_uncertain(crate::CompactionProbeUncertainty::CorruptObject);
+                }
+                (checkpoint, Some(record))
+            }
+            crate::SessionObjectKind::RewindPublication { operation, .. } => (operation, None),
+            crate::SessionObjectKind::TranscriptSegment { .. } => continue,
+            crate::SessionObjectKind::Checkpoint { .. }
+            | crate::SessionObjectKind::RewindOperation { .. } => {
+                return probe_uncertain(crate::CompactionProbeUncertainty::CorruptObject);
+            }
+        };
+        let side = match store.load_object(&key, &probe.generation, side_id) {
+            Ok(Some(side)) => side,
+            Ok(None) => {
+                return probe_uncertain(crate::CompactionProbeUncertainty::MissingObject);
+            }
+            Err(error) => return probe_store_error(error),
+        };
+        if side.id() != side_id || side.session() != &key || side.generation() != &probe.generation
+        {
+            return probe_uncertain(crate::CompactionProbeUncertainty::CorruptObject);
+        }
+        match (object.kind(), side.kind(), expected_compaction) {
+            (
+                crate::SessionObjectKind::CheckpointPublication { .. },
+                crate::SessionObjectKind::Checkpoint { .. },
+                None,
+            )
+            | (
+                crate::SessionObjectKind::RewindPublication { .. },
+                crate::SessionObjectKind::RewindOperation { .. },
+                None,
+            ) => {}
+            (
+                crate::SessionObjectKind::CompactionPublication { .. },
+                crate::SessionObjectKind::Checkpoint { shell_bytes, .. },
+                Some(record),
+            ) => {
+                let facts = crate::CompactionContentFacts::from_bytes(
+                    crate::COMPACTION_CHECKPOINT_DIGEST_DOMAIN,
+                    shell_bytes,
+                    record.checkpoint.item_count,
+                );
+                if facts != record.checkpoint {
+                    return probe_uncertain(crate::CompactionProbeUncertainty::CorruptObject);
+                }
+            }
+            _ => return probe_uncertain(crate::CompactionProbeUncertainty::CorruptObject),
+        }
+    }
+    if same_origin {
+        let base_sequence = match usize::try_from(probe.base.sequence) {
+            Ok(sequence) if sequence <= reverse.len() => sequence,
+            _ => return probe_uncertain(crate::CompactionProbeUncertainty::BaseNotInAncestry),
+        };
+        let base_head = base_sequence
+            .checked_sub(1)
+            .and_then(|index| reverse.get(index))
+            .map(|object| object.id());
+        if base_head != probe.base.head.as_ref() {
+            return probe_uncertain(crate::CompactionProbeUncertainty::BaseNotInAncestry);
+        }
+        let base_bytes = reverse[..base_sequence]
+            .iter()
+            .try_fold(0u64, |total, object| {
+                total.checked_add(probe_chain_bytes(object)?)
+            });
+        let Some(base_bytes) = base_bytes else {
+            return probe_uncertain(crate::CompactionProbeUncertainty::CorruptObject);
+        };
+        let reconstructed_base = match crate::SessionManifest::new(
+            key.clone(),
+            probe.base.generation.clone(),
+            probe.base.head.clone(),
+            probe.base.sequence,
+            base_bytes,
+        ) {
+            Ok(manifest) => manifest,
+            Err(error) => return probe_store_error(error),
+        };
+        if reconstructed_base.digest() != probe.base.manifest_digest.as_str() {
+            return probe_uncertain(crate::CompactionProbeUncertainty::BaseNotInAncestry);
+        }
+    }
+
+    let mut found: Option<(
+        usize,
+        &crate::SessionObject,
+        &crate::CompactionPublicationRecord,
+    )> = None;
+    for (index, object) in reverse.iter().enumerate() {
+        let crate::SessionObjectKind::CompactionPublication { record, .. } = object.kind() else {
+            continue;
+        };
+        if record.intent.id != probe.id {
+            continue;
+        }
+        if found.is_some()
+            || record.intent.probe().intent_digest != probe.intent_digest
+            || record.intent.base != probe.base
+        {
+            return probe_uncertain(crate::CompactionProbeUncertainty::ConflictingPublication);
+        }
+        found = Some((index, object, record));
+    }
+
+    let second = match store.inspect_slot(&key) {
+        Ok(crate::SessionSlot::Live(document)) => document,
+        Ok(_) => return probe_uncertain(crate::CompactionProbeUncertainty::UnstableManifest),
+        Err(error) => return probe_store_error(error),
+    };
+    if second != first {
+        return probe_uncertain(crate::CompactionProbeUncertainty::UnstableManifest);
+    }
+    let as_of_manifest_digest = match crate::CompactionDigest::from_stored(first.version().digest())
+    {
+        Ok(digest) => digest,
+        Err(_) => return probe_uncertain(crate::CompactionProbeUncertainty::CorruptObject),
+    };
+    let Some((index, publication, record)) = found else {
+        if !same_origin {
+            return probe_uncertain(crate::CompactionProbeUncertainty::BaseNotInAncestry);
+        }
+        // The chain proves head/sequence/bytes ancestry, but not which revision
+        // carried it. The exact current version proves itself; alternatively a
+        // still-durable pending intent proves the prior (revision, digest)
+        // because the store validates that tuple on None -> IntentPending.
+        let pending_proves_base = match first.manifest().compaction_state() {
+            crate::CompactionManifestState::IntentPending(intent)
+            | crate::CompactionManifestState::NotAppliedPending { intent, .. } => {
+                intent.id == probe.id
+                    && intent.base == probe.base
+                    && intent.probe().intent_digest == probe.intent_digest
+            }
+            crate::CompactionManifestState::None
+            | crate::CompactionManifestState::EvidencePending(_) => false,
+        };
+        let current_is_base = first.version().revision() == probe.base.manifest_revision
+            && first.version().digest() == probe.base.manifest_digest.as_str();
+        if !pending_proves_base && !current_is_base {
+            return probe_uncertain(crate::CompactionProbeUncertainty::BaseNotInAncestry);
+        }
+        return crate::CompactionProbeResult::NotPublished {
+            base: probe.base,
+            as_of_revision: first.version().revision(),
+            as_of_manifest_digest,
+        };
+    };
+    let crate::SessionObjectKind::CompactionPublication { checkpoint, .. } = publication.kind()
+    else {
+        unreachable!("matched compaction publication")
+    };
+    let checkpoint_object = match store.load_object(&key, &probe.generation, checkpoint) {
+        Ok(Some(object)) => object,
+        Ok(None) => return probe_uncertain(crate::CompactionProbeUncertainty::MissingObject),
+        Err(error) => return probe_store_error(error),
+    };
+    let crate::SessionObjectKind::Checkpoint { shell_bytes, .. } = checkpoint_object.kind() else {
+        return probe_uncertain(crate::CompactionProbeUncertainty::CorruptObject);
+    };
+    let checkpoint_facts = crate::CompactionContentFacts::from_bytes(
+        crate::COMPACTION_CHECKPOINT_DIGEST_DOMAIN,
+        shell_bytes,
+        record.checkpoint.item_count,
+    );
+    if checkpoint_object.id() != checkpoint
+        || checkpoint_object.session() != &key
+        || checkpoint_object.generation() != &probe.generation
+        || checkpoint_facts != record.checkpoint
+    {
+        return probe_uncertain(crate::CompactionProbeUncertainty::CorruptObject);
+    }
+    let receipt = record.receipt(
+        probe.session.clone(),
+        probe.generation.clone(),
+        publication.id().clone(),
+        checkpoint.clone(),
+        publication.sequence().expect("publication sequence"),
+    );
+    if receipt.validate().is_err() {
+        return probe_uncertain(crate::CompactionProbeUncertainty::CorruptObject);
+    }
+    let suffix = &reverse[index + 1..];
+    let relation = if !same_origin {
+        crate::CompactionTimelineRelation::Forked {
+            origin_session: record.intent.owner.session().clone(),
+        }
+    } else if let Some(by) = suffix.iter().find_map(|object| match object.kind() {
+        crate::SessionObjectKind::CompactionPublication { record, .. } => {
+            Some(record.intent.id.clone())
+        }
+        _ => None,
+    }) {
+        crate::CompactionTimelineRelation::Superseded { by }
+    } else if let Some(operation) = suffix.iter().find_map(|object| match object.kind() {
+        crate::SessionObjectKind::RewindPublication { operation, .. } => Some(operation.clone()),
+        _ => None,
+    }) {
+        crate::CompactionTimelineRelation::Rewound { operation }
+    } else if suffix.is_empty() {
+        crate::CompactionTimelineRelation::Current
+    } else {
+        crate::CompactionTimelineRelation::Followed
+    };
+    crate::CompactionProbeResult::Applied {
+        receipt,
+        relation,
+        as_of_revision: first.version().revision(),
+        as_of_manifest_digest,
+    }
 }
 
 impl Runtime {
@@ -28,7 +351,7 @@ impl Runtime {
         options: RuntimeOptions,
         run_store: Option<Arc<dyn xai_agent_lifecycle::run::RunStore>>,
     ) -> Result<(Self, mpsc::UnboundedReceiver<Event>), Error> {
-        Self::start_with_stores(input, options, run_store, None, None).await
+        Self::start_with_stores(input, options, run_store, None, None, None).await
     }
 
     pub async fn start_with_stores(
@@ -37,8 +360,14 @@ impl Runtime {
         run_store: Option<Arc<dyn xai_agent_lifecycle::run::RunStore>>,
         evidence_store: Option<Arc<dyn SessionEvidenceStore>>,
         session_state_store: Option<Arc<dyn crate::SessionStateStore>>,
+        compaction_observer: Option<Arc<dyn crate::CompactionObserver>>,
     ) -> Result<(Self, mpsc::UnboundedReceiver<Event>), Error> {
         validate(&input, &options)?;
+        if compaction_observer.is_some() && session_state_store.is_none() {
+            return Err(Error::InvalidConfig(
+                "CompactionObserver requires a SessionStateStore".into(),
+            ));
+        }
         mount_conversation_tools(&mut options)?;
         if let Some(ui) = options.mcp_elicitation_ui.clone() {
             options.mcp_host_services = std::mem::take(&mut options.mcp_host_services)
@@ -85,6 +414,7 @@ impl Runtime {
                 Arc::new(crate::LocalSessionEvidenceStore::new(&input.session_storage).map_err(op)?)
             }
         };
+        let probe_session_state_store = session_state_store.clone();
         let (events, event_rx) = mpsc::unbounded_channel();
         let (commands, command_rx) = mpsc::unbounded_channel();
         let (startup_tx, startup_rx) = oneshot::channel();
@@ -111,6 +441,7 @@ impl Runtime {
                                         events,
                                         evidence_store,
                                         session_state_store,
+                                        compaction_observer,
                                     )
                                     .await
                                     {
@@ -142,6 +473,7 @@ impl Runtime {
                     runs: tokio::sync::Mutex::new(runs),
                     shutdown: AtomicBool::new(false),
                     capabilities,
+                    session_state_store: probe_session_state_store,
                 }),
             },
             event_rx,
@@ -149,6 +481,15 @@ impl Runtime {
     }
     pub fn capabilities(&self) -> RuntimeCapabilities {
         self.shared.capabilities.clone()
+    }
+
+    pub fn probe_compaction(&self, probe: crate::CompactionProbe) -> crate::CompactionProbeResult {
+        let Some(store) = &self.shared.session_state_store else {
+            return crate::CompactionProbeResult::Uncertain {
+                reason: crate::CompactionProbeUncertainty::StoreFailure,
+            };
+        };
+        probe_compaction(store.as_ref(), probe)
     }
     pub(super) fn ensure_running(&self) -> Result<(), Error> {
         if self.shared.shutdown.load(Ordering::Acquire) {
@@ -647,6 +988,30 @@ impl Runtime {
     ) -> Result<PromptReceipt, Error> {
         self.call(|r| Command::Prompt(id.clone(), t, x, source, r))
             .await
+    }
+    pub async fn prompt_autonomous(
+        &self,
+        id: &SessionId,
+        t: String,
+        x: String,
+        run: crate::run::RunId,
+        iteration: crate::run::IterationId,
+        operation: crate::run::OperationId,
+    ) -> Result<PromptReceipt, Error> {
+        self.call(|reply| {
+            Command::PromptAutonomous(
+                id.clone(),
+                t,
+                x,
+                AutonomousCompactionCorrelation {
+                    run,
+                    iteration,
+                    operation,
+                },
+                reply,
+            )
+        })
+        .await
     }
     pub async fn prompt_content(
         &self,

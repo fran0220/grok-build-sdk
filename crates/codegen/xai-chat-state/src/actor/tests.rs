@@ -726,6 +726,43 @@ async fn replace_conversation_persists_and_emits_reset() {
 }
 
 #[tokio::test]
+async fn install_published_compaction_skips_persistence_and_acks_exact_state() {
+    let mut h = TestHarness::new();
+    h.handle.begin_turn_capture();
+    h.handle
+        .push_user_message(ConversationItem::user("x".repeat(4_000)));
+    h.handle.record_token_usage(51_000);
+    let _ = h.handle.get_conversation().await;
+    h.drain_persistence();
+
+    let published = vec![
+        ConversationItem::system("published system"),
+        ConversationItem::user("published summary ".repeat(200)),
+    ];
+    let ack = h
+        .handle
+        .install_published_compaction(published.clone())
+        .await;
+
+    assert_eq!(ack, Some(()));
+    let installed = h.handle.get_conversation().await;
+    assert_eq!(
+        serde_json::to_value(&installed).unwrap(),
+        serde_json::to_value(&published).unwrap()
+    );
+    let base_estimate = crate::estimate_conversation_tokens(&published);
+    let expected = (base_estimate as f64 * 51_000f64 / 1_000f64).round() as u64;
+    assert_eq!(h.handle.get_total_tokens().await, expected.min(51_000));
+    let capture = h
+        .handle
+        .take_turn_messages()
+        .await
+        .expect("capture was active");
+    assert!(capture.compaction_occurred);
+    assert!(h.drain_persistence().is_empty());
+}
+
+#[tokio::test]
 async fn compaction_reseed_carries_provider_overhead() {
     let h = TestHarness::new();
     // ~1k estimated tokens; provider reports 51k → 50k overhead.

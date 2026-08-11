@@ -11,6 +11,7 @@ impl Runtime {
             run_store: None,
             evidence_store: None,
             session_state_store: None,
+            compaction_observer: None,
         }
     }
 }
@@ -20,6 +21,7 @@ pub struct RuntimeBuilder {
     run_store: Option<Arc<dyn run::RunStore>>,
     evidence_store: Option<Arc<dyn SessionEvidenceStore>>,
     session_state_store: Option<Arc<dyn SessionStateStore>>,
+    compaction_observer: Option<Arc<dyn CompactionObserver>>,
 }
 impl RuntimeBuilder {
     pub fn profile(mut self, value: RuntimeProfile) -> Self {
@@ -163,6 +165,13 @@ impl RuntimeBuilder {
         self.session_state_store = Some(value);
         self
     }
+    /// Installs the one Host audit observer for native Session compaction.
+    /// The SDK remains the checkpoint and recovery authority; the observer
+    /// receives only bounded, credential-free digest facts.
+    pub fn compaction_observer(mut self, value: Arc<dyn CompactionObserver>) -> Self {
+        self.compaction_observer = Some(value);
+        self
+    }
     pub async fn start(self) -> Result<(Runtime, mpsc::UnboundedReceiver<Event>), Error> {
         let conversation = self.options.conversation_delegate.clone();
         let mcp_elicitation_ui = self.options.mcp_elicitation_ui.clone();
@@ -172,6 +181,7 @@ impl RuntimeBuilder {
             self.run_store,
             self.evidence_store,
             self.session_state_store,
+            self.compaction_observer,
         )
         .await
         .map(|(inner, events)| {

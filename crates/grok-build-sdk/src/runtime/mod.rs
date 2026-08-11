@@ -103,6 +103,7 @@ impl Runtime {
             Some(run_store),
             Some(evidence_store),
             None,
+            None,
         )
         .await
         .map(|(inner, events)| {

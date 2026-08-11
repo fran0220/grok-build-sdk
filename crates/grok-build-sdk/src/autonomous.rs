@@ -295,7 +295,7 @@ impl AutonomousTurnLoop {
                 ))
                 .await?;
             snapshot = prepared.snapshot;
-            let mut claim = run::ClaimEffect::new(operation_id)
+            let mut claim = run::ClaimEffect::new(operation_id.clone())
                 .reservation(session_turn_reservation(&snapshot.run)?);
             if let Some(fence) = activation.activation_fence.clone() {
                 claim = claim.activation(fence);
@@ -320,7 +320,19 @@ impl AutonomousTurnLoop {
                 activation.activation_fence.as_ref(),
             )
             .await?;
-            let receipt = match self.runtime.prompt(&session_id, &turn_id, &prompt).await {
+            let receipt = match self
+                .runtime
+                .inner
+                .prompt_autonomous(
+                    &session_id,
+                    turn_id.clone(),
+                    prompt.clone(),
+                    activation.run_id.clone(),
+                    handle.iteration_id,
+                    operation_id,
+                )
+                .await
+            {
                 Ok(receipt) => receipt,
                 Err(error) => {
                     // A transport failure may occur before or after native

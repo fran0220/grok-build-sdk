@@ -34,7 +34,15 @@ impl LocalSessionStateStore {
             inspect_schema(&c)?
         } else {
             let tx = c.transaction().map_err(storage)?;
-            tx.execute_batch("CREATE TABLE metadata(key TEXT PRIMARY KEY NOT NULL,value TEXT NOT NULL);CREATE TABLE objects(session_identity TEXT NOT NULL,generation TEXT NOT NULL,id TEXT NOT NULL,size INTEGER NOT NULL,payload BLOB NOT NULL,PRIMARY KEY(session_identity,generation,id));CREATE TABLE manifests(session_identity TEXT PRIMARY KEY NOT NULL,generation TEXT NOT NULL,revision INTEGER NOT NULL,digest TEXT NOT NULL,size INTEGER NOT NULL,payload BLOB NOT NULL);CREATE TABLE tombstones(session_identity TEXT PRIMARY KEY NOT NULL,generation TEXT NOT NULL,revision INTEGER NOT NULL,prior_digest TEXT NOT NULL);INSERT INTO metadata VALUES('schema_marker','grok-build-sdk.session-log');INSERT INTO metadata VALUES('schema_version','1');").map_err(storage)?;
+            tx.execute_batch("CREATE TABLE metadata(key TEXT PRIMARY KEY NOT NULL,value TEXT NOT NULL);CREATE TABLE objects(session_identity TEXT NOT NULL,generation TEXT NOT NULL,id TEXT NOT NULL,size INTEGER NOT NULL,payload BLOB NOT NULL,PRIMARY KEY(session_identity,generation,id));CREATE TABLE manifests(session_identity TEXT PRIMARY KEY NOT NULL,generation TEXT NOT NULL,revision INTEGER NOT NULL,digest TEXT NOT NULL,size INTEGER NOT NULL,payload BLOB NOT NULL);CREATE TABLE tombstones(session_identity TEXT PRIMARY KEY NOT NULL,generation TEXT NOT NULL,revision INTEGER NOT NULL,prior_digest TEXT NOT NULL);").map_err(storage)?;
+            tx.execute(
+                "INSERT INTO metadata VALUES('schema_marker',?1),('schema_version',?2)",
+                rusqlite::params![
+                    SESSION_LOG_SCHEMA_MARKER,
+                    SESSION_LOG_SCHEMA_VERSION.to_string()
+                ],
+            )
+            .map_err(storage)?;
             tx.commit().map_err(storage)?
         }
         c.execute_batch("PRAGMA journal_mode=WAL;PRAGMA synchronous=FULL;")
@@ -62,6 +70,7 @@ impl SessionStateStore for LocalSessionStateStore {
         let path = self.lease_root.join(format!("{digest:x}.lock"));
         let file = std::fs::OpenOptions::new()
             .create(true)
+            .truncate(false)
             .read(true)
             .write(true)
             .open(path)
@@ -417,6 +426,29 @@ fn validate_references(
                     }
                 }
             }
+            SessionObjectKind::CompactionPublication {
+                checkpoint, record, ..
+            } => {
+                let checkpoint =
+                    load_tx(c, &o.session, &o.generation, checkpoint)?.ok_or_else(|| {
+                        corrupt("compaction publication has a missing checkpoint reference")
+                    })?;
+                let SessionObjectKind::Checkpoint { shell_bytes, .. } = checkpoint.kind else {
+                    return Err(corrupt(
+                        "compaction publication has a wrong-kind checkpoint reference",
+                    ));
+                };
+                let facts = crate::CompactionContentFacts::from_bytes(
+                    crate::COMPACTION_CHECKPOINT_DIGEST_DOMAIN,
+                    &shell_bytes,
+                    record.checkpoint.item_count,
+                );
+                if facts != record.checkpoint {
+                    return Err(corrupt(
+                        "compaction checkpoint differs from its publication facts",
+                    ));
+                }
+            }
             SessionObjectKind::RewindPublication { operation, .. } => {
                 match load_tx(c, &o.session, &o.generation, operation)?.map(|x| x.kind) {
                     Some(SessionObjectKind::RewindOperation { .. }) => {}
@@ -453,7 +485,10 @@ fn inspect_schema(c: &rusqlite::Connection) -> Result<(), SessionStateStoreError
     if metadata
         != [
             ("schema_marker".into(), SESSION_LOG_SCHEMA_MARKER.into()),
-            ("schema_version".into(), "1".into()),
+            (
+                "schema_version".into(),
+                SESSION_LOG_SCHEMA_VERSION.to_string(),
+            ),
         ]
     {
         return Err(corrupt("schema marker/version mismatch"));

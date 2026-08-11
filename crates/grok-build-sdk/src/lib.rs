@@ -8,6 +8,7 @@
 mod activation;
 mod artifact;
 mod autonomous;
+mod compaction;
 mod conversation;
 mod evidence;
 mod harness;
@@ -38,6 +39,19 @@ pub use artifact::{
     run_artifact_vault_conformance,
 };
 pub use autonomous::{AutonomousActivation, AutonomousActivationResult, AutonomousTurnLoop};
+pub use compaction::{
+    COMPACTION_CHECKPOINT_DIGEST_DOMAIN, COMPACTION_INPUT_DIGEST_DOMAIN,
+    COMPACTION_INPUT_HOSTED_TOOLS_DIGEST_DOMAIN, COMPACTION_INPUT_MESSAGES_DIGEST_DOMAIN,
+    COMPACTION_INPUT_MODEL_DIGEST_DOMAIN, COMPACTION_INPUT_TOOLS_DIGEST_DOMAIN,
+    COMPACTION_STATE_DIGEST_DOMAIN, COMPACTION_SUMMARY_DIGEST_DOMAIN, CompactionAcknowledgement,
+    CompactionContentFacts, CompactionContractError, CompactionDigest, CompactionId,
+    CompactionInputFacts, CompactionIntent, CompactionNotAppliedReason, CompactionObserver,
+    CompactionObserverError, CompactionObserverErrorCode, CompactionOutcome, CompactionOwner,
+    CompactionProbe, CompactionProbeResult, CompactionProbeUncertainty,
+    CompactionPublicationRecord, CompactionPublicationReference, CompactionReason,
+    CompactionReceipt, CompactionRequestPath, CompactionStateReference, CompactionTimelineRelation,
+    CompactionTurnId, MAX_COMPACTION_ID_BYTES, MAX_COMPACTION_TURN_ID_BYTES,
+};
 pub use conversation::{
     CONVERSATION_TOOL_SERVER, ConversationAcceptance, ConversationCreate, ConversationDelegate,
     ConversationDelivery, ConversationDigest, ConversationError, ConversationId,
@@ -96,15 +110,16 @@ pub use program::{
     run_program_runtime_conformance,
 };
 pub use session_state::{
-    ConformanceOpen, DeleteReceipt, LiveSessionDocument, LocalSessionStateStore,
-    MAX_SESSION_GENERATION_BYTES, MAX_SESSION_IDENTITY_BYTES, MAX_SESSION_MANIFEST_BYTES,
-    MAX_SESSION_OBJECT_BYTES, ManifestCas, ManifestVersion, ObjectPut, PreparedManifestCas,
-    PreparedSessionDelete, RewindKind, SESSION_LOG_SCHEMA_MARKER, SESSION_LOG_SCHEMA_VERSION,
-    SessionDelete, SessionGeneration, SessionKey, SessionManifest, SessionObject, SessionObjectId,
-    SessionObjectKind, SessionSlot, SessionStateFault, SessionStateFaultHarness,
-    SessionStateFaultMetrics, SessionStateLease, SessionStateStore, SessionStateStoreError,
-    TARGET_TRANSCRIPT_SEGMENT_BYTES, delete_reconciled, manifest_cas_reconciled,
-    object_put_reconciled, run_session_state_conformance, run_session_state_fault_conformance,
+    CompactionManifestState, ConformanceOpen, DeleteReceipt, LiveSessionDocument,
+    LocalSessionStateStore, MAX_SESSION_GENERATION_BYTES, MAX_SESSION_IDENTITY_BYTES,
+    MAX_SESSION_MANIFEST_BYTES, MAX_SESSION_OBJECT_BYTES, ManifestCas, ManifestVersion, ObjectPut,
+    PreparedManifestCas, PreparedSessionDelete, RewindKind, SESSION_LOG_SCHEMA_MARKER,
+    SESSION_LOG_SCHEMA_VERSION, SessionDelete, SessionGeneration, SessionKey, SessionManifest,
+    SessionObject, SessionObjectId, SessionObjectKind, SessionSlot, SessionStateFault,
+    SessionStateFaultHarness, SessionStateFaultMetrics, SessionStateLease, SessionStateStore,
+    SessionStateStoreError, TARGET_TRANSCRIPT_SEGMENT_BYTES, delete_reconciled,
+    manifest_cas_reconciled, object_put_reconciled, run_session_state_conformance,
+    run_session_state_fault_conformance,
 };
 
 pub(crate) use std::{collections::BTreeMap, path::PathBuf, sync::Arc};

@@ -1,7 +1,7 @@
 use super::contracts::*;
 use sha2::{Digest as _, Sha256};
 
-const MAGIC: &[u8] = b"grok-build-sdk.session-log\0\x01";
+const MAGIC: &[u8] = b"grok-build-sdk.session-log\0\x02";
 pub(super) fn encode_object(
     k: &SessionKey,
     g: &SessionGeneration,
@@ -62,6 +62,20 @@ pub(super) fn encode_object(
             b.extend(sequence.to_be_bytes());
             put_bytes64(&mut b, marker_bytes);
             put_ref(&mut b, Some(operation))
+        }
+        SessionObjectKind::CompactionPublication {
+            previous,
+            sequence,
+            marker_bytes,
+            checkpoint,
+            record,
+        } => {
+            b.push(8);
+            put_ref(&mut b, previous.as_ref());
+            b.extend(sequence.to_be_bytes());
+            put_bytes64(&mut b, marker_bytes);
+            put_ref(&mut b, Some(checkpoint));
+            put_bytes64(&mut b, &serde_json::to_vec(record).map_err(validation)?)
         }
     }
     if b.len() > MAX_SESSION_OBJECT_BYTES {
@@ -124,6 +138,23 @@ pub(super) fn decode_object(
                 }
             }
         }
+        8 => {
+            let previous = get_ref(b, &mut p)?;
+            let sequence = get_u64(b, &mut p)?;
+            let marker_bytes = get_bytes64(b, &mut p)?;
+            let checkpoint =
+                get_ref(b, &mut p)?.ok_or_else(|| corrupt("publication missing reference"))?;
+            let record: crate::CompactionPublicationRecord =
+                serde_json::from_slice(&get_bytes64(b, &mut p)?).map_err(corrupt)?;
+            record.validate().map_err(corrupt)?;
+            SessionObjectKind::CompactionPublication {
+                previous,
+                sequence,
+                marker_bytes,
+                checkpoint,
+                record,
+            }
+        }
         _ => return Err(corrupt("invalid object kind")),
     };
     if p != b.len() {
@@ -137,6 +168,7 @@ pub(super) fn encode_manifest(
     h: Option<&SessionObjectId>,
     count: u64,
     bytes: u64,
+    compaction_state: &CompactionManifestState,
 ) -> Result<Vec<u8>, SessionStateStoreError> {
     let mut b = MAGIC.to_vec();
     put_bytes(&mut b, k.0.as_bytes());
@@ -144,6 +176,10 @@ pub(super) fn encode_manifest(
     put_ref(&mut b, h);
     b.extend(count.to_be_bytes());
     b.extend(bytes.to_be_bytes());
+    put_bytes64(
+        &mut b,
+        &serde_json::to_vec(compaction_state).map_err(validation)?,
+    );
     if b.len() > MAX_SESSION_MANIFEST_BYTES {
         return Err(validation("manifest exceeds 64 KiB"));
     }
@@ -162,6 +198,9 @@ pub(super) fn decode_manifest(b: &[u8]) -> Result<SessionManifest, SessionStateS
     let head = get_ref(b, &mut p)?;
     let segment_count = get_u64(b, &mut p)?;
     let transcript_bytes = get_u64(b, &mut p)?;
+    let compaction_state: CompactionManifestState =
+        serde_json::from_slice(&get_bytes64(b, &mut p)?).map_err(corrupt)?;
+    validate_compaction_state(&compaction_state).map_err(as_corrupt)?;
     if p != b.len() || head.is_none() && (segment_count != 0 || transcript_bytes != 0) {
         return Err(corrupt("invalid manifest"));
     }
@@ -171,6 +210,7 @@ pub(super) fn decode_manifest(b: &[u8]) -> Result<SessionManifest, SessionStateS
         head,
         segment_count,
         transcript_bytes,
+        compaction_state,
         bytes: b.to_vec(),
     })
 }
@@ -185,6 +225,9 @@ pub(super) fn chain_parts(k: &SessionObjectKind) -> Option<(Option<&SessionObjec
         | SessionObjectKind::RewindPublication {
             previous, sequence, ..
         } => Some((previous.as_ref(), *sequence)),
+        SessionObjectKind::CompactionPublication {
+            previous, sequence, ..
+        } => Some((previous.as_ref(), *sequence)),
         _ => None,
     }
 }
@@ -192,18 +235,24 @@ pub(super) fn chain_bytes(k: &SessionObjectKind) -> u64 {
     match k {
         SessionObjectKind::TranscriptSegment { bytes, .. } => bytes.len() as u64,
         SessionObjectKind::CheckpointPublication { marker_bytes, .. }
-        | SessionObjectKind::RewindPublication { marker_bytes, .. } => marker_bytes.len() as u64,
+        | SessionObjectKind::RewindPublication { marker_bytes, .. }
+        | SessionObjectKind::CompactionPublication { marker_bytes, .. } => {
+            marker_bytes.len() as u64
+        }
         _ => 0,
     }
 }
 pub(super) fn validate_kind(k: &SessionObjectKind) -> Result<(), SessionStateStoreError> {
-    if let Some((p, s)) = chain_parts(k) {
-        if s == 0 || s == 1 && p.is_some() || s > 1 && p.is_none() {
-            return Err(validation("chain previous/sequence mismatch"));
-        }
+    if let Some((p, s)) = chain_parts(k)
+        && (s == 0 || s == 1 && p.is_some() || s > 1 && p.is_none())
+    {
+        return Err(validation("chain previous/sequence mismatch"));
     }
     if let SessionObjectKind::Checkpoint { name, .. } = k {
         valid_text(name, 1024, "checkpoint name")?
+    }
+    if let SessionObjectKind::CompactionPublication { record, .. } = k {
+        record.validate().map_err(validation)?;
     }
     Ok(())
 }

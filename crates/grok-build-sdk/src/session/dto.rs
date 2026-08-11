@@ -147,8 +147,25 @@ pub struct SubagentCancelReceipt {
     pub outcome: Option<SubagentCancelOutcome>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize)]
 pub struct SessionId(pub(crate) String);
+
+impl<'de> serde::Deserialize<'de> for SessionId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = <String as serde::Deserialize>::deserialize(deserializer)?;
+        if value.is_empty()
+            || value.len() > crate::MAX_SESSION_IDENTITY_BYTES
+            || value.contains('\0')
+        {
+            return Err(serde::de::Error::custom("invalid Session identity"));
+        }
+        Ok(Self(value))
+    }
+}
+
 impl SessionId {
     pub(crate) const RUNTIME_EVENTS: &'static str = "__origin_runtime__";
 

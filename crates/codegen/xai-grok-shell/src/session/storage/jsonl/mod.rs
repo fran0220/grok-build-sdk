@@ -1049,6 +1049,19 @@ impl JsonlStorageAdapter {
                             })?);
                         }
                     }
+                    ReplayRecord::Compaction {
+                        name,
+                        payload,
+                        marker,
+                        ..
+                    } => {
+                        checkpoints.insert(name, payload);
+                        if !marker.is_empty() {
+                            updates.push(serde_json::from_slice(&marker).map_err(|error| {
+                                io::Error::new(io::ErrorKind::InvalidData, error)
+                            })?);
+                        }
+                    }
                     ReplayRecord::Rewind { operation, marker } => {
                         match operation {
                             RewindOperation::AppendPoint { payload, .. } => {
@@ -1875,6 +1888,57 @@ impl StorageAdapter for JsonlStorageAdapter {
         let bytes = serde_json::to_vec_pretty(checkpoint)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         tokio::fs::write(path, bytes).await
+    }
+    async fn begin_native_compaction(
+        &self,
+        input: crate::session::state_authority::NativeCompactionInput,
+    ) -> Result<
+        crate::session::state_authority::NativeCompactionBegin,
+        crate::session::state_authority::NativeCompactionError,
+    > {
+        match &self.native_session {
+            Some(session) => session.begin_compaction(input).await,
+            None => Ok(crate::session::state_authority::NativeCompactionBegin::Disabled),
+        }
+    }
+    async fn native_compaction_not_applied(
+        &self,
+        compaction_id: String,
+        reason: crate::session::state_authority::NativeCompactionNotAppliedReason,
+    ) -> Result<(), crate::session::state_authority::NativeCompactionError> {
+        match &self.native_session {
+            Some(session) => session.compaction_not_applied(compaction_id, reason).await,
+            None => Err(crate::session::state_authority::NativeCompactionError::disabled()),
+        }
+    }
+    async fn publish_native_compaction(
+        &self,
+        publication: crate::session::state_authority::NativeCompactionPublication,
+    ) -> Result<(), crate::session::state_authority::NativeCompactionError> {
+        match &self.native_session {
+            Some(session) => session.publish_compaction(publication).await,
+            None => Err(crate::session::state_authority::NativeCompactionError::disabled()),
+        }
+    }
+    async fn native_compaction_applied(
+        &self,
+        compaction_id: String,
+    ) -> Result<(), crate::session::state_authority::NativeCompactionError> {
+        match &self.native_session {
+            Some(session) => session.compaction_applied(compaction_id).await,
+            None => Err(crate::session::state_authority::NativeCompactionError::disabled()),
+        }
+    }
+    async fn recover_native_compaction(
+        &self,
+    ) -> Result<
+        crate::session::state_authority::NativeCompactionRecovery,
+        crate::session::state_authority::NativeCompactionError,
+    > {
+        match &self.native_session {
+            Some(session) => session.recover_compaction().await,
+            None => Ok(crate::session::state_authority::NativeCompactionRecovery::None),
+        }
     }
     async fn write_compaction_request(
         &self,

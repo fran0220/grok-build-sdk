@@ -221,6 +221,10 @@ impl ChatStateActor {
             } => {
                 self.replace_conversation(items, is_compaction);
             }
+            ChatStateCommand::InstallPublishedCompaction { items, reply } => {
+                self.install_published_compaction(items);
+                let _ = reply.send(());
+            }
             ChatStateCommand::RepairHistory {
                 dry_run,
                 turn_active,

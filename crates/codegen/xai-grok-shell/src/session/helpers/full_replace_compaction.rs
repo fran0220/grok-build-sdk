@@ -39,7 +39,8 @@ use xai_chat_state::compaction_utils::{
 
 use crate::sampling::Client as OaiCompatClient;
 use crate::session::helpers::session_compact::{
-    CompactFailure, CompactOutput, build_compaction_chat_history, generate_session_compact,
+    CompactFailure, CompactOutput, PreparedCompactionRequest, build_compaction_chat_history,
+    generate_prepared_session_compact, prepare_compaction_request,
 };
 
 /// Wraps `generate_session_compact` as the shared engine's
@@ -73,6 +74,7 @@ pub(crate) struct ShellCompactionSampler {
     wall_clock_budget_secs: u64,
     tool_choice: crate::util::config::CompactionToolChoice,
     cancel: tokio_util::sync::CancellationToken,
+    prepared: Mutex<Option<PreparedCompactionRequest>>,
     /// Full output of the most recent successful sample (for L5 telemetry).
     last_success: Mutex<Option<CompactOutput>>,
 }
@@ -104,8 +106,32 @@ impl ShellCompactionSampler {
             wall_clock_budget_secs,
             tool_choice,
             cancel,
+            prepared: Mutex::new(None),
             last_success: Mutex::new(None),
         }
+    }
+
+    /// Freeze the exact semantic request used by all retries for the current
+    /// input-ladder stage. The returned value is also the source of the native
+    /// observer digest.
+    pub(crate) fn prepare_request(
+        &self,
+        turns: Vec<ConversationItem>,
+    ) -> PreparedCompactionRequest {
+        let history = build_compaction_chat_history(
+            turns,
+            self.user_context.as_deref(),
+            self.use_short_prompt,
+        );
+        let prepared = prepare_compaction_request(
+            history,
+            self.tools.clone(),
+            self.hosted_tools.clone(),
+            &self.sampling_config,
+            self.tool_choice,
+        );
+        *self.prepared.lock().unwrap() = Some(prepared.clone());
+        prepared
     }
 
     /// Take the [`CompactOutput`] of the most recent successful sample, if any.
@@ -120,29 +146,22 @@ impl CompactionSampler for ShellCompactionSampler {
 
     async fn sample_compaction(
         &self,
-        turns: &[ConversationItem],
+        _turns: &[ConversationItem],
         _prompt: &CompactionPrompt,
         _timeout: Duration,
     ) -> Result<LlmCompactionOutput, CompactionSampleError> {
-        // Append the harness-selected summarization prompt as the final user
-        // message (compat short vs structured grok-build), ignoring the shared
-        // engine's `_prompt` (see the struct doc).
-        let chat_history = build_compaction_chat_history(
-            turns.to_vec(),
-            self.user_context.as_deref(),
-            self.use_short_prompt,
-        );
+        let prepared = self.prepared.lock().unwrap().clone().ok_or_else(|| {
+            CompactionSampleError::Build(
+                "compaction request was not finalized before sampling".into(),
+            )
+        })?;
 
-        match generate_session_compact(
-            chat_history,
-            self.tools.clone(),
-            self.hosted_tools.clone(),
+        match generate_prepared_session_compact(
+            prepared,
             self.client.clone(),
             self.session_id.clone(),
-            &self.sampling_config,
             self.idle_timeout,
             self.wall_clock_budget_secs,
-            self.tool_choice,
             &self.cancel,
         )
         .await

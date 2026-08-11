@@ -41,7 +41,7 @@ const DEFAULT_CLIENT_IDENTIFIER: &str = "grok-shell";
 
 /// Product identifier baked into User-Agent strings.
 const AGENT_PRODUCT: &str = "grok-shell";
-const ANTHROPIC_DEFAULT_MAX_TOKENS: u32 = 128_000;
+pub const ANTHROPIC_DEFAULT_MAX_TOKENS: u32 = 128_000;
 
 /// Per-request `x-grok-*` headers. Optional fields are skipped when empty/`None`.
 struct GrokRequestHeaders<'a> {
@@ -1334,7 +1334,7 @@ impl SamplingClient {
             SamplingError::Serialization(e)
         })?;
         // Inject xAI-specific fields not in async-openai's CreateResponse type.
-        if self.defaults.stream_tool_calls {
+        if request.stream_tool_calls {
             request_body["stream_tool_calls"] = serde_json::json!(true);
         }
         // Inject xAI-specific tools (e.g., x_search) that can't be expressed
@@ -1906,6 +1906,7 @@ impl SamplingClient {
         let responses_request: rs::CreateResponse = (&request).into();
 
         let mut wrapper = CreateResponseWrapper::new(responses_request);
+        wrapper.stream_tool_calls = self.defaults.stream_tool_calls;
         wrapper.x_grok_conv_id = x_grok_conv_id;
         wrapper.x_grok_req_id = x_grok_req_id;
         wrapper.x_grok_session_id = x_grok_session_id;

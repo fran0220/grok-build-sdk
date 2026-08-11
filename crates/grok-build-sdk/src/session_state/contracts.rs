@@ -1,7 +1,7 @@
 use super::codec::*;
 
 pub const SESSION_LOG_SCHEMA_MARKER: &str = "grok-build-sdk.session-log";
-pub const SESSION_LOG_SCHEMA_VERSION: u32 = 1;
+pub const SESSION_LOG_SCHEMA_VERSION: u32 = 2;
 pub const MAX_SESSION_OBJECT_BYTES: usize = 64 * 1024 * 1024;
 pub const MAX_SESSION_MANIFEST_BYTES: usize = 64 * 1024;
 pub const TARGET_TRANSCRIPT_SEGMENT_BYTES: usize = 4 * 1024 * 1024;
@@ -20,7 +20,7 @@ pub enum SessionStateStoreError {
 
 macro_rules! text_type {
     ($name:ident, $max:ident, $label:literal, $method:ident) => {
-        #[derive(Clone, Debug, PartialEq, Eq, Hash)]
+        #[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize)]
         pub struct $name(pub(super) String);
         impl $name {
             pub fn new(value: impl Into<String>) -> Result<Self, SessionStateStoreError> {
@@ -30,6 +30,15 @@ macro_rules! text_type {
             }
             pub fn $method(&self) -> &str {
                 &self.0
+            }
+        }
+        impl<'de> serde::Deserialize<'de> for $name {
+            fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+            where
+                D: serde::Deserializer<'de>,
+            {
+                let value = <String as serde::Deserialize>::deserialize(deserializer)?;
+                Self::new(value).map_err(serde::de::Error::custom)
             }
         }
     };
@@ -47,7 +56,7 @@ text_type!(
     as_str
 );
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize)]
 pub struct SessionObjectId(pub(super) String);
 impl SessionObjectId {
     pub fn from_stored(value: impl Into<String>) -> Result<Self, SessionStateStoreError> {
@@ -60,6 +69,16 @@ impl SessionObjectId {
     }
 }
 
+impl<'de> serde::Deserialize<'de> for SessionObjectId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = <String as serde::Deserialize>::deserialize(deserializer)?;
+        Self::from_stored(value).map_err(serde::de::Error::custom)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RewindKind {
     AppendPoint,
@@ -67,7 +86,28 @@ pub enum RewindKind {
     Merge,
 }
 
+/// Durable fence for an observed compaction. `IntentPending` proves that no
+/// matching checkpoint publication or terminal nonapplication has committed.
+/// `NotAppliedPending` preserves the exact terminal reason across a lost Host
+/// acknowledgement. `EvidencePending` proves publication committed but
+/// volatile installation and/or Host outcome acknowledgement still requires
+/// idempotent recovery.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(tag = "state", content = "value", rename_all = "snake_case")]
+#[allow(clippy::large_enum_variant)]
+pub enum CompactionManifestState {
+    #[default]
+    None,
+    IntentPending(crate::CompactionIntent),
+    NotAppliedPending {
+        intent: crate::CompactionIntent,
+        reason: crate::CompactionNotAppliedReason,
+    },
+    EvidencePending(crate::CompactionReceipt),
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[allow(clippy::large_enum_variant)]
 pub enum SessionObjectKind {
     TranscriptSegment {
         previous: Option<SessionObjectId>,
@@ -88,6 +128,13 @@ pub enum SessionObjectKind {
         sequence: u64,
         marker_bytes: Vec<u8>,
         checkpoint: SessionObjectId,
+    },
+    CompactionPublication {
+        previous: Option<SessionObjectId>,
+        sequence: u64,
+        marker_bytes: Vec<u8>,
+        checkpoint: SessionObjectId,
+        record: crate::CompactionPublicationRecord,
     },
     RewindPublication {
         previous: Option<SessionObjectId>,
@@ -193,6 +240,27 @@ impl SessionObject {
             },
         )
     }
+    pub fn publish_compaction(
+        session: SessionKey,
+        generation: SessionGeneration,
+        previous: Option<SessionObjectId>,
+        sequence: u64,
+        marker_bytes: Vec<u8>,
+        checkpoint: SessionObjectId,
+        record: crate::CompactionPublicationRecord,
+    ) -> Result<Self, SessionStateStoreError> {
+        Self::build(
+            session,
+            generation,
+            SessionObjectKind::CompactionPublication {
+                previous,
+                sequence,
+                marker_bytes,
+                checkpoint,
+                record,
+            },
+        )
+    }
     fn build(
         session: SessionKey,
         generation: SessionGeneration,
@@ -252,7 +320,7 @@ impl SessionObject {
         self.bytes.len() as u64
     }
     pub fn previous(&self) -> Option<&SessionObjectId> {
-        chain_parts(&self.kind).map(|x| x.0).flatten()
+        chain_parts(&self.kind).and_then(|x| x.0)
     }
     pub fn sequence(&self) -> Option<u64> {
         chain_parts(&self.kind).map(|x| x.1)
@@ -266,6 +334,7 @@ pub struct SessionManifest {
     pub(super) head: Option<SessionObjectId>,
     pub(super) segment_count: u64,
     pub(super) transcript_bytes: u64,
+    pub(super) compaction_state: CompactionManifestState,
     pub(super) bytes: Vec<u8>,
 }
 impl SessionManifest {
@@ -276,15 +345,34 @@ impl SessionManifest {
         segment_count: u64,
         transcript_bytes: u64,
     ) -> Result<Self, SessionStateStoreError> {
+        Self::new_with_compaction_state(
+            session,
+            generation,
+            head,
+            segment_count,
+            transcript_bytes,
+            CompactionManifestState::None,
+        )
+    }
+    pub fn new_with_compaction_state(
+        session: SessionKey,
+        generation: SessionGeneration,
+        head: Option<SessionObjectId>,
+        segment_count: u64,
+        transcript_bytes: u64,
+        compaction_state: CompactionManifestState,
+    ) -> Result<Self, SessionStateStoreError> {
         if head.is_none() && (segment_count != 0 || transcript_bytes != 0) {
             return Err(validation("empty head must have zero counters"));
         }
+        validate_compaction_state(&compaction_state)?;
         let bytes = encode_manifest(
             &session,
             &generation,
             head.as_ref(),
             segment_count,
             transcript_bytes,
+            &compaction_state,
         )?;
         Ok(Self {
             session,
@@ -292,6 +380,7 @@ impl SessionManifest {
             head,
             segment_count,
             transcript_bytes,
+            compaction_state,
             bytes,
         })
     }
@@ -315,6 +404,9 @@ impl SessionManifest {
     }
     pub fn transcript_bytes(&self) -> u64 {
         self.transcript_bytes
+    }
+    pub fn compaction_state(&self) -> &CompactionManifestState {
+        &self.compaction_state
     }
     pub fn canonical_bytes(&self) -> &[u8] {
         &self.bytes
@@ -408,6 +500,7 @@ impl DeleteReceipt {
     }
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[allow(clippy::large_enum_variant)]
 pub enum SessionSlot {
     Vacant,
     Live(LiveSessionDocument),
@@ -431,10 +524,10 @@ impl PreparedManifestCas {
         if manifest.session != key {
             return Err(validation("manifest session mismatch"));
         }
-        if let Some(e) = &expected {
-            if e.manifest.session != key || e.manifest.generation != manifest.generation {
-                return Err(validation("manifest identity or generation changed"));
-            }
+        if let Some(e) = &expected
+            && (e.manifest.session != key || e.manifest.generation != manifest.generation)
+        {
+            return Err(validation("manifest identity or generation changed"));
         }
         let revision = expected
             .as_ref()
@@ -442,6 +535,7 @@ impl PreparedManifestCas {
             .filter(|x| *x <= i64::MAX as u64)
             .ok_or_else(|| validation("manifest revision overflow"))?;
         validate_suffix(&manifest, expected.as_ref().map(|x| &x.manifest), suffix)?;
+        validate_compaction_transition(expected.as_ref(), &manifest, suffix)?;
         let successor = LiveSessionDocument {
             version: ManifestVersion {
                 revision,
@@ -467,6 +561,115 @@ impl PreparedManifestCas {
     }
     pub fn suffix(&self) -> &[SessionObjectId] {
         &self.suffix
+    }
+}
+
+pub(super) fn validate_compaction_state(
+    state: &CompactionManifestState,
+) -> Result<(), SessionStateStoreError> {
+    match state {
+        CompactionManifestState::None => Ok(()),
+        CompactionManifestState::IntentPending(intent) => intent.validate().map_err(validation),
+        CompactionManifestState::NotAppliedPending { intent, .. } => {
+            intent.validate().map_err(validation)
+        }
+        CompactionManifestState::EvidencePending(receipt) => receipt.validate().map_err(validation),
+    }
+}
+
+fn validate_compaction_transition(
+    expected: Option<&LiveSessionDocument>,
+    successor: &SessionManifest,
+    suffix: &[SessionObject],
+) -> Result<(), SessionStateStoreError> {
+    let prior = expected
+        .map(|document| document.manifest.compaction_state())
+        .unwrap_or(&CompactionManifestState::None);
+    let next = successor.compaction_state();
+    if prior == next {
+        if matches!(prior, CompactionManifestState::None)
+            || expected.is_some_and(|document| {
+                suffix.is_empty()
+                    && document.manifest.head == successor.head
+                    && document.manifest.segment_count == successor.segment_count
+                    && document.manifest.transcript_bytes == successor.transcript_bytes
+            })
+        {
+            return Ok(());
+        }
+        return Err(validation(
+            "ordinary Session publication is fenced during native compaction",
+        ));
+    }
+    let chain_unchanged = suffix.is_empty()
+        && expected.is_some_and(|document| {
+            document.manifest.head == successor.head
+                && document.manifest.segment_count == successor.segment_count
+                && document.manifest.transcript_bytes == successor.transcript_bytes
+        });
+    match (prior, next) {
+        (CompactionManifestState::None, CompactionManifestState::IntentPending(intent))
+            if chain_unchanged
+                && expected.is_some_and(|document| {
+                    intent.base.session.as_str() == document.manifest.session.session_identity()
+                        && intent.base.generation == document.manifest.generation
+                        && intent.base.manifest_revision == document.version.revision
+                        && intent.base.manifest_digest.as_str() == document.version.digest
+                        && intent.base.head == document.manifest.head
+                        && intent.base.sequence == document.manifest.segment_count
+                }) =>
+        {
+            Ok(())
+        }
+        (CompactionManifestState::IntentPending(_), CompactionManifestState::None)
+        | (CompactionManifestState::NotAppliedPending { .. }, CompactionManifestState::None)
+        | (CompactionManifestState::EvidencePending(_), CompactionManifestState::None)
+            if chain_unchanged =>
+        {
+            Ok(())
+        }
+        (
+            CompactionManifestState::IntentPending(intent),
+            CompactionManifestState::NotAppliedPending {
+                intent: pending, ..
+            },
+        ) if chain_unchanged && intent == pending => Ok(()),
+        (
+            CompactionManifestState::IntentPending(intent),
+            CompactionManifestState::EvidencePending(receipt),
+        ) => {
+            let Some(SessionObject {
+                id,
+                kind:
+                    SessionObjectKind::CompactionPublication {
+                        checkpoint, record, ..
+                    },
+                ..
+            }) = suffix.last()
+            else {
+                return Err(validation(
+                    "evidence-pending transition lacks a typed compaction publication",
+                ));
+            };
+            if receipt.intent != *intent
+                || receipt.publication.publication != *id
+                || receipt.publication.checkpoint != *checkpoint
+                || receipt.publication.session.as_str() != successor.session.session_identity()
+                || receipt.publication.generation != successor.generation
+                || receipt.publication.sequence != successor.segment_count
+                || receipt.intent != record.intent
+                || receipt.summary != record.summary
+                || receipt.checkpoint != record.checkpoint
+                || receipt.installed_state != record.installed_state
+                || receipt.publication.prompt_index != record.prompt_index
+            {
+                return Err(validation(
+                    "evidence-pending receipt differs from its intent or publication",
+                ));
+            }
+            Ok(())
+        }
+        _ => Err(validation("invalid compaction manifest transition")),
     }
 }
 #[derive(Clone, Debug)]
@@ -512,6 +715,7 @@ pub enum ObjectPut {
     CommitUnknown,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[allow(clippy::large_enum_variant)]
 pub enum ManifestCas {
     Committed(LiveSessionDocument),
     Conflict,

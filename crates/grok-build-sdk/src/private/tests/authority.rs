@@ -75,7 +75,11 @@ fn session_state_bridge_round_trips_semantic_port() {
     let root = tempfile::TempDir::new().unwrap();
     let store: Arc<dyn crate::SessionStateStore> =
         Arc::new(crate::LocalSessionStateStore::new(root.path()).unwrap());
-    let authority = SessionStateAuthorityBridge { store };
+    let authority = SessionStateAuthorityBridge {
+        store,
+        observer: None,
+        correlations: Arc::new(std::sync::Mutex::new(HashMap::new())),
+    };
     let id = SessionIdentity {
         identity: "session-1".into(),
         generation: "generation-1".into(),

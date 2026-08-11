@@ -63,10 +63,19 @@ pub(crate) struct AsyncCompactionCache {
 pub(crate) struct CompactCancelGate {
     token: RefCell<tokio_util::sync::CancellationToken>,
     holders: AtomicUsize,
+    /// Exactly one applying compaction may own a Session at a time. Prefire is
+    /// deliberately excluded: pass 1 is speculative and never publishes or
+    /// installs Session state.
+    applying: Arc<AtomicBool>,
 }
 
 /// Decrements the holder count when a compact/prefire scope ends.
 pub(crate) struct CompactCancelScope<'a>(&'a CompactCancelGate);
+
+/// Owned Session-actor permit for one applying compaction. It can be claimed
+/// synchronously before a manual compaction task is spawned, closing the race
+/// in which the actor could otherwise admit a prompt first.
+pub(crate) struct CompactApplyPermit(Arc<AtomicBool>);
 
 impl Drop for CompactCancelScope<'_> {
     fn drop(&mut self) {
@@ -74,7 +83,24 @@ impl Drop for CompactCancelScope<'_> {
     }
 }
 
+impl Drop for CompactApplyPermit {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
 impl CompactCancelGate {
+    pub(crate) fn try_begin_apply(&self) -> Option<CompactApplyPermit> {
+        self.applying
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .ok()
+            .map(|_| CompactApplyPermit(Arc::clone(&self.applying)))
+    }
+
+    pub(crate) fn is_applying(&self) -> bool {
+        self.applying.load(Ordering::Acquire)
+    }
+
     /// Start or join a compact/prefire scope. Nested callers share one token,
     /// including a token already cancelled by stop, so overlapping prefire +
     /// compact both observe the same abort. A later independent enter after

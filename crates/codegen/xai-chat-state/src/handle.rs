@@ -202,6 +202,16 @@ impl ChatStateHandle {
         self.send_replace(items, true);
     }
 
+    /// Install a compaction that the caller has already durably published.
+    /// Skips persistence and returns only after memory and token state have
+    /// been updated. Returns `None` if the actor is unavailable.
+    pub async fn install_published_compaction(&self, items: Vec<ConversationItem>) -> Option<()> {
+        self.query("InstallPublishedCompaction", |reply| {
+            ChatStateCommand::InstallPublishedCompaction { items, reply }
+        })
+        .await
+    }
+
     fn send_replace(&self, items: Vec<ConversationItem>, is_compaction: bool) {
         let _ = self.cmd_tx.send(ChatStateCommand::ReplaceConversation {
             items,
