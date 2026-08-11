@@ -140,7 +140,7 @@ fn validate_line(label: &str, value: &str, limit: usize) -> Result<(), ProgramEr
 /// unambiguous: no combination of field contents can be re-partitioned into a
 /// different sequence that encodes the same way, so two executions with
 /// different arguments cannot share an arguments digest.
-fn digest_of_fields(fields: &[&str]) -> ArtifactDigest {
+pub(crate) fn digest_of_fields(fields: &[&str]) -> ArtifactDigest {
     let mut encoded = String::new();
     for field in fields {
         encoded.push_str(&field.len().to_string());

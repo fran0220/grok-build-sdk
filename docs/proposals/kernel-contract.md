@@ -1,7 +1,8 @@
 # Proposal: persistent kernel contract and bounded workflow driver
 
-Status: draft, for separate approval. Not implemented. No code in this
-repository changes until this document is approved.
+Status: approved and implemented. This document is now the design record for
+the shipped contract; where the implementation departs from the sketch below,
+§7 says so and the code is authoritative.
 
 Scope: the shape of a new `crate::kernel` contract module and the rules a
 bounded workflow driver must follow. Read alongside `src/program.rs`
@@ -886,3 +887,59 @@ release.
 - Pre-release, there is exactly one current schema. If this contract's schema
   is superseded before release, its readers, writers, fixtures and stored
   state go in the same change; there is no dual-read path.
+
+---
+
+## 7. What shipped
+
+Every §5 recommendation was adopted as written, and §6.2 was closed with option
+(a). The contract lives in `crates/grok-build-sdk/src/kernel.rs`, its reference
+backend in `src/kernel/local.rs` (durable records in
+`src/kernel/local/records.rs`), its conformance suite in
+`src/kernel/conformance.rs`, the bounded driver in `src/workflow.rs`, and the
+scriptable kernel the suite runs against in `src/bin/kernel_fixture.rs`. The
+Host-facing tests are `crates/grok-build-sdk/tests/kernel_runtime.rs`.
+
+### 7.1 Departures from the sketch
+
+- **`KernelRuntimeHarness::fragment` takes bounds.** The suite has to submit the
+  same described fragment under different declared bounds — a flood under a
+  small capture bound, a sleep under a short deadline — so the bounds are a
+  parameter rather than a property of the script.
+- **The harness gained `sink` and `damage`.** Captured output goes to a
+  caller-supplied `ProgramOutputSink`, so the harness has to supply one.
+  `damage` stages the two controls that are unreachable through the contract by
+  design: a receipt edited out from under its own digest (N6) and a row the
+  backend cannot decode (N7).
+- **`MAX_KERNEL_RESTORABLE_FACTS` was added.** The sketch bounded only the
+  non-restorable list. Decoding a stored checkpoint has to be fail-closed
+  symmetrically, so both lists are bounded.
+- **N1's compile-fail case is a documented structural argument plus a runtime
+  assertion.** No `trybuild` case was added. The structural half — no credential
+  type in the module, no method taking a `CredentialResolver`, and no sibling of
+  `KernelSpec::environment` that takes a handle name — is checked by the
+  compiler on every build of this crate, and breaking it would require adding a
+  type rather than passing a bad value. The runtime half asserts that every
+  published reserved name, in either case, is refused.
+- **N10 lives beside the driver, not in the backend suite.** A stale
+  `ActivationFence` constrains the workflow driver; a `KernelRuntime` backend
+  has no fence to be stale. `WorkflowDriver::claim` is the only shape in this
+  SDK that mints a claim for a workflow step and it always attaches the fence,
+  which is what makes the reducer's existing stale-fence refusal reachable
+  rather than remembered. That is asserted in `src/workflow.rs`'s own tests; the
+  reducer's refusal itself is the reducer's tested invariant.
+- **`WorkflowDriver::admit` takes a `RunEnvelope`.** The sketch's §3.4 loop is
+  expressed as an admission decision plus a claim constructor rather than as one
+  driving function, because the surrounding calls — `claim_due`,
+  `BeginIteration`, `prepare_operation`, `acknowledge_effect`, `renew`,
+  `release` — are already public and already ordered by the reducer. Wrapping
+  them in a second loop would have added the one thing §3.1 refuses: another
+  place where a workflow's position is remembered.
+
+### 7.2 What proves it
+
+`run_kernel_runtime_conformance` implements the fifteen positive properties and
+nine of the ten negative controls, and `LocalKernelRuntime` is gated through it
+against a real long-lived child process. A backend that answers a lost session
+with a clean shutdown is proved to fail the suite in
+`a_backend_that_fabricates_a_clean_shutdown_fails_the_suite`.

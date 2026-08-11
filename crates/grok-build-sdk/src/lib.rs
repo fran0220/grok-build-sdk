@@ -11,6 +11,7 @@ mod autonomous;
 mod conversation;
 mod evidence;
 mod harness;
+mod kernel;
 mod prime;
 mod private;
 mod program;
@@ -61,6 +62,22 @@ pub use harness::{
     MAX_HARNESS_SNAPSHOT_BYTES, MAX_TURN_BINDING_RECORD_BYTES, MaterializedHarness, SdkProvenance,
     TURN_BINDING_RECORD_SCHEMA_VERSION, TurnBindingKey, TurnBindingReceipt, TurnBindingRecord,
     TurnBindingStatus, harness_put_reconciled, run_harness_store_conformance,
+};
+pub use kernel::{
+    CONFORMANCE_KERNEL_ERROR_CLASS, CONFORMANCE_KERNEL_FLOOD_BYTES, CONFORMANCE_KERNEL_SECRET,
+    CONFORMANCE_KERNEL_STATE_NAME, CONFORMANCE_KERNEL_STATE_VALUE, CONFORMANCE_KERNEL_STDERR_MARK,
+    CONFORMANCE_KERNEL_STDOUT_MARK, KERNEL_FRAME_MARK, KERNEL_RESERVED_ENVIRONMENT_NAMES,
+    KERNEL_RUNTIME_SCHEMA_MARKER, KERNEL_RUNTIME_SCHEMA_VERSION, KernelCheckpointRef, KernelDamage,
+    KernelDisposition, KernelError, KernelExecutionBounds, KernelExecutionDisposition,
+    KernelExecutionId, KernelExecutionKey, KernelExecutionReceipt, KernelExecutionStatus,
+    KernelGeneration, KernelLabel, KernelReconcileOutcome, KernelRestore, KernelRuntime,
+    KernelRuntimeHarness, KernelScript, KernelSessionBounds, KernelSessionId, KernelSessionReceipt,
+    KernelSessionStatus, KernelSpec, KernelSubmission, LOCAL_KERNEL_PROTOCOL, LocalKernelRuntime,
+    MAX_KERNEL_CAPTURE_BYTES, MAX_KERNEL_CHECKPOINT_BYTES, MAX_KERNEL_EXECUTION_DEADLINE_MS,
+    MAX_KERNEL_EXECUTION_ID_BYTES, MAX_KERNEL_IDLE_DEADLINE_MS, MAX_KERNEL_LABEL_BYTES,
+    MAX_KERNEL_NON_RESTORABLE_FACTS, MAX_KERNEL_RESTORABLE_FACTS, MAX_KERNEL_SESSION_EXECUTIONS,
+    MAX_KERNEL_SESSION_ID_BYTES, MAX_KERNEL_SOURCE_BYTES, NonRestorableFact, RestorableFact,
+    run_kernel_runtime_conformance,
 };
 pub use prime::*;
 pub use program::{
@@ -148,6 +165,7 @@ mod mcp;
 mod provenance;
 mod runtime;
 mod session;
+mod workflow;
 
 pub use capability::{
     AgentServiceContribution, CapabilityBinding, CapabilityError, CapabilityKind, CapabilityLayer,
@@ -160,6 +178,10 @@ pub use mcp::*;
 pub use provenance::*;
 pub use runtime::*;
 pub use session::*;
+pub use workflow::{
+    MAX_WORKFLOW_STEPS, MAX_WORKFLOW_WALL_MS, WorkflowAction, WorkflowAdmission, WorkflowCeilings,
+    WorkflowDisposition, WorkflowDriver, WorkflowStepIntent,
+};
 
 pub(crate) use capability::{ResolvedCapabilities, resolve_capabilities};
 pub(crate) use conversation::{

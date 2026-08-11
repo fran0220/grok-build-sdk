@@ -53,7 +53,8 @@ executable.
 | Program execution custody | `ProgramRuntime`, `LocalProgramRuntime`, `ExecutionId`, `ProgramLaunch`, `ProgramBounds`, `ExecutionReceipt`, `ExitDisposition`, `CaptureRecord`, `CredentialHandleName`, `CredentialResolver`, `ProgramOutputSink`, `LivenessProbe`, `ReconcileOutcome`, `run_program_runtime_conformance` | Complete. Every execution is named by its caller before it runs and receipted after it settles; the receipt names the program, the argument and environment digests, the working root, the attached credential handles, the exit disposition, the timing and the artifact handles of captured output, and is digest-verified on read. A cancel and an elapsed declared deadline settle as `Cancelled` and `TimedOut`, output past a declared capture bound is a recorded truncation with an honest produced-byte count, and an execution that was running at a crash is found alive, settled `Interrupted`, or left uncertain — never reported as success. Secrets are unrepresentable in durable state: a launch binds a handle name and the value exists only between the caller's resolver and the spawn. |
 | Per-Session capability layering | `CapabilityLayer`, `RuntimeBuilder::general_capabilities`, `create_session_with_capabilities`, `create_session_with_harness_and_capabilities`, `load_session_with_capabilities`, `resume_session_with_capabilities`, `set_session_capabilities`, `session_capabilities` | Complete for skills, MCP mounts and agent-service routes. One application-owned general layer is masked per Session by name and kind, so per-project activation and per-Session routing need neither a Runtime restart nor a second Runtime. |
 | Peer conversations | `InputSource`, `prompt_from`, `prompt_content_from`, `ConversationDelegate`, `RuntimeBuilder::conversation_delegate`, `conversation_tool_descriptors`, `ConversationCreate`, `ConversationRead`, `ConversationSend`, `ConversationAcceptance`, `ConversationDigest`, `create_conversation`, `read_conversation`, `send_to_conversation`, `invoke_conversation_tool` | Complete as a contract. A Turn's prompt states whether a person or another conversation produced it, and a peer source carries the originating conversation identity into the durable ledger; an absent source is the user and an unknown one fails the read. The three tools are declared, bounded and dispatched by the SDK and answered entirely by the Host: it owns conversation existence, the send queue and transcript distillation, and no raw transcript crosses the boundary. There is no parent/child coupling, no wait primitive and no mailbox reducer. |
-| Persistent kernel | `TerminalBackend`, background task handles, native terminal/PTY/process tools | M3 audit only, now narrower. `ProgramRuntime` supplies the durable identity, execution receipt, declared cancel/timeout bounds and restart reconciliation that this row previously listed as missing; what remains missing is the *persistent* half — a checkpointable kernel whose state survives between executions and can be restored into a new one. `PersistentKernelDriver` still describes that shape and no internal implementation is suitable to publish. Persistent shell state restores cwd/environment around newly spawned commands and is not a substitute. |
+| Persistent kernel custody | `KernelRuntime`, `LocalKernelRuntime`, `KernelSessionId`, `KernelGeneration`, `KernelExecutionKey`, `KernelSpec`, `KernelSessionBounds`, `KernelSubmission`, `KernelExecutionBounds`, `KernelExecutionDisposition`, `KernelDisposition`, `KernelCheckpointRef`, `RestorableFact`, `NonRestorableFact`, `KernelRestore`, `KernelReconcileOutcome`, `KernelRestoreReceipt`, `run_kernel_runtime_conformance` | Complete. The durable authority for a kernel whose state survives between executions: a session is named by its caller before it exists, one incarnation runs one fragment at a time so a receipt's sequence is also the order state was mutated in, and every execution settles into a digest-verified receipt that says `Completed`, `Raised`, `Cancelled`, `TimedOut`, `Interrupted` or `KernelDied` — never silence. A checkpoint is evidence, not authority: it addresses its own payload, enumerates what it carried as `RestorableFact`s and what it could not as `NonRestorableFact`s, and a restore hands that loss back with the new incarnation so no caller can receive a session without receiving what it lost. A checkpoint from a different image is a `SpecMismatch` rather than a silent reinterpretation, a declared session ceiling settles the session by the name of the ceiling that was reached, and a session that was live at a crash is found alive, settled `Interrupted` together with every execution in flight under it, or left uncertain. Credentials are structurally absent: no type here can carry one, no method takes a resolver, and `KERNEL_RESERVED_ENVIRONMENT_NAMES` is refused by `KernelSpec::validate`. |
+| Bounded workflow driver | `WorkflowCeilings`, `WorkflowStepIntent`, `WorkflowAction`, `WorkflowDisposition`, `WorkflowAdmission`, `WorkflowDriver` | Complete as a contract, and deliberately storeless. A workflow is a bounded sequence of steps executed entirely through Run intents, activation grants and artifact identities that already exist: the step index is the Run's own iteration count, exclusivity is the activation fence every claim carries, and the outcome of a step is an `EffectReceipt`. What this adds is the declared ceilings — steps, wall time, consecutive failures and a finite resource budget, all validated before the first step is prepared so a workflow that cannot terminate never starts — and a disposition that names the ceiling that stopped it rather than saying it ran out of something. |
 | Continuation / gates | Generation-bound `McpContinuation`; Run-scoped `GateRequest`, `GateEvaluation`, `GateProvider` | M3 audit only. MCP continuation is one non-serializable live MRTR retry and a gate evaluation is an immediate provider result. Neither supplies a durable Host aggregate with identity/revision, ownership transfer, replay cursor or content-bound receipt. |
 
 The dependency order is M1 baseline → immutable snapshot/refinement façade →
@@ -380,6 +381,76 @@ the contract; the suite fails any backend that fabricates success for an orphan,
 settles an uncertain probe, re-runs a replayed settle, loses output silently,
 persists a resolved secret, or lets one identity start two processes.
 
+## Persistent kernel custody
+
+`KernelRuntime` is the durable authority a Host asks *is this kernel still the
+one I opened*, *what did this fragment do to its state*, and *what did the
+kernel lose when it was restored*. It is not a second agent loop: it holds no
+model, no tools and no turn. It executes fragments a caller already decided to
+run.
+
+Three exclusions are load-bearing. A kernel session's in-memory state is
+**evidence, never authority** — nothing durable is ever concluded from it, and a
+Host that needs a fact reads it from the Run, the vault or the session store. A
+checkpoint is likewise evidence: it addresses its own payload by digest, is
+bound to the `spec_digest` of the image that produced it, and declares both what
+it carried and what it could not. And **loss is never silent**: a
+`NonRestorableFact` list travels with the restored session in
+`KernelRestore::Restored`, so there is no accessor anywhere that yields a live
+restored session without the loss beside it.
+
+One incarnation runs one fragment at a time. That is what makes a receipt's
+`sequence` mean the order state was mutated in; a Host that wants parallelism
+opens more sessions, which is a different session identity and therefore a
+different state. Cancellation is scoped to the fragment: a kernel that abandons
+its work cooperatively leaves the session live and settles `Cancelled`, and a
+kernel that will not is killed and settles `KernelDied`, because those are
+different facts.
+
+Credentials are absent structurally rather than by policy. There is no
+credential type in the module, no method takes a `CredentialResolver`, and
+`KernelSpec::environment` binds a literal `String` with no sibling that takes a
+handle — so a Host cannot attach a secret to a kernel because the shape to do
+it with does not exist. `KERNEL_RESERVED_ENVIRONMENT_NAMES` closes the
+remaining door, refusing the variable names a provider library would read, and
+`KernelSpec::reserving` lets a Host add its own. A kernel that needs a network
+capability gets it over MCP, from a process that already has a credential
+boundary.
+
+`LocalKernelRuntime` is the reference authority: a real persistent child process
+per incarnation speaking `LOCAL_KERNEL_PROTOCOL`, long-lived bounded capture
+readers that keep counting past the bound so truncation is honest, and a SQLite
+store whose every scalar is re-validated on read, so an undecodable row or a
+receipt that no longer addresses to its own digest fails the read rather than
+presenting an invented account. A Host backend proves the same semantics with
+`run_kernel_runtime_conformance`, which drives a `KernelRuntimeHarness` so the
+backend supplies its own kernel image and can crash or damage its own state
+under the contract; the suite fails any backend that fabricates a clean shutdown
+for an orphan, settles an uncertain probe, re-runs a replayed settle, restores a
+checkpoint that enumerated no losses, lets one execution identity run twice, or
+lets a durable secret survive.
+
+## Bounded workflow driver
+
+`WorkflowDriver` runs a bounded sequence of steps unattended and adds no state
+store, because every piece of a workflow's state already has exactly one owner:
+the activation coordinator owns which workflow is due and who may run it, the
+Run owns the step sequence, each step's declared intent, its exclusive right to
+execute and its outcome, the vault owns step inputs and outputs, and
+`KernelRuntime` owns kernel session state as evidence. The step index is the
+Run's own iteration count; the driver holds no counter.
+
+What it contributes is the two things that did not exist. `WorkflowCeilings`
+declares maximum steps, maximum wall time, maximum consecutive failures and a
+finite resource budget, all validated at construction, so a workflow that cannot
+terminate never starts. And `WorkflowDisposition` names each ceiling separately
+— `StepCeiling`, `WallCeiling`, `BudgetCeiling { dimension }`,
+`ConsecutiveFailureCeiling` — because a Host telling a person why an unattended
+sequence stopped cannot do it from a variant meaning *ran out of something*.
+Every claim is minted by `WorkflowDriver::claim`, which always attaches the
+activation fence, so a superseded driver's step is refused by the reducer before
+it can be acknowledged.
+
 `AutonomousTurnLoop` currently has enforceable exact upper bounds only for iteration count, agent calls, and concurrency. Until a model/runtime capability contract supplies enforceable per-Turn maxima, finite `tokens`, `cost_micros`, `active_ms`, `wall_ms`, or `artifact_bytes` budgets are rejected before an iteration or prompt is dispatched. Use `u64::MAX` to mark those dimensions explicitly unbounded. Actual typed usage is still settled and recorded; an overrun or unknown value against a finite reservation durably enters recovery rather than being treated as free work.
 
 | SDK owns | Embedding Host owns |
@@ -387,6 +458,7 @@ persists a resolved secret, or lets one identity start two processes.
 | Run reducer and lifecycle invariants, bounded loop, budgets, gates, verifier policy, intent/outbox, command de-duplication, epoch/token fencing, receipts, recovery decisions and attach contract | Worker/process placement, OS daemon/service residency, durable timer implementation and invoking bounded activations |
 | Activation coordination semantics: due ordering, claim exclusivity, monotonic fencing tokens, expiry-based recovery, idempotent settlement, bounds and fail-closed decoding | The timer that decides when to sweep, the supervisor loop and its renewal cadence, what a work item means, and the retention policy behind `purge_settled` |
 | Artifact custody semantics: derived identity, digest verification on read, immutable handles, provenance and observation vocabulary, declared size/media-type/retention hints, missing-versus-corrupt answers, explicit identity-preserving recovery, usage accounting and verified materialization | Physical artifact bytes and their placement, encryption, backup and replication; what an artifact means to a person; the retention policy that acts on the stored hints; which artifacts are shown, exported or garbage collected |
+| Persistent kernel semantics: session identity and incarnation minting, one-fragment-at-a-time ordering, declared session and execution bounds, honest dispositions including the difference between a cooperative cancel and a kernel that had to be killed, checkpoint declaration and spec-digest addressing, the restore answer that carries its own loss, and probe-driven reconciliation of a crash-time backlog | The kernel image and the dialect it speaks, what a fragment means, where a snapshot's bytes physically live, the working root and its contents, whether a lost fact is worth reconstructing and from what, and any network capability the kernel needs — which arrives over MCP, from a process that already has a credential boundary |
 | Program execution semantics: caller-supplied execution identity and one-process-per-identity claiming, receipt content and digest verification, honest exit dispositions, declared deadline and capture bounds, truncation accounting, credential handle vocabulary and spawn-time resolution, artifact binding of captured output, restart backlog and probe-driven reconciliation | Process placement and isolation, cgroups/job objects/containers, the authority that holds secrets behind a handle name, the liveness evidence a `LivenessProbe` answers from, where captured artifacts physically live, retention of settled executions, and what an execution means to a person |
 | Peer conversation semantics: the input-source vocabulary and its fail-closed decoding, validated conversation/project/label/delivery-key shapes, the declared tool names, schemas and argument bounds, the digest ceiling and truncation vocabulary, and the checks that an answer is about the conversation, project and delivery key that were asked about | Which conversations exist and what a project is, the one send queue and whether a delivery starts a Turn or waits for settlement, delivery-key retention, how a transcript is distilled and what belongs in a digest, and every reply or completion notice — which are ordinary reverse sends, not mechanism |
 | SessionLedger/rewind/binding schemas; native Session object/chunk schemas, validation, replay and publication semantics; CAS transition intent and fail-closed reconciliation; artifact identity/integrity and provider contracts | Physical Run, session-evidence, and native Session-state persistence; transactions/migrations/encryption/backup/lifecycle; uncovered shell-sidecar placement; credentials, providers, workspace, queues, policy and UI |

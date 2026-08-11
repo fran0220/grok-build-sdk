@@ -300,11 +300,49 @@ pub trait ProgramDriver: Send + Sync + 'static {
     async fn cancel(&self, handle: &ProgramHandle) -> Result<(), RunError>;
 }
 
+/// What a restore hands back.
+///
+/// The handle and the loss travel together because there is no honest way to
+/// hand back one without the other: a caller that receives a live kernel
+/// without receiving what the kernel could not carry will describe a session as
+/// whole when it is not. This is the same reason
+/// [`crate::KernelRestore::Restored`] carries its `lost` list rather than
+/// exposing an accessor that yields a session on its own.
+#[non_exhaustive]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KernelRestoreReceipt {
+    pub handle: ProgramHandle,
+    /// What the checkpoint declared it could not capture, in the order the
+    /// kernel declared it.
+    pub lost: Vec<crate::NonRestorableFact>,
+}
+
+impl KernelRestoreReceipt {
+    pub fn new(handle: ProgramHandle, lost: Vec<crate::NonRestorableFact>) -> Self {
+        Self { handle, lost }
+    }
+
+    /// Whether the restored session is missing anything the previous
+    /// incarnation held.
+    pub fn is_complete(&self) -> bool {
+        self.lost.is_empty()
+    }
+}
+
 /// Optional persistent-kernel specialization. A checkpoint is evidence, not
 /// authority: recovery must still reconcile the durable operation identity.
+///
+/// It is deliberately silent about *how* a kernel session is owned, exactly as
+/// [`ProgramDriver`] is. Session identity and incarnation, declared bounds,
+/// honest dispositions, checkpoint declarations and crash-time reconciliation
+/// belong to [`crate::KernelRuntime`], which a Host implements once and can
+/// then drive this seam from: [`crate::KernelCheckpointRef::as_artifact_ref`]
+/// makes the [`ArtifactRef`] this seam wants, and a
+/// [`crate::KernelSessionId`] plus a [`crate::KernelGeneration`] are what
+/// [`ProgramHandle`]'s `id` and `generation` were shaped for.
 #[async_trait::async_trait]
 pub trait PersistentKernelDriver: ProgramDriver {
-    async fn restore(&self, checkpoint: &ArtifactRef) -> Result<ProgramHandle, RunError>;
+    async fn restore(&self, checkpoint: &ArtifactRef) -> Result<KernelRestoreReceipt, RunError>;
     async fn checkpoint(&self, handle: &ProgramHandle) -> Result<ArtifactRef, RunError>;
 }
 
