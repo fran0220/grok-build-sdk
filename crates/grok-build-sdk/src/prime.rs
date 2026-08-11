@@ -279,8 +279,18 @@ pub enum ProgramRecovery {
     Uncertain,
 }
 
+/// The Run reducer's dispatch seam: it hands a durably claimed
+/// [`ProgramIntent`] to whatever executes it and takes a [`ProgramReceipt`]
+/// back, so the Run's operation state and the external effect settle together.
+///
+/// It is deliberately silent about *how* an execution is owned. Process
+/// identity, declared cancellation and capture bounds, honest exit
+/// dispositions, credential resolution at spawn time, and crash-time
+/// reconciliation against a liveness probe belong to
+/// [`crate::ProgramRuntime`], which a Host implements once and can then drive
+/// this seam from.
 #[async_trait::async_trait]
-pub trait ProgramRuntime: Send + Sync + 'static {
+pub trait ProgramDriver: Send + Sync + 'static {
     async fn execute(
         &self,
         intent: ProgramIntent,
@@ -293,7 +303,7 @@ pub trait ProgramRuntime: Send + Sync + 'static {
 /// Optional persistent-kernel specialization. A checkpoint is evidence, not
 /// authority: recovery must still reconcile the durable operation identity.
 #[async_trait::async_trait]
-pub trait PersistentKernelDriver: ProgramRuntime {
+pub trait PersistentKernelDriver: ProgramDriver {
     async fn restore(&self, checkpoint: &ArtifactRef) -> Result<ProgramHandle, RunError>;
     async fn checkpoint(&self, handle: &ProgramHandle) -> Result<ArtifactRef, RunError>;
 }
@@ -337,7 +347,7 @@ impl crate::Runtime {
     pub async fn execute_program(
         &self,
         request: ProgramExecutionRequest,
-        runtime: &dyn ProgramRuntime,
+        runtime: &dyn ProgramDriver,
         artifacts: &dyn crate::run::ArtifactStore,
     ) -> Result<ProgramReceipt, crate::Error> {
         request.intent.validate()?;
@@ -463,7 +473,7 @@ impl crate::Runtime {
     pub async fn reconcile_program(
         &self,
         request: ProgramReconcileRequest,
-        runtime: &dyn ProgramRuntime,
+        runtime: &dyn ProgramDriver,
         artifacts: &dyn crate::run::ArtifactStore,
     ) -> Result<crate::run::RunCommandResult, crate::Error> {
         let decision = match runtime.reconcile(&request.operation_id).await? {

@@ -4808,6 +4808,7 @@ dependencies = [
  "base64 0.22.1",
  "fs2",
  "indexmap",
+ "libc",
  "rusqlite",
  "rustls",
  "serde",

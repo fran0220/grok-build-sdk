@@ -50,8 +50,9 @@ executable.
 | Child Run / A2A | `admit_run_child`, `settle_run_child`, `accept_run_message`, `transition_run_message` | Durable admission, reservations, fenced settlement, de-duplication, and ordered mailbox state use the existing Run reducer. The shell subagent coordinator remains a UI/transport adapter and is not silently treated as Run authority. Hosts execute child placement and feed its typed settlement callback. |
 | Durable activation coordination | `ActivationCoordinator`, `LocalActivationCoordinator`, `ActivationWake`, `ActivationClaimRequest`, `ActivationGrant`, `ActivationHandle`, `ActivationDisposition`, `run_activation_coordinator_conformance` | Complete. The durable queue in front of Run activation: identity-keyed work items with a due time, claims fenced by a strictly monotonic per-item token, renewal, completion or yield, and expiry-based recovery. Two supervisors on one authority grant a due item exactly once, a superseded worker is refused rather than tolerated, and a retried completion is an answer rather than a second execution. |
 | Artifact custody | `ArtifactVault`, `LocalArtifactVault`, `ArtifactId`, `ArtifactHandle`, `ArtifactWrite`, `ArtifactProvenance`, `ArtifactObservation`, `ArtifactRecord`, `ArtifactIntegrity`, `ArtifactRecovery`, `ArtifactUsage`, `run_artifact_vault_conformance` | Complete. Identity is the SHA-256 of the content, so a handle names one byte sequence forever; provenance names the producing Run, iteration and operation, and an instrument observation additionally names the program execution, its inputs and the revision under observation. Damage is reported rather than served and is repaired only by an explicit recovery that cannot change what an identity means. Reads and materializations are durably counted, and two workers on one authority observe each other and converge on one artifact. |
+| Program execution custody | `ProgramRuntime`, `LocalProgramRuntime`, `ExecutionId`, `ProgramLaunch`, `ProgramBounds`, `ExecutionReceipt`, `ExitDisposition`, `CaptureRecord`, `CredentialHandleName`, `CredentialResolver`, `ProgramOutputSink`, `LivenessProbe`, `ReconcileOutcome`, `run_program_runtime_conformance` | Complete. Every execution is named by its caller before it runs and receipted after it settles; the receipt names the program, the argument and environment digests, the working root, the attached credential handles, the exit disposition, the timing and the artifact handles of captured output, and is digest-verified on read. A cancel and an elapsed declared deadline settle as `Cancelled` and `TimedOut`, output past a declared capture bound is a recorded truncation with an honest produced-byte count, and an execution that was running at a crash is found alive, settled `Interrupted`, or left uncertain — never reported as success. Secrets are unrepresentable in durable state: a launch binds a handle name and the value exists only between the caller's resolver and the spawn. |
 | Per-Session capability layering | `CapabilityLayer`, `RuntimeBuilder::general_capabilities`, `create_session_with_capabilities`, `create_session_with_harness_and_capabilities`, `load_session_with_capabilities`, `resume_session_with_capabilities`, `set_session_capabilities`, `session_capabilities` | Complete for skills, MCP mounts and agent-service routes. One application-owned general layer is masked per Session by name and kind, so per-project activation and per-Session routing need neither a Runtime restart nor a second Runtime. |
-| Persistent kernel | `TerminalBackend`, background task handles, native terminal/PTY/process tools | M3 audit only. Persistent shell state restores cwd/environment around newly spawned commands; it is not a checkpointable programmatic kernel with durable identity, execution receipt, cancel/restart and state-restore semantics. No internal kernel implementation is suitable to publish. |
+| Persistent kernel | `TerminalBackend`, background task handles, native terminal/PTY/process tools | M3 audit only, now narrower. `ProgramRuntime` supplies the durable identity, execution receipt, declared cancel/timeout bounds and restart reconciliation that this row previously listed as missing; what remains missing is the *persistent* half — a checkpointable kernel whose state survives between executions and can be restored into a new one. `PersistentKernelDriver` still describes that shape and no internal implementation is suitable to publish. Persistent shell state restores cwd/environment around newly spawned commands and is not a substitute. |
 | Continuation / gates | Generation-bound `McpContinuation`; Run-scoped `GateRequest`, `GateEvaluation`, `GateProvider` | M3 audit only. MCP continuation is one non-serializable live MRTR retry and a gate evaluation is an immediate provider result. Neither supplies a durable Host aggregate with identity/revision, ownership transfer, replay cursor or content-bound receipt. |
 
 The dependency order is M1 baseline → immutable snapshot/refinement façade →
@@ -292,6 +293,92 @@ backend can damage its own storage under the contract; the suite fails any
 backend that hides damage, serves a corrupt copy, re-labels content on a
 repeated write, or forgets usage across a restart.
 
+## Program execution custody
+
+`ProgramRuntime` is the durable authority a Host asks *what did this execution
+run*, *how did it end*, *where did its output go*, and *what happened to the
+things that were running when I died*. It sits beside `ProgramDriver`, which is
+the Run reducer's dispatch seam and answers none of those. The runtime's marker
+and version are `grok-build-sdk.program-runtime`/1.
+
+An execution is named by its caller before it exists. `ExecutionId` is supplied
+rather than generated because a Host that crashes between deciding to run
+something and hearing that it ran can only ask *did execution X happen* if it
+named X first; a second `launch` under a known identity — running or settled —
+is `ProgramError::Conflict` rather than a second process. A settled execution
+yields an `ExecutionReceipt` naming the program path, the argument and
+environment digests, the working root, the credential handles that were
+attached, the `ExitDisposition`, the declared `ProgramBounds`, the start and
+settle instants, and a `CaptureRecord` per stream. Receipts are append-only and
+digest-verified: a store keeps `ExecutionReceipt::digest` alongside the receipt
+and recomputes it on read, so a row edited underneath the contract fails the
+read instead of presenting an altered account. Waiting on a settled execution
+replays its receipt; nothing runs twice.
+
+Settlement is never fabricated. `ExitDisposition::Exited { code: 0 }` is the
+only success, and every other way an execution can stop has its own name:
+`Cancelled` for a caller that changed its mind, `TimedOut` for a declared
+deadline that elapsed, `Signalled` for a death the program did not ask for, and
+`Interrupted` for a process that was running when its owner died and is gone
+when the owner returns. A late `cancel` never rewrites a settlement that
+already happened.
+
+Bounds are declared at launch, not chosen by a backend, so that a receipt can
+report the limit that produced its outcome. `ProgramBounds` carries a non-zero
+deadline and a per-stream capture bound, all validated before a process exists.
+A program that outruns its capture bound keeps producing output — a backend
+that stopped reading would turn a truncation into a hang — and its
+`CaptureRecord` reports `captured_bytes`, `produced_bytes` and `truncated`, so
+the loss is a fact a Host can show rather than a gap it has to infer.
+
+Captured output binds to `ArtifactHandle`, and storage is the one-method
+`ProgramOutputSink` seam. That is deliberate: the handle is a derived-identity
+value type with no storage behaviour, so sharing it makes an execution's output
+resolvable by whatever custody a Host runs, while the sink keeps a Host that
+runs programs from being forced to adopt an `ArtifactVault`. A Host that has
+one gets the binding for free through `ArtifactVaultOutputSink`. A backend
+verifies a returned handle against the bytes it supplied, so a sink cannot bind
+an execution's output to content that is not that output.
+
+Secrets are unrepresentable in durable state. A launch binds a variable to a
+`CredentialHandleName` — a name a keychain or relay knows a secret by — and
+there is no constructor, accessor or conversion that turns one into secret
+material. The value is produced at spawn time by the caller's
+`CredentialResolver`, exists only as a `ResolvedCredential` (no `Serialize`, no
+revealing `Debug`, zeroed in place on drop), and reaches nothing but the child's
+environment. The environment digest covers the variable name and the handle
+name, so it is stable across credential rotation: rotating a secret does not
+change what was run. A resolver that refuses stops the launch before a process
+exists and leaves no durable state behind.
+
+Restart is reconciliation, not inference. `requiring_reconciliation` answers
+exactly the executions this authority durably believes are running but this
+handle does not own — after a restart, the crash-time backlog — and they
+`inspect` as `ExecutionStatus::Uncertain` until something resolves them.
+`reconcile` takes a caller-supplied `LivenessProbe` because the trustworthy
+answer is deployment-specific: `Liveness::Live` answers `StillRunning` and
+settles nothing, `Gone` settles `Interrupted` with no captured output (nobody
+read those pipes, and claiming an empty stdout would be as much of a
+fabrication as claiming success), and `Unknown` answers
+`ReconcileOutcome::Uncertain` and leaves the execution exactly as uncertain as
+it was. `OsLivenessProbe` is the reference pid probe and documents that it
+cannot see through pid reuse across a reboot.
+
+Wall time belongs to the caller. A backend owns a monotonic duration source so
+it can enforce a deadline and nothing else; every instant in a receipt is the
+`now_ms` declared at launch plus measured elapsed time.
+
+`LocalProgramRuntime` is the reference authority: real `std::process` spawning
+with a cleared environment, bounded draining capture threads, and a SQLite
+store in which every stored scalar is re-validated on read, so a foreign schema
+marker or an undecodable launch record fails the read rather than presenting an
+invented account of what ran. A Host backend proves the same semantics with
+`run_program_runtime_conformance`, which drives a `ProgramRuntimeHarness` so the
+backend supplies its own programs and can crash one of its own executions under
+the contract; the suite fails any backend that fabricates success for an orphan,
+settles an uncertain probe, re-runs a replayed settle, loses output silently,
+persists a resolved secret, or lets one identity start two processes.
+
 `AutonomousTurnLoop` currently has enforceable exact upper bounds only for iteration count, agent calls, and concurrency. Until a model/runtime capability contract supplies enforceable per-Turn maxima, finite `tokens`, `cost_micros`, `active_ms`, `wall_ms`, or `artifact_bytes` budgets are rejected before an iteration or prompt is dispatched. Use `u64::MAX` to mark those dimensions explicitly unbounded. Actual typed usage is still settled and recorded; an overrun or unknown value against a finite reservation durably enters recovery rather than being treated as free work.
 
 | SDK owns | Embedding Host owns |
@@ -299,6 +386,7 @@ repeated write, or forgets usage across a restart.
 | Run reducer and lifecycle invariants, bounded loop, budgets, gates, verifier policy, intent/outbox, command de-duplication, epoch/token fencing, receipts, recovery decisions and attach contract | Worker/process placement, OS daemon/service residency, durable timer implementation and invoking bounded activations |
 | Activation coordination semantics: due ordering, claim exclusivity, monotonic fencing tokens, expiry-based recovery, idempotent settlement, bounds and fail-closed decoding | The timer that decides when to sweep, the supervisor loop and its renewal cadence, what a work item means, and the retention policy behind `purge_settled` |
 | Artifact custody semantics: derived identity, digest verification on read, immutable handles, provenance and observation vocabulary, declared size/media-type/retention hints, missing-versus-corrupt answers, explicit identity-preserving recovery, usage accounting and verified materialization | Physical artifact bytes and their placement, encryption, backup and replication; what an artifact means to a person; the retention policy that acts on the stored hints; which artifacts are shown, exported or garbage collected |
+| Program execution semantics: caller-supplied execution identity and one-process-per-identity claiming, receipt content and digest verification, honest exit dispositions, declared deadline and capture bounds, truncation accounting, credential handle vocabulary and spawn-time resolution, artifact binding of captured output, restart backlog and probe-driven reconciliation | Process placement and isolation, cgroups/job objects/containers, the authority that holds secrets behind a handle name, the liveness evidence a `LivenessProbe` answers from, where captured artifacts physically live, retention of settled executions, and what an execution means to a person |
 | SessionLedger/rewind/binding schemas; native Session object/chunk schemas, validation, replay and publication semantics; CAS transition intent and fail-closed reconciliation; artifact identity/integrity and provider contracts | Physical Run, session-evidence, and native Session-state persistence; transactions/migrations/encryption/backup/lifecycle; uncovered shell-sidecar placement; credentials, providers, workspace, queues, policy and UI |
 
 `ProviderSet` supplies typed artifact, gate, verifier, approval, and telemetry contracts. Local defaults store content-addressed artifacts and fail gates, verification, and approval closed until the Host installs explicit providers.

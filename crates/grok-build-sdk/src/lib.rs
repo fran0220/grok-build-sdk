@@ -12,6 +12,7 @@ mod evidence;
 mod harness;
 mod prime;
 mod private;
+mod program;
 mod session_state;
 
 pub use activation::{
@@ -51,6 +52,21 @@ pub use harness::{
     TurnBindingStatus, harness_put_reconciled, run_harness_store_conformance,
 };
 pub use prime::*;
+pub use program::{
+    ArtifactVaultOutputSink, CONFORMANCE_CREDENTIAL_HANDLE, CONFORMANCE_CREDENTIAL_VARIABLE,
+    CONFORMANCE_EXIT_CODE, CONFORMANCE_FLOOD_BYTES, CONFORMANCE_SECRET, CONFORMANCE_STDERR_MARK,
+    CONFORMANCE_STDOUT_MARK, CaptureRecord, CredentialHandleName, CredentialResolver,
+    EnvironmentBinding, ExecutionId, ExecutionReceipt, ExecutionStatus, ExitDisposition, Liveness,
+    LivenessProbe, LocalProgramRuntime, MAX_PROGRAM_ARGUMENT_BYTES, MAX_PROGRAM_ARGUMENTS,
+    MAX_PROGRAM_CAPTURE_BYTES, MAX_PROGRAM_CREDENTIAL_BINDINGS, MAX_PROGRAM_DEADLINE_MS,
+    MAX_PROGRAM_ENVIRONMENT_ENTRIES, MAX_PROGRAM_ENVIRONMENT_NAME_BYTES,
+    MAX_PROGRAM_ENVIRONMENT_VALUE_BYTES, MAX_PROGRAM_EXECUTION_ID_BYTES, MAX_PROGRAM_LABEL_BYTES,
+    MAX_PROGRAM_PATH_BYTES, OsLivenessProbe, PROGRAM_RUNTIME_SCHEMA_MARKER,
+    PROGRAM_RUNTIME_SCHEMA_VERSION, ProcessIdentity, ProgramBounds, ProgramError, ProgramLabel,
+    ProgramLaunch, ProgramOutputSink, ProgramPath, ProgramRuntime, ProgramRuntimeHarness,
+    ProgramScript, ProgramStream, ReconcileOutcome, ResolvedCredential,
+    run_program_runtime_conformance,
+};
 pub use session_state::{
     ConformanceOpen, DeleteReceipt, LiveSessionDocument, LocalSessionStateStore,
     MAX_SESSION_GENERATION_BYTES, MAX_SESSION_IDENTITY_BYTES, MAX_SESSION_MANIFEST_BYTES,

@@ -32,6 +32,11 @@ xai-grok-mcp = { workspace = true }
 xai-grok-shell = { workspace = true }
 xai-grok-tools = { workspace = true }
 
+# Only used by `OsLivenessProbe`, which asks whether a recorded pid still names
+# a live process. There is no portable std equivalent.
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
 [dev-dependencies]
 axum = { workspace = true }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
