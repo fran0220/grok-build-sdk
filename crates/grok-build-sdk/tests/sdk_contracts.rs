@@ -12,8 +12,6 @@ mod harness_facade;
 mod harness_store;
 #[path = "host_backend_conformance.rs"]
 mod host_backend_conformance;
-#[path = "kernel_runtime.rs"]
-mod kernel_runtime;
 #[path = "mcp_facade.rs"]
 mod mcp_facade;
 #[path = "program_runtime.rs"]

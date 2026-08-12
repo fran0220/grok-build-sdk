@@ -751,8 +751,9 @@ Use the gates in increasing cost order:
 2. Run the Cargo-integrated version of the same policy with
    `cargo test -p grok-build-sdk --test sdk_contracts source_layout`. It remains
    part of the automatic Cargo test suite and is fast when the build cache is
-   warm. Ordinary integration contracts share this harness so Cargo links the
-   large upstream runtime closure once instead of once per source file.
+   warm. Most integration contracts share this harness so Cargo links the
+   large upstream runtime closure once instead of once per source file;
+   process-sensitive and live-provider suites retain separate process isolation.
 3. Check formatting and every SDK target:
    `cargo fmt --all -- --check`, then
    `cargo check -p grok-build-sdk --all-targets`.

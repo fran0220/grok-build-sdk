@@ -45,12 +45,16 @@ xai-grok-test-support = { workspace = true }
 xai-grok-sampler = { workspace = true }
 xai-grok-sampling-types = { path = "../codegen/xai-grok-sampling-types" }
 
-# Keep the ordinary contract suite in one binary. The SDK runtime has a large
-# upstream dependency closure, so one harness avoids linking that closure once
-# per source file. Live provider checks stay separate and opt-in.
+# Keep most ordinary contracts in one binary. The SDK runtime has a large
+# upstream dependency closure, so a shared harness avoids linking that closure
+# once per source file. Process-sensitive and live checks retain isolation.
 [[test]]
 name = "sdk_contracts"
 path = "tests/sdk_contracts.rs"
+
+[[test]]
+name = "kernel_runtime"
+path = "tests/kernel_runtime.rs"
 
 [[test]]
 name = "live_provider_protocols"
