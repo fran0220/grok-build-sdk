@@ -1442,6 +1442,7 @@ mod tests {
             aspect_ratio: None,
             resolution: DEFAULT_RESOLUTION,
             reference_images: Vec::new(),
+            reference_audios: Vec::new(),
             output: None,
         };
         let json = serde_json::to_value(&payload).unwrap();
@@ -1455,6 +1456,7 @@ mod tests {
             aspect_ratio: Some("16:9"),
             resolution: DEFAULT_RESOLUTION,
             reference_images: Vec::new(),
+            reference_audios: Vec::new(),
             output: None,
         };
         let json = serde_json::to_value(&payload).unwrap();
