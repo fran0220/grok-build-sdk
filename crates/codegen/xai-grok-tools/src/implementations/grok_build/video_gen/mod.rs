@@ -242,11 +242,11 @@ impl VideoGenClient {
             query_params: query_params.as_ref().clone(),
             image_to_video_model: resolve_video_model(
                 image_to_video_model.as_deref(),
-                XAI_VIDEO_QUALITY_MODEL,
+                XAI_VIDEO_MODEL,
             ),
             reference_to_video_model: resolve_video_model(
                 reference_to_video_model.as_deref(),
-                XAI_VIDEO_BASE_MODEL,
+                XAI_VIDEO_MODEL,
             ),
             writer: super::storage::SessionFileWriter::new(DEFAULT_VIDEO_DIR, "mp4"),
             zdr_video_output_s3: zdr_video_output_s3
@@ -742,10 +742,10 @@ pub enum VideoGenConfig {
         query_params: Box<indexmap::IndexMap<String, String>>,
         zdr_video_output_s3: Option<Box<ZdrVideoOutputS3Config>>,
         /// Optional model override used by the native `image_to_video` tool.
-        /// Missing or empty values preserve the current quality-model default.
+        /// Missing or empty values preserve the current upstream default.
         image_to_video_model: Option<String>,
         /// Optional model override used by the native `reference_to_video` tool.
-        /// Missing or empty values preserve the current base-model default.
+        /// Missing or empty values preserve the current upstream default.
         reference_to_video_model: Option<String>,
         /// Allow the session's rotating sampling credential to override the
         /// static key. Custom embedded media providers set this to false.
@@ -1415,12 +1415,12 @@ mod tests {
     #[test]
     fn client_resolves_video_model_defaults_and_empty_overrides() {
         let client = VideoGenClient::new(&video_gen_config(None, None), None).unwrap();
-        assert_eq!(client.image_to_video_model(), XAI_VIDEO_QUALITY_MODEL);
-        assert_eq!(client.reference_to_video_model(), XAI_VIDEO_BASE_MODEL);
+        assert_eq!(client.image_to_video_model(), XAI_VIDEO_MODEL);
+        assert_eq!(client.reference_to_video_model(), XAI_VIDEO_MODEL);
 
         let client = VideoGenClient::new(&video_gen_config(Some(""), Some("   ")), None).unwrap();
-        assert_eq!(client.image_to_video_model(), XAI_VIDEO_QUALITY_MODEL);
-        assert_eq!(client.reference_to_video_model(), XAI_VIDEO_BASE_MODEL);
+        assert_eq!(client.image_to_video_model(), XAI_VIDEO_MODEL);
+        assert_eq!(client.reference_to_video_model(), XAI_VIDEO_MODEL);
     }
 
     #[test]
