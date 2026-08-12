@@ -12,7 +12,7 @@ pub struct SourceProvenance {
 }
 pub fn source_provenance() -> SourceProvenance {
     SourceProvenance {
-        upstream_release: "1.0.0",
+        upstream_release: "1.0.1",
         fork_commit: env!("GROK_BUILD_SDK_COMMIT"),
         upstream_source_rev: include_str!("../../../SOURCE_REV").trim(),
         facade_version: env!("CARGO_PKG_VERSION"),
