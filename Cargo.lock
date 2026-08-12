@@ -4820,13 +4820,11 @@ dependencies = [
  "url",
  "uuid",
  "xai-agent-lifecycle",
- "xai-file-utils",
  "xai-grok-mcp",
  "xai-grok-sampler",
  "xai-grok-sampling-types",
  "xai-grok-shell",
  "xai-grok-test-support",
- "xai-grok-tools",
 ]
 
 [[package]]
