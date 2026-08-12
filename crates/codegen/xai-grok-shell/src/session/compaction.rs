@@ -2861,6 +2861,7 @@ mod inline_auto_compact_flow_tests {
                 temperature: None,
                 top_p: None,
                 api_backend: Default::default(),
+                auth_scheme: Default::default(),
                 extra_headers: Default::default(),
                 query_params: Default::default(),
                 env_http_headers: Default::default(),

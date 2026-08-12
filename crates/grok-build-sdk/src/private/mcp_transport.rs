@@ -139,7 +139,7 @@ impl Drop for ActiveMcpBindingGuard {
 }
 
 #[async_trait::async_trait]
-impl xai_grok_mcp::acp_transport::EmbeddedMcpInvoker for DirectMcpInvoker {
+impl xai_grok_mcp::embedded_transport::EmbeddedMcpInvoker for DirectMcpInvoker {
     fn host_services(&self) -> Option<xai_grok_mcp::servers::McpHostServices> {
         (!self.host_services.is_empty()).then(|| self.host_services.clone())
     }

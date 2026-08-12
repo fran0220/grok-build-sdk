@@ -2128,6 +2128,7 @@ fn test_sampling_config(model_slug: &str) -> xai_grok_sampling_types::SamplingCo
         temperature: None,
         top_p: None,
         api_backend: Default::default(),
+        auth_scheme: Default::default(),
         extra_headers: Default::default(),
         query_params: Default::default(),
         env_http_headers: Default::default(),

@@ -241,6 +241,7 @@ pub(crate) async fn create_test_actor_with_terminal(
             temperature: None,
             top_p: None,
             api_backend: Default::default(),
+            auth_scheme: Default::default(),
             extra_headers: Default::default(),
             query_params: Default::default(),
             env_http_headers: Default::default(),

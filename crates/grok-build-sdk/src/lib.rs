@@ -126,7 +126,7 @@ pub(crate) use std::{collections::BTreeMap, path::PathBuf, sync::Arc};
 pub(crate) use tokio::sync::mpsc;
 
 /// Typed MCP 2026 client-role services. SDK users implement these traits
-/// directly; no ACP service or raw shell protocol is exposed.
+/// directly; no transport service or raw shell protocol is exposed.
 pub use xai_grok_mcp::servers::{
     McpElicitationService, McpHostContext, McpHostServiceError, McpHostServices, McpRootsService,
     McpSamplingService,

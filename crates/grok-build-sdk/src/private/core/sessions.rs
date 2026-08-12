@@ -111,13 +111,7 @@ impl Core {
         .as_object()
         .cloned();
         self.agent
-            .set_session_model(
-                acp::SetSessionModelRequest::new(
-                    acp::SessionId::new(id.0.clone()),
-                    acp::ModelId::new(model.to_owned()),
-                )
-                .meta(meta),
-            )
+            .set_session_model(id.0.clone(), model.to_owned(), meta)
             .await
             .map(|_| ())
             .map_err(|error| protocol("session/set_model", error))
@@ -128,14 +122,14 @@ impl Core {
     pub(super) fn mcp_servers_for(
         &self,
         capabilities: &ResolvedCapabilities,
-    ) -> Vec<acp::McpServer> {
+    ) -> Vec<EmbeddedMcpServer> {
         if self.options.profile == crate::RuntimeProfile::Restricted {
             return Vec::new();
         }
         capabilities
             .mcp_services
             .iter()
-            .map(to_acp_mcp_server)
+            .map(to_embedded_mcp_server)
             .collect()
     }
     pub(super) fn emit(&self, id: &SessionId, u: EventUpdate, t: Option<String>) {
@@ -316,13 +310,13 @@ impl Core {
         let x = self
             .agent
             .new_session(
-                acp::NewSessionRequest::new(config.cwd.clone())
-                    .mcp_servers(self.mcp_servers_for(&capabilities))
-                    .meta(meta),
+                config.cwd.clone(),
+                self.mcp_servers_for(&capabilities),
+                meta,
             )
             .await
             .map_err(|error| protocol("session/new", error))?;
-        let id = SessionId(x.session_id.0.to_string());
+        let id = SessionId(x);
         // `session/new` selects the catalog model but historically does not
         // consume its reasoning override. Apply the same normalized route
         // before exposing the Session so native sampling and receipts agree.
@@ -463,18 +457,20 @@ impl Core {
         if resume {
             self.agent
                 .resume_session(
-                    acp::ResumeSessionRequest::new(acp::SessionId::new(id.0.clone()), config.cwd)
-                        .mcp_servers(self.mcp_servers_for(&capabilities))
-                        .meta(meta),
+                    id.0.clone(),
+                    config.cwd,
+                    self.mcp_servers_for(&capabilities),
+                    meta,
                 )
                 .await
                 .map_err(|error| protocol("session/resume", error))?;
         } else {
             self.agent
                 .load_session(
-                    acp::LoadSessionRequest::new(acp::SessionId::new(id.0.clone()), config.cwd)
-                        .mcp_servers(self.mcp_servers_for(&capabilities))
-                        .meta(meta),
+                    id.0.clone(),
+                    config.cwd,
+                    self.mcp_servers_for(&capabilities),
+                    meta,
                 )
                 .await
                 .map_err(|error| protocol("session/load", error))?;

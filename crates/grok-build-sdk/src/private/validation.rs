@@ -46,22 +46,8 @@ pub(super) fn validate(c: &RuntimeConfig, options: &RuntimeOptions) -> Result<()
             "model provider refers to an unknown catalog model".into(),
         ));
     }
-    if options.services.model_providers.values().any(|provider| {
-        provider.base_url.trim().is_empty()
-            || provider.api_key.trim().is_empty()
-            || provider
-                .model
-                .as_deref()
-                .is_some_and(|model| model.trim().is_empty())
-            || provider.headers.keys().any(|name| name.trim().is_empty())
-            || provider
-                .query_params
-                .keys()
-                .any(|name| name.trim().is_empty())
-    }) {
-        return Err(Error::InvalidConfig(
-            "model providers require a base URL, API key, non-empty optional model slug, and non-empty header/query names".into(),
-        ));
+    for provider in options.services.model_providers.values() {
+        provider.validate()?;
     }
     let legacy_provider_available = !c.endpoint.trim().is_empty() && !c.api_key.trim().is_empty();
     if !legacy_provider_available
@@ -200,12 +186,12 @@ pub(super) fn run_error(error: xai_agent_lifecycle::run::RunError) -> Error {
     Error::DurableRun(error)
 }
 
-pub(super) fn protocol(method: &str, error: acp::Error) -> Error {
+pub(super) fn protocol(method: &str, error: EmbeddedError) -> Error {
     Error::Protocol {
         method: method.into(),
-        code: i32::from(error.code),
+        code: error.code,
         message: error.message,
-        data: error.data.unwrap_or(serde_json::Value::Null),
+        data: error.data,
         retryable: false,
     }
 }
@@ -282,9 +268,9 @@ pub(super) fn prompt_block_wire(block: &PromptBlock) -> Result<serde_json::Value
     Ok(value)
 }
 
-pub(super) fn client_capability_meta(options: &RuntimeOptions) -> Result<acp::Meta, Error> {
+pub(super) fn client_capability_meta(options: &RuntimeOptions) -> Result<SessionMeta, Error> {
     let mut meta = match &options.host_capabilities.meta {
-        serde_json::Value::Null => acp::Meta::new(),
+        serde_json::Value::Null => SessionMeta::new(),
         serde_json::Value::Object(meta) => meta.clone(),
         _ => {
             return Err(Error::InvalidConfig(

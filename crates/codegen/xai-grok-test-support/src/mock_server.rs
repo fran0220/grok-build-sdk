@@ -835,88 +835,96 @@ impl MockInferenceServer {
             )
             .route(
                 "/v1/messages",
-                post(move |headers: HeaderMap, Json(body): Json<Value>| {
-                    let log = log_msg.clone();
-                    let mode = mode_msg.clone();
-                    let overrides = overrides_msg.clone();
-                    let agent_turns = agent_turns_msg.clone();
-                    let stop_reason = messages_stop_reason.clone();
-                    let delay = delay_msg.clone();
-                    async move {
-                        let auth = Self::extract_auth(&headers);
-                        log.record(
-                            "POST",
-                            "/v1/messages",
-                            Some(&body),
-                            auth.as_deref(),
-                            Self::headers_vec(&headers),
-                        );
+                post(
+                    move |OriginalUri(uri): OriginalUri,
+                          headers: HeaderMap,
+                          Json(body): Json<Value>| {
+                        let log = log_msg.clone();
+                        let mode = mode_msg.clone();
+                        let overrides = overrides_msg.clone();
+                        let agent_turns = agent_turns_msg.clone();
+                        let stop_reason = messages_stop_reason.clone();
+                        let delay = delay_msg.clone();
+                        async move {
+                            let auth = Self::extract_auth(&headers);
+                            let path = uri
+                                .path_and_query()
+                                .map_or(uri.path(), |value| value.as_str());
+                            log.record(
+                                "POST",
+                                path,
+                                Some(&body),
+                                auth.as_deref(),
+                                Self::headers_vec(&headers),
+                            );
 
-                        let request =
-                            overrides.classify(InferenceEndpoint::Messages, &headers, &body);
-                        let chunk_delay = *delay.read().unwrap();
-                        if let Some(response) = overrides
-                            .response_override(&request, &headers, chunk_delay)
-                            .await
-                        {
-                            return response;
-                        }
+                            let request =
+                                overrides.classify(InferenceEndpoint::Messages, &headers, &body);
+                            let chunk_delay = *delay.read().unwrap();
+                            if let Some(response) = overrides
+                                .response_override(&request, &headers, chunk_delay)
+                                .await
+                            {
+                                return response;
+                            }
 
-                        // Anthropic content is either a plain string or an
-                        // array of typed blocks; extract the last user text.
-                        let user_msg = body
-                            .get("messages")
-                            .and_then(|m| m.as_array())
-                            .and_then(|msgs| {
-                                msgs.iter()
-                                    .rev()
-                                    .find(|m| m.get("role").and_then(Value::as_str) == Some("user"))
-                            })
-                            .and_then(|m| m.get("content"))
-                            .and_then(|c| {
-                                c.as_str().map(String::from).or_else(|| {
-                                    c.as_array().and_then(|blocks| {
-                                        blocks.iter().find_map(|b| {
-                                            if b.get("type").and_then(Value::as_str) == Some("text")
-                                            {
-                                                b.get("text")
-                                                    .and_then(Value::as_str)
-                                                    .map(String::from)
-                                            } else {
-                                                None
-                                            }
+                            // Anthropic content is either a plain string or an
+                            // array of typed blocks; extract the last user text.
+                            let user_msg = body
+                                .get("messages")
+                                .and_then(|m| m.as_array())
+                                .and_then(|msgs| {
+                                    msgs.iter().rev().find(|m| {
+                                        m.get("role").and_then(Value::as_str) == Some("user")
+                                    })
+                                })
+                                .and_then(|m| m.get("content"))
+                                .and_then(|c| {
+                                    c.as_str().map(String::from).or_else(|| {
+                                        c.as_array().and_then(|blocks| {
+                                            blocks.iter().find_map(|b| {
+                                                if b.get("type").and_then(Value::as_str)
+                                                    == Some("text")
+                                                {
+                                                    b.get("text")
+                                                        .and_then(Value::as_str)
+                                                        .map(String::from)
+                                                } else {
+                                                    None
+                                                }
+                                            })
                                         })
                                     })
                                 })
-                            })
-                            .unwrap_or_else(|| "hello".to_string());
+                                .unwrap_or_else(|| "hello".to_string());
 
-                        let model = body
-                            .get("model")
-                            .and_then(Value::as_str)
-                            .unwrap_or("test-model");
+                            let model = body
+                                .get("model")
+                                .and_then(Value::as_str)
+                                .unwrap_or("test-model");
 
-                        let stop = stop_reason.read().unwrap().clone();
-                        let events = match Self::pop_agent_turn(&agent_turns, &request) {
-                            Some(text) => sse::messages_api_events(&text, model, &stop),
-                            None => match &*mode.read().unwrap() {
-                                ResponseMode::Echo => sse::messages_api_events(
-                                    &format!("Echo: {user_msg}"),
-                                    model,
-                                    &stop,
-                                ),
-                                ResponseMode::Fixed(text) => {
-                                    sse::messages_api_events(text, model, &stop)
-                                }
-                            },
-                        };
-                        let gate = overrides.fallback_terminal_wait(&request);
-                        let stream = paced_events(events, *delay.read().unwrap(), gate);
-                        Sse::new(stream)
-                            .keep_alive(KeepAlive::default())
-                            .into_response()
-                    }
-                }),
+                            let stop = stop_reason.read().unwrap().clone();
+                            let events = match Self::pop_agent_turn(&agent_turns, &request) {
+                                Some(text) => sse::messages_api_events(&text, model, &stop),
+                                None => match &*mode.read().unwrap() {
+                                    ResponseMode::Echo => sse::messages_api_events(
+                                        &format!("Echo: {user_msg}"),
+                                        model,
+                                        &stop,
+                                    ),
+                                    ResponseMode::Fixed(text) => {
+                                        sse::messages_api_events(text, model, &stop)
+                                    }
+                                },
+                            };
+                            let gate = overrides.fallback_terminal_wait(&request);
+                            let stream = paced_events(events, *delay.read().unwrap(), gate);
+                            Sse::new(stream)
+                                .keep_alive(KeepAlive::default())
+                                .into_response()
+                        }
+                    },
+                ),
             )
             .route(
                 "/v1/models",

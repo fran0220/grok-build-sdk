@@ -124,6 +124,16 @@ impl Core {
             let query_params = provider
                 .map(|provider| provider.query_params.clone())
                 .unwrap_or_default();
+            let api_backend = provider.map_or_else(
+                || match model.api_backend {
+                    crate::ApiBackend::ChatCompletions => "chat_completions",
+                    crate::ApiBackend::Responses => "responses",
+                },
+                |provider| provider.protocol.api_backend(),
+            );
+            let auth_scheme = provider
+                .map(|provider| provider.protocol.auth_scheme())
+                .unwrap_or("bearer");
             let entry: ModelEntryConfig = serde_json::from_value(serde_json::json!({
                 "id": model.id,
                 "model": provider_model,
@@ -132,10 +142,8 @@ impl Core {
                 "extra_headers": extra_headers,
                 "query_params": query_params,
                 "context_window": model.context_window,
-                "api_backend": match model.api_backend {
-                    crate::ApiBackend::ChatCompletions => "chat_completions",
-                    crate::ApiBackend::Responses => "responses",
-                },
+                "api_backend": api_backend,
+                "auth_scheme": auth_scheme,
                 "agent_type": "grok-build",
                 "reasoning_effort": model.default_reasoning,
                 "supports_reasoning_effort": model.supports_reasoning,
@@ -146,7 +154,6 @@ impl Core {
         }
         let models = ModelsManager::from_origin_fixed(fixed, auth.clone(), cfg.clone())
             .map_err(Error::Operation)?;
-        let (gw_tx, gw_rx) = mpsc::unbounded_channel();
         let profile = match options.profile {
             crate::RuntimeProfile::Restricted => {
                 xai_grok_shell::agent::config::OriginEmbeddedProfile::Restricted
@@ -165,52 +172,10 @@ impl Core {
                     correlations: compaction_correlations.clone(),
                 }) as Arc<ShellAuthority>
             });
-        let agent = Rc::new(
-            MvpAgent::with_origin_embedded_profile_models_and_session_state(
-                AcpAgentGatewaySender::new(gw_tx),
-                &cfg,
-                auth,
-                models,
-                input.session_storage.clone(),
-                profile,
-                session_state_authority.clone(),
-            ),
-        );
         static NEXT_RUNTIME_INSTANCE: std::sync::atomic::AtomicU64 =
             std::sync::atomic::AtomicU64::new(1);
         let runtime_instance_id = NEXT_RUNTIME_INSTANCE.fetch_add(1, Ordering::Relaxed);
         let mcp_bindings = Arc::new(McpBindingRegistry::default());
-        if options.profile == crate::RuntimeProfile::Desktop
-            && (!options.in_process_mcp_servers.is_empty() || !options.mcp_host_services.is_empty())
-        {
-            let servers = options
-                .in_process_mcp_servers
-                .iter()
-                .map(|server| xai_grok_mcp::servers::AcpServerEntry {
-                    name: server.name.clone(),
-                    server_id: server.server_id.clone(),
-                })
-                .collect();
-            let handlers = options
-                .in_process_mcp_servers
-                .iter()
-                .map(|server| {
-                    (
-                        server.server_id.clone(),
-                        (server.name.clone(), server.handler.clone()),
-                    )
-                })
-                .collect();
-            agent.set_embedded_mcp_servers(
-                servers,
-                Arc::new(DirectMcpInvoker {
-                    runtime_instance_id,
-                    handlers,
-                    bindings: mcp_bindings.clone(),
-                    host_services: options.mcp_host_services.clone(),
-                }),
-            );
-        }
         let sequences = Rc::new(RefCell::new(HashMap::new()));
         let retained = Rc::new(RefCell::new(HashMap::new()));
         let turns = Rc::new(RefCell::new(HashMap::new()));
@@ -246,28 +211,59 @@ impl Core {
             turn_usages: turn_usages.clone(),
             replay: replay.clone(),
         };
-        tokio::task::spawn_local(
-            AcpGatewayReceiver::new(gw_rx, client)
-                .with_on_meta(xai_file_utils::trace_context::span_from_meta_traceparent)
-                .run(),
-        );
-        // Advertising ACP I/O prevents the shell from falling back to direct
+        let agent = Rc::new(EmbeddedAgent::new(
+            &cfg,
+            auth,
+            models,
+            input.session_storage.clone(),
+            profile,
+            session_state_authority.clone(),
+            Rc::new(client),
+        ));
+        if options.profile == crate::RuntimeProfile::Desktop
+            && (!options.in_process_mcp_servers.is_empty() || !options.mcp_host_services.is_empty())
+        {
+            let servers = options
+                .in_process_mcp_servers
+                .iter()
+                .map(|server| EmbeddedMcpRegistration {
+                    name: server.name.clone(),
+                    server_id: server.server_id.clone(),
+                })
+                .collect();
+            let handlers = options
+                .in_process_mcp_servers
+                .iter()
+                .map(|server| {
+                    (
+                        server.server_id.clone(),
+                        (server.name.clone(), server.handler.clone()),
+                    )
+                })
+                .collect();
+            agent.set_embedded_mcp_servers(
+                servers,
+                Arc::new(DirectMcpInvoker {
+                    runtime_instance_id,
+                    handlers,
+                    bindings: mcp_bindings.clone(),
+                    host_services: options.mcp_host_services.clone(),
+                }),
+            );
+        }
+        // Advertising host I/O prevents the shell from falling back to direct
         // process-local filesystem and terminal implementations. Restricted
         // intentionally advertises those routes without a delegate so every
         // operation fails closed; Desktop either uses the host-advertised
         // routes or deliberately retains the native local implementations.
         let restricted_io = options.profile == crate::RuntimeProfile::Restricted;
-        let client_caps = acp::ClientCapabilities::new()
-            .fs(acp::FileSystemCapabilities::new()
-                .read_text_file(restricted_io || options.host_capabilities.fs_read)
-                .write_text_file(restricted_io || options.host_capabilities.fs_write))
-            .terminal(restricted_io || options.host_capabilities.terminal)
-            .meta(client_capability_meta(&options)?);
         agent
-            .initialize(
-                acp::InitializeRequest::new(acp::ProtocolVersion::V1)
-                    .client_capabilities(client_caps),
-            )
+            .initialize(xai_grok_shell::embedded::EmbeddedClientCapabilities {
+                fs_read: restricted_io || options.host_capabilities.fs_read,
+                fs_write: restricted_io || options.host_capabilities.fs_write,
+                terminal: restricted_io || options.host_capabilities.terminal,
+                meta: client_capability_meta(&options)?,
+            })
             .await
             .map_err(|error| protocol("initialize", error))?;
         let capabilities = capabilities_for(&options);

@@ -1,4 +1,7 @@
+//! Embedded client callback tests.
+
 use super::super::*;
+use xai_grok_shell::embedded::EmbeddedClient as _;
 
 struct PermissionPolicy {
     decision: Result<crate::ToolPermissionDecision, crate::ToolPermissionError>,
@@ -203,44 +206,38 @@ fn dropping_turn_reservation_clears_active_identity_and_usage() {
     );
 }
 
-fn permission_request() -> acp::RequestPermissionRequest {
-    acp::RequestPermissionRequest::new(
-        "session-typed",
-        acp::ToolCallUpdate::new(
-            "call-1",
-            acp::ToolCallUpdateFields::new()
-                .title("Run tests")
-                .kind(acp::ToolKind::Execute)
-                .status(acp::ToolCallStatus::Pending)
-                .raw_input(serde_json::json!({"command":"cargo test"}))
-                .raw_output(serde_json::json!({"preview":true})),
-        ),
-        [
-            ("once", "Once", acp::PermissionOptionKind::AllowOnce),
-            ("always", "Always", acp::PermissionOptionKind::AllowAlways),
-            ("reject", "Reject", acp::PermissionOptionKind::RejectOnce),
-            ("never", "Never", acp::PermissionOptionKind::RejectAlways),
+fn permission_request() -> serde_json::Value {
+    serde_json::json!({
+        "sessionId": "session-typed",
+        "toolCall": {
+            "toolCallId": "call-1",
+            "title": "Run tests",
+            "kind": "execute",
+            "status": "pending",
+            "rawInput": {"command":"cargo test"},
+            "rawOutput": {"preview":true}
+        },
+        "options": [
+            {"optionId":"once", "name":"Once", "kind":"allow_once"},
+            {"optionId":"always", "name":"Always", "kind":"allow_always"},
+            {"optionId":"reject", "name":"Reject", "kind":"reject_once"},
+            {"optionId":"never", "name":"Never", "kind":"reject_always"}
         ]
-        .into_iter()
-        .map(|(id, name, kind)| acp::PermissionOption::new(id, name, kind))
-        .collect(),
-    )
+    })
 }
 
 #[tokio::test]
 async fn typed_permission_policy_parses_routes_and_fails_closed() {
-    use agent_client_protocol::Client as _;
     let policy = Arc::new(PermissionPolicy {
         decision: Ok(crate::ToolPermissionDecision::Selected("always".into())),
         requests: Default::default(),
     });
     let response = permission_client(Some(policy.clone()))
-        .request_permission(permission_request())
+        .request("session/request_permission", permission_request())
         .await
         .unwrap();
-    assert!(
-        matches!(response.outcome, acp::RequestPermissionOutcome::Selected(ref selected) if selected.option_id.0.as_ref() == "always")
-    );
+    assert_eq!(response["outcome"]["outcome"], "selected");
+    assert_eq!(response["outcome"]["optionId"], "always");
     let requests = policy.requests.lock().unwrap();
     let request = &requests[0];
     assert_eq!(request.session_id, "session-typed");
@@ -268,10 +265,10 @@ async fn typed_permission_policy_parses_routes_and_fails_closed() {
         requests: Default::default(),
     });
     let error = permission_client(Some(invalid))
-        .request_permission(permission_request())
+        .request("session/request_permission", permission_request())
         .await
         .unwrap_err();
-    assert_eq!(i32::from(error.code), -32602);
+    assert_eq!(error.code, -32602);
 
     let failing = Arc::new(PermissionPolicy {
         decision: Err(crate::ToolPermissionError {
@@ -281,19 +278,16 @@ async fn typed_permission_policy_parses_routes_and_fails_closed() {
         requests: Default::default(),
     });
     let error = permission_client(Some(failing))
-        .request_permission(permission_request())
+        .request("session/request_permission", permission_request())
         .await
         .unwrap_err();
-    assert_eq!(i32::from(error.code), -32603);
+    assert_eq!(error.code, -32603);
 
     let cancelled = permission_client(None)
-        .request_permission(permission_request())
+        .request("session/request_permission", permission_request())
         .await
         .unwrap();
-    assert!(matches!(
-        cancelled.outcome,
-        acp::RequestPermissionOutcome::Cancelled
-    ));
+    assert_eq!(cancelled["outcome"]["outcome"], "cancelled");
 }
 
 #[derive(Default)]
@@ -431,8 +425,6 @@ fn known_mcp_notifications_are_typed_and_unknown_methods_fail_closed() {
 
 #[tokio::test]
 async fn mcp_notifications_never_forward_raw_catalog_secrets_to_the_host() {
-    use agent_client_protocol::Client as _;
-
     let (events, mut event_rx) = mpsc::unbounded_channel();
     let host = Arc::new(EchoHost::default());
     let client = Client {
@@ -482,10 +474,7 @@ async fn mcp_notifications_never_forward_raw_catalog_secrets_to_the_host() {
         ]
     });
     client
-        .ext_notification(acp::ExtNotification::new(
-            "x.ai/mcp/servers_updated",
-            Arc::from(serde_json::value::to_raw_value(&payload).unwrap()),
-        ))
+        .notification("x.ai/mcp/servers_updated", payload)
         .await
         .expect("typed MCP catalog notification");
     let event = event_rx.recv().await.expect("redacted typed event");
@@ -545,10 +534,7 @@ async fn mcp_notifications_never_forward_raw_catalog_secrets_to_the_host() {
         ),
     ] {
         client
-            .ext_notification(acp::ExtNotification::new(
-                method,
-                Arc::from(serde_json::value::to_raw_value(&payload).unwrap()),
-            ))
+            .notification(method, payload)
             .await
             .expect("known MCP notification");
         let event = event_rx.recv().await.expect("typed MCP event");
@@ -560,16 +546,13 @@ async fn mcp_notifications_never_forward_raw_catalog_secrets_to_the_host() {
     assert!(host.notifications.lock().unwrap().is_empty());
 
     client
-        .ext_notification(acp::ExtNotification::new(
+        .notification(
             "x.ai/mcp/future_catalog",
-            Arc::from(
-                serde_json::value::to_raw_value(&serde_json::json!({
-                    "sessionId":"session-1",
-                    "futureSecret":"must-not-enter-an-untyped-fallback"
-                }))
-                .unwrap(),
-            ),
-        ))
+            serde_json::json!({
+                "sessionId":"session-1",
+                "futureSecret":"must-not-enter-an-untyped-fallback"
+            }),
+        )
         .await
         .expect("unknown MCP notifications are suppressed");
     assert!(matches!(
@@ -581,8 +564,6 @@ async fn mcp_notifications_never_forward_raw_catalog_secrets_to_the_host() {
 
 #[tokio::test]
 async fn reverse_extension_transport_preserves_json_and_journals_notifications() {
-    use agent_client_protocol::Client as _;
-
     let (events, mut event_rx) = mpsc::unbounded_channel();
     let host = Arc::new(EchoHost::default());
     let client = Client {
@@ -599,37 +580,23 @@ async fn reverse_extension_transport_preserves_json_and_journals_notifications()
         replay: Rc::new(RefCell::new(HashMap::new())),
     };
     let params = serde_json::json!({"nested":{"future":[1,true,null]}});
-    let raw = serde_json::value::to_raw_value(&params).expect("raw request");
     let response = client
-        .ext_method(acp::ExtRequest::new(
-            "host.desktop/screenshot",
-            Arc::from(raw),
-        ))
+        .request("host.desktop/screenshot", params.clone())
         .await
         .expect("reverse request");
-    let response: serde_json::Value =
-        serde_json::from_str(response.0.get()).expect("response json");
     assert_eq!(response["method"], "host.desktop/screenshot");
     assert_eq!(response["params"], params);
     assert_eq!(response["host"], true);
 
-    let raw = serde_json::value::to_raw_value(&serde_json::json!({})).expect("raw denied request");
     let denied = client
-        .ext_method(acp::ExtRequest::new(
-            "host.desktop/unadvertised",
-            Arc::from(raw),
-        ))
+        .request("host.desktop/unadvertised", serde_json::json!({}))
         .await
         .expect_err("unadvertised reverse methods fail closed");
-    assert_eq!(i32::from(denied.code), -32601);
+    assert_eq!(denied.code, -32601);
 
     let notification_params = serde_json::json!({"windowId":"w-1","dirty":true});
-    let raw = serde_json::value::to_raw_value(&notification_params).expect("raw notification");
     client
-        .ext_notification(acp::ExtNotification::new(
-            "host.desktop/window_changed",
-            Arc::from(raw),
-        ))
+        .notification("host.desktop/window_changed", notification_params.clone())
         .await
         .expect("reverse notification");
     let event = event_rx.recv().await.expect("journal event");
@@ -665,7 +632,6 @@ impl crate::AgentHookHandler for RecordingHook {
 
 #[tokio::test]
 async fn reverse_hook_transport_is_typed_and_fails_closed() {
-    use agent_client_protocol::Client as _;
     let (events, _) = mpsc::unbounded_channel();
     let hook = Arc::new(RecordingHook(std::sync::Mutex::new(Vec::new())));
     let client = Client {
@@ -686,14 +652,7 @@ async fn reverse_hook_transport_is_typed_and_fails_closed() {
         "sessionId":"s", "cwd":"/tmp", "toolName":"write_file",
         "toolUseId":"call", "toolInput":{"path":"a"}, "future":42
     });
-    let response = client
-        .ext_method(acp::ExtRequest::new(
-            "x.ai/hooks/run",
-            Arc::from(serde_json::value::to_raw_value(&payload).unwrap()),
-        ))
-        .await
-        .unwrap();
-    let response: serde_json::Value = serde_json::from_str(response.0.get()).unwrap();
+    let response = client.request("x.ai/hooks/run", payload).await.unwrap();
     assert_eq!(response["decision"], "deny");
     assert_eq!(response["systemMessage"], "policy denied");
     let calls = hook.0.lock().unwrap();
@@ -707,11 +666,8 @@ async fn reverse_hook_transport_is_typed_and_fails_closed() {
         "hookCallbackId":"missing", "hookEventName":"post_tool_use", "sessionId":"s"
     });
     let error = client
-        .ext_notification(acp::ExtNotification::new(
-            "x.ai/hooks/event",
-            Arc::from(serde_json::value::to_raw_value(&unknown).unwrap()),
-        ))
+        .notification("x.ai/hooks/event", unknown)
         .await
         .unwrap_err();
-    assert_eq!(i32::from(error.code), -32601);
+    assert_eq!(error.code, -32601);
 }

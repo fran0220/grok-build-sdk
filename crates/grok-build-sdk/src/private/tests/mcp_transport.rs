@@ -32,7 +32,7 @@ async fn direct_mcp_invoker_rejects_unregistered_stale_and_nonresident_bindings(
         host_services: Default::default(),
     };
 
-    let unregistered = xai_grok_mcp::acp_transport::EmbeddedMcpInvoker::invoke(
+    let unregistered = xai_grok_mcp::embedded_transport::EmbeddedMcpInvoker::invoke(
         &invoker,
         "unknown-session",
         u64::MAX,
@@ -46,7 +46,7 @@ async fn direct_mcp_invoker_rejects_unregistered_stale_and_nonresident_bindings(
 
     let old_binding = bindings.bind("closed-session");
     let new_binding = bindings.bind("closed-session");
-    let stale = xai_grok_mcp::acp_transport::EmbeddedMcpInvoker::invoke(
+    let stale = xai_grok_mcp::embedded_transport::EmbeddedMcpInvoker::invoke(
         &invoker,
         "closed-session",
         old_binding,
@@ -58,7 +58,7 @@ async fn direct_mcp_invoker_rejects_unregistered_stale_and_nonresident_bindings(
     .expect_err("replacement invalidates the old actor binding");
     assert!(stale.contains("stale or not resident"));
 
-    xai_grok_mcp::acp_transport::EmbeddedMcpInvoker::invoke(
+    xai_grok_mcp::embedded_transport::EmbeddedMcpInvoker::invoke(
         &invoker,
         "closed-session",
         new_binding,
@@ -70,7 +70,7 @@ async fn direct_mcp_invoker_rejects_unregistered_stale_and_nonresident_bindings(
     .expect("the replacement binding is active");
 
     bindings.revoke_session("closed-session");
-    let error = xai_grok_mcp::acp_transport::EmbeddedMcpInvoker::invoke(
+    let error = xai_grok_mcp::embedded_transport::EmbeddedMcpInvoker::invoke(
         &invoker,
         "closed-session",
         new_binding,
@@ -130,7 +130,7 @@ async fn in_process_outbound_peer_is_bounded_and_generation_bound() {
     };
     let first_binding = bindings.bind("session");
     let (first_tx, mut first_rx) = tokio::sync::mpsc::channel(1);
-    xai_grok_mcp::acp_transport::EmbeddedMcpInvoker::connect(
+    xai_grok_mcp::embedded_transport::EmbeddedMcpInvoker::connect(
         &invoker,
         "session",
         first_binding,
@@ -161,7 +161,7 @@ async fn in_process_outbound_peer_is_bounded_and_generation_bound() {
     assert!(first_rx.try_recv().is_err());
 
     let (second_tx, mut second_rx) = tokio::sync::mpsc::channel(1);
-    xai_grok_mcp::acp_transport::EmbeddedMcpInvoker::connect(
+    xai_grok_mcp::embedded_transport::EmbeddedMcpInvoker::connect(
         &invoker,
         "session",
         second_binding,
@@ -273,7 +273,7 @@ async fn direct_mcp_invoker_rejects_a_result_after_its_binding_is_revoked() {
     let invocation = {
         let invoker = invoker.clone();
         tokio::spawn(async move {
-            xai_grok_mcp::acp_transport::EmbeddedMcpInvoker::invoke(
+            xai_grok_mcp::embedded_transport::EmbeddedMcpInvoker::invoke(
                 invoker.as_ref(),
                 "session",
                 binding_id,

@@ -86,18 +86,17 @@ impl Core {
             id.as_str(),
             self.capability_meta(resolved).as_ref(),
         );
-        let mcp_servers: Vec<acp::McpServer> = resolved
+        let mcp_servers: Vec<EmbeddedMcpServer> = resolved
             .mcp_services
             .iter()
-            .map(to_acp_mcp_server)
+            .map(to_embedded_mcp_server)
             .collect();
         self.extension::<serde_json::Value>(
             "x.ai/session/update_mcp_servers",
             serde_json::json!({"sessionId": id.as_str(), "mcpServers": mcp_servers}),
         )
         .await?;
-        self.agent
-            .reload_skills_for_session(&acp::SessionId::new(id.0.clone()));
+        self.agent.reload_skills_for_session(&id.0);
         Ok(())
     }
 

@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use grok_build_sdk::{
-    AgentServiceConfig, ApiProviderConfig, HostDelegate, HostError, HostNotification, HostRequest,
-    McpServerConfig, MediaProviderConfig, MediaServiceConfig, Runtime, RuntimeConfig,
+    AgentServiceConfig, HostDelegate, HostError, HostNotification, HostRequest, McpServerConfig,
+    MediaProviderConfig, MediaServiceConfig, ProviderConfig, Runtime, RuntimeConfig,
     RuntimeProfile,
 };
 use serde_json::Value;
@@ -22,14 +22,8 @@ impl HostDelegate for DesktopHost {
     }
 }
 
-fn provider(base_url: &str, key: &str, wire_model: &str) -> ApiProviderConfig {
-    ApiProviderConfig {
-        base_url: base_url.into(),
-        api_key: key.into(),
-        model: Some(wire_model.into()),
-        headers: BTreeMap::new(),
-        query_params: BTreeMap::new(),
-    }
+fn provider(base_url: &str, key: &str, wire_model: &str) -> ProviderConfig {
+    ProviderConfig::openai_chat(base_url, key, wire_model)
 }
 
 // `config.models` is the fixed SDK catalog. `endpoint`/`api_key` may be empty

@@ -45,18 +45,49 @@ pub struct HostCapabilities {
     pub meta: serde_json::Value,
 }
 
-/// Explicit credentials and routing for an API-compatible model provider.
+/// Provider wire protocol. This is the single source of truth for both the
+/// endpoint shape and authentication scheme of an explicitly configured
+/// model.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderProtocol {
+    #[default]
+    OpenAiChatCompletions,
+    OpenAiResponses,
+    AnthropicMessages,
+}
+
+impl ProviderProtocol {
+    pub(crate) fn api_backend(self) -> &'static str {
+        match self {
+            Self::OpenAiChatCompletions => "chat_completions",
+            Self::OpenAiResponses => "responses",
+            Self::AnthropicMessages => "messages",
+        }
+    }
+
+    pub(crate) fn auth_scheme(self) -> &'static str {
+        match self {
+            Self::OpenAiChatCompletions | Self::OpenAiResponses => "bearer",
+            Self::AnthropicMessages => "x_api_key",
+        }
+    }
+}
+
+/// Explicit credentials and routing for one model provider.
 /// Values are never read from environment variables by the runtime. The
-/// configured secret is sent as an HTTP Bearer token, so a desktop host can
-/// point the base URL at its loopback relay and supply a relay-scoped bearer
-/// instead of giving the SDK a provider's raw credential. The SDK does not
+/// selected [`ProviderProtocol`] exclusively determines the request endpoint,
+/// wire format, and authentication header; [`ModelSpec::api_backend`] is used
+/// only by the legacy `RuntimeConfig` endpoint/key fallback. The SDK does not
 /// persist this configuration. Secrets are intentionally omitted from both
 /// `Debug` and `Serialize`; hosts may deserialize configuration but cannot
 /// accidentally export the secret bag.
 #[derive(Clone, Default, PartialEq, serde::Deserialize)]
-pub struct ApiProviderConfig {
+pub struct ProviderConfig {
     /// OpenAI-compatible API base URL, including any path prefix (usually
     /// `/v1`). Loopback HTTP endpoints are supported.
+    #[serde(default)]
+    pub protocol: ProviderProtocol,
     pub base_url: String,
     pub api_key: String,
     /// Optional model slug sent to this provider. Defaults to the catalog ID.
@@ -67,6 +98,115 @@ pub struct ApiProviderConfig {
     #[serde(default)]
     pub query_params: BTreeMap<String, String>,
 }
+
+impl ProviderConfig {
+    pub fn openai_chat(
+        base_url: impl Into<String>,
+        api_key: impl Into<String>,
+        model: impl Into<String>,
+    ) -> Self {
+        Self::new(
+            ProviderProtocol::OpenAiChatCompletions,
+            base_url,
+            api_key,
+            model,
+        )
+    }
+
+    pub fn openai_responses(
+        base_url: impl Into<String>,
+        api_key: impl Into<String>,
+        model: impl Into<String>,
+    ) -> Self {
+        Self::new(ProviderProtocol::OpenAiResponses, base_url, api_key, model)
+    }
+
+    pub fn anthropic(
+        base_url: impl Into<String>,
+        api_key: impl Into<String>,
+        model: impl Into<String>,
+    ) -> Self {
+        Self::new(
+            ProviderProtocol::AnthropicMessages,
+            base_url,
+            api_key,
+            model,
+        )
+    }
+
+    fn new(
+        protocol: ProviderProtocol,
+        base_url: impl Into<String>,
+        api_key: impl Into<String>,
+        model: impl Into<String>,
+    ) -> Self {
+        Self {
+            protocol,
+            base_url: base_url.into(),
+            api_key: api_key.into(),
+            model: Some(model.into()),
+            headers: BTreeMap::new(),
+            query_params: BTreeMap::new(),
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), Error> {
+        if self.api_key.trim().is_empty()
+            || self
+                .model
+                .as_deref()
+                .is_some_and(|model| model.trim().is_empty())
+        {
+            return Err(Error::InvalidConfig(
+                "model providers require an API key and non-empty optional model slug".into(),
+            ));
+        }
+        let parsed = url::Url::parse(&self.base_url).map_err(|_| {
+            Error::InvalidConfig("model provider base URL must be an absolute URL".into())
+        })?;
+        if !matches!(parsed.scheme(), "http" | "https")
+            || parsed.host_str().is_none()
+            || !parsed.username().is_empty()
+            || parsed.password().is_some()
+            || parsed.fragment().is_some()
+        {
+            return Err(Error::InvalidConfig(
+                "model provider base URL must be http(s) without userinfo or a fragment".into(),
+            ));
+        }
+        let mut normalized_headers = std::collections::HashSet::new();
+        for (name, value) in &self.headers {
+            let parsed_name = http::HeaderName::from_bytes(name.as_bytes()).map_err(|_| {
+                Error::InvalidConfig("model provider header name is invalid".into())
+            })?;
+            if parsed_name == http::header::AUTHORIZATION
+                || parsed_name == http::HeaderName::from_static("x-api-key")
+            {
+                return Err(Error::InvalidConfig(
+                    "model provider authentication headers are derived from protocol and api_key"
+                        .into(),
+                ));
+            }
+            value.parse::<http::HeaderValue>().map_err(|_| {
+                Error::InvalidConfig("model provider header value is invalid".into())
+            })?;
+            if !normalized_headers.insert(parsed_name) {
+                return Err(Error::InvalidConfig(
+                    "model provider header names must be unique ignoring case".into(),
+                ));
+            }
+        }
+        if self.query_params.keys().any(|name| name.trim().is_empty()) {
+            return Err(Error::InvalidConfig(
+                "model provider query parameter names must be non-empty".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Compatibility spelling retained for existing embedders.
+pub type ApiProviderConfig = ProviderConfig;
 
 /// Explicit credentials and routing for the Imagine-compatible media API.
 /// Model slugs are operation-specific fields on [`MediaServiceConfig`].
@@ -218,9 +358,9 @@ impl McpServerConfig {
         Ok(value)
     }
 
-    /// Validates the public transport contract before it reaches ACP or a
-    /// helper process. Unknown serde variants/fields are rejected by the type
-    /// itself; malformed URLs and header material fail here.
+    /// Validates the public transport contract before it reaches the embedded
+    /// runtime or a helper process. Unknown serde variants/fields are rejected
+    /// by the type itself; malformed URLs and header material fail here.
     pub fn validate(&self) -> Result<(), Error> {
         match self {
             Self::Stdio {
@@ -314,7 +454,7 @@ impl McpServerConfig {
 #[derive(Clone, Default, PartialEq, serde::Deserialize)]
 pub struct RuntimeServices {
     #[serde(default)]
-    pub model_providers: BTreeMap<String, ApiProviderConfig>,
+    pub model_providers: BTreeMap<String, ProviderConfig>,
     #[serde(default)]
     pub agents: AgentServiceConfig,
     pub media: Option<MediaServiceConfig>,
@@ -504,7 +644,7 @@ pub struct RuntimeCapabilities {
 pub struct ModelCatalog {
     pub current_model_id: String,
     pub available_models: Vec<AvailableModel>,
-    /// Forward-compatible catalog metadata from the ACP contract.
+    /// Forward-compatible catalog metadata from the native runtime contract.
     pub metadata: Option<serde_json::Map<String, serde_json::Value>>,
 }
 

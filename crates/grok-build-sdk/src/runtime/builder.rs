@@ -67,11 +67,7 @@ impl RuntimeBuilder {
     }
     /// Overrides one catalog model's provider. This is a convenience for
     /// hosts that do not need the rest of [`RuntimeServices`].
-    pub fn model_provider(
-        mut self,
-        model_id: impl Into<String>,
-        provider: ApiProviderConfig,
-    ) -> Self {
+    pub fn model_provider(mut self, model_id: impl Into<String>, provider: ProviderConfig) -> Self {
         self.options
             .services
             .model_providers

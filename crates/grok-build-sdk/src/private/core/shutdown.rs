@@ -6,13 +6,7 @@ impl Core {
         if self.turns.borrow().contains_key(&id.0) {
             self.cancel(id.clone()).await?;
         }
-        let response = match self
-            .agent
-            .close_session(acp::CloseSessionRequest::new(acp::SessionId::new(
-                id.0.clone(),
-            )))
-            .await
-        {
+        let response = match self.agent.close_session(id.0.clone()).await {
             Ok(response) => response,
             Err(error) => {
                 self.mark_close_uncertain(&id);

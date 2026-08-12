@@ -5,7 +5,7 @@ impl Core {
         let session_id = id.0.clone();
         let result = self
             .agent
-            .cancel(acp::CancelNotification::new(acp::SessionId::new(id.0)))
+            .cancel(id.0)
             .await
             .map_err(|error| protocol("session/cancel", error));
         if let Err(error) = result {
@@ -41,19 +41,35 @@ impl Core {
         method: &'static str,
         params: serde_json::Value,
     ) -> Result<T, Error> {
-        let raw = serde_json::value::to_raw_value(&params).map_err(op)?;
         let response = self
             .agent
-            .ext_method(acp::ExtRequest::new(method, Arc::from(raw)))
+            .extension(method, params)
             .await
             .map_err(|error| protocol(method, error))?;
-        serde_json::from_str(response.0.get()).map_err(op)
+        serde_json::from_value(response).map_err(op)
     }
     pub(super) async fn list_models(&self) -> Result<ModelCatalog, Error> {
         #[derive(serde::Deserialize)]
         struct ModelsListResult {
-            result: Option<acp::SessionModelState>,
+            result: Option<SessionModelState>,
             error: Option<serde_json::Value>,
+        }
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct SessionModelState {
+            current_model_id: String,
+            available_models: Vec<SessionModelInfo>,
+            #[serde(rename = "_meta")]
+            meta: Option<SessionMeta>,
+        }
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct SessionModelInfo {
+            model_id: String,
+            name: String,
+            description: Option<String>,
+            #[serde(rename = "_meta")]
+            meta: Option<SessionMeta>,
         }
 
         let response: ModelsListResult = self
@@ -66,12 +82,12 @@ impl Core {
             .result
             .ok_or_else(|| Error::Operation("models/list response missing result".into()))?;
         Ok(ModelCatalog {
-            current_model_id: state.current_model_id.0.to_string(),
+            current_model_id: state.current_model_id,
             available_models: state
                 .available_models
                 .into_iter()
                 .map(|model| AvailableModel {
-                    id: model.model_id.0.to_string(),
+                    id: model.model_id,
                     name: model.name,
                     description: model.description,
                     metadata: model.meta,
@@ -113,15 +129,12 @@ impl Core {
         &self,
         request: ExtensionRequest,
     ) -> Result<ExtensionResponse, Error> {
-        let raw = serde_json::value::to_raw_value(&request.params).map_err(op)?;
         let response = self
             .agent
-            .ext_method(acp::ExtRequest::new(request.method.clone(), Arc::from(raw)))
+            .extension(&request.method, request.params)
             .await
             .map_err(|e| protocol(&request.method, e))?;
-        Ok(ExtensionResponse {
-            result: serde_json::from_str(response.0.get()).map_err(op)?,
-        })
+        Ok(ExtensionResponse { result: response })
     }
     pub(super) async fn fork(
         &self,
@@ -181,32 +194,23 @@ impl Core {
                 "generic extension notifications require the Desktop profile".into(),
             ));
         }
-        let raw = serde_json::value::to_raw_value(&request.params).map_err(op)?;
         self.agent
-            .ext_notification(acp::ExtNotification::new(
-                request.method.clone(),
-                Arc::from(raw),
-            ))
+            .extension_notification(&request.method, request.params)
             .await
             .map_err(|error| protocol(&request.method, error))
     }
     pub(super) async fn set_mode(&self, id: SessionId, mode: String) -> Result<(), Error> {
         self.agent
-            .set_session_mode(acp::SetSessionModeRequest::new(
-                acp::SessionId::new(id.0),
-                acp::SessionModeId::new(mode),
-            ))
+            .set_session_mode(id.0, mode)
             .await
             .map(|_| ())
             .map_err(|e| protocol("session/set_mode", e))
     }
     pub(super) async fn list_sessions(&self) -> Result<serde_json::Value, Error> {
-        let response = self
-            .agent
-            .list_sessions(acp::ListSessionsRequest::new())
+        self.agent
+            .list_sessions()
             .await
-            .map_err(|e| protocol("session/list", e))?;
-        serde_json::to_value(response).map_err(op)
+            .map_err(|e| protocol("session/list", e))
     }
     pub(super) async fn set_route(
         &self,

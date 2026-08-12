@@ -8,8 +8,6 @@ use crate::{
     SessionId, SessionLedger, SessionLedgerEntry, SessionReplayProbe, TurnBindingKey,
     TurnBindingReceipt, TurnBindingRecord, TurnBindingStatus, TurnOutcome, resolve_capabilities,
 };
-use agent_client_protocol as acp;
-use agent_client_protocol::Agent as _;
 use indexmap::IndexMap;
 use std::{
     cell::RefCell,
@@ -22,49 +20,48 @@ use std::{
     },
 };
 use tokio::sync::{mpsc, oneshot, watch};
-use xai_acp_lib::{AcpAgentGatewaySender, AcpGatewayReceiver};
 use xai_grok_shell::{
     agent::{
         config::{Config, ModelEntry, ModelEntryConfig, OriginMediaConfig},
         models::ModelsManager,
-        mvp_agent::MvpAgent,
     },
     auth::AuthManager,
+    embedded::{
+        EmbeddedAgent, EmbeddedError, EmbeddedMcpRegistration, EmbeddedMcpServer,
+        EmbeddedStopReason,
+    },
 };
 
 const CANCEL_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
-fn to_acp_mcp_server(server: &crate::McpServerConfig) -> acp::McpServer {
+fn to_embedded_mcp_server(server: &crate::McpServerConfig) -> EmbeddedMcpServer {
     match server {
         crate::McpServerConfig::Stdio {
             name,
             command,
             args,
             env,
-        } => acp::McpServer::Stdio(
-            acp::McpServerStdio::new(name, command)
-                .args(args.clone())
-                .env(
-                    env.iter()
-                        .map(|(k, v)| acp::EnvVariable::new(k, v))
-                        .collect(),
-                ),
-        ),
-        crate::McpServerConfig::Http { name, url, headers } => acp::McpServer::Http(
-            acp::McpServerHttp::new(name, url).headers(
-                headers
-                    .iter()
-                    .map(|(k, v)| acp::HttpHeader::new(k, v))
-                    .collect(),
-            ),
-        ),
-        crate::McpServerConfig::Sse { name, url, headers } => acp::McpServer::Sse(
-            acp::McpServerSse::new(name, url).headers(
-                headers
-                    .iter()
-                    .map(|(k, v)| acp::HttpHeader::new(k, v))
-                    .collect(),
-            ),
-        ),
+        } => EmbeddedMcpServer::Stdio {
+            name: name.clone(),
+            command: command.clone(),
+            args: args.clone(),
+            env: env.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+        },
+        crate::McpServerConfig::Http { name, url, headers } => EmbeddedMcpServer::Http {
+            name: name.clone(),
+            url: url.clone(),
+            headers: headers
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
+        },
+        crate::McpServerConfig::Sse { name, url, headers } => EmbeddedMcpServer::Sse {
+            name: name.clone(),
+            url: url.clone(),
+            headers: headers
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
+        },
     }
 }
 type Reply<T> = oneshot::Sender<Result<T, Error>>;
@@ -175,8 +172,8 @@ enum Command {
     Shutdown(Reply<()>),
 }
 
-mod acp_client;
 mod core;
+mod embedded_client;
 mod evidence;
 mod mcp_transport;
 mod runtime;
@@ -184,8 +181,8 @@ mod session_authority;
 mod validation;
 mod worker;
 
-use acp_client::*;
 use core::*;
+use embedded_client::*;
 pub(crate) use evidence::ledger_settlement_id;
 use evidence::*;
 use mcp_transport::*;

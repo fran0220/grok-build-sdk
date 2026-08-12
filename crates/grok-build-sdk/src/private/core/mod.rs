@@ -199,7 +199,7 @@ struct PreparedHarnessTurn {
 }
 
 pub(super) struct Core {
-    agent: Rc<MvpAgent>,
+    agent: Rc<EmbeddedAgent>,
     session_state_authority: Option<Arc<ShellAuthority>>,
     session_state_store: Option<Arc<dyn crate::SessionStateStore>>,
     session_leases: RefCell<HashMap<String, Box<dyn crate::SessionStateLease>>>,

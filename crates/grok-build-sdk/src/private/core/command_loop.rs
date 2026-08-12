@@ -219,7 +219,7 @@ impl Core {
                         ))
                     } else {
                         self.agent
-                            .sdk_mcp_modern_operation(id.as_str(), server, operation)
+                            .mcp_operation(id.as_str(), server, operation)
                             .await
                             .map_err(Error::Operation)
                     };
@@ -232,7 +232,7 @@ impl Core {
                         ))
                     } else {
                         self.agent
-                            .sdk_mcp_modern_subscribe(id.as_str(), server, filter, capacity)
+                            .mcp_subscribe(id.as_str(), server, filter, capacity)
                             .await
                             .map_err(Error::Operation)
                     };
@@ -265,8 +265,8 @@ impl Core {
                                 ))
                             }
                             Ok(()) => {
-                                let mcp_servers: Vec<acp::McpServer> =
-                                    servers.iter().map(to_acp_mcp_server).collect();
+                                let mcp_servers: Vec<EmbeddedMcpServer> =
+                                    servers.iter().map(to_embedded_mcp_server).collect();
                                 self.extension::<serde_json::Value>(
                                     "x.ai/session/update_mcp_servers",
                                     serde_json::json!({"sessionId":id.as_str(),"mcpServers":mcp_servers}),

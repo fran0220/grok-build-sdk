@@ -86,6 +86,105 @@ async fn explicit_model_providers_route_endpoint_auth_headers_and_wire_model() {
     runtime.shutdown().await.expect("runtime shuts down");
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn provider_protocol_controls_responses_and_anthropic_wire_contracts() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    for (protocol, endpoint) in [
+        (ProviderProtocol::OpenAiResponses, "/v1/responses"),
+        (ProviderProtocol::AnthropicMessages, "/v1/messages"),
+    ] {
+        let server = MockInferenceServer::start().await.expect("provider");
+        let root = TempDir::new().expect("temp root");
+        let workspace = root.path().join("workspace");
+        std::fs::create_dir(&workspace).expect("workspace");
+        let mut config = runtime_config(&root, String::new());
+        config.api_key.clear();
+        // The legacy catalog backend deliberately disagrees. An explicit
+        // provider protocol must be the sole wire/auth source of truth.
+        config.models[0].api_backend = ApiBackend::ChatCompletions;
+        let mut explicit = match protocol {
+            ProviderProtocol::OpenAiResponses => {
+                ProviderConfig::openai_responses(server.url(), "wire-secret", "wire-model")
+            }
+            ProviderProtocol::AnthropicMessages => {
+                ProviderConfig::anthropic(server.url(), "wire-secret", "wire-model")
+            }
+            ProviderProtocol::OpenAiChatCompletions => unreachable!(),
+        };
+        explicit
+            .headers
+            .insert("x-provider-test".into(), "present".into());
+        explicit
+            .query_params
+            .insert("tenant".into(), "protocol".into());
+        let (runtime, _) = Runtime::builder(config)
+            .profile(RuntimeProfile::Desktop)
+            .model_provider("test-model", explicit)
+            .start()
+            .await
+            .expect("runtime starts");
+        let session = runtime
+            .create_session(session_config(workspace))
+            .await
+            .expect("session starts");
+        runtime
+            .prompt(&session, "protocol-turn", "provider protocol marker")
+            .await
+            .expect("provider turn succeeds");
+
+        let expected_path = format!("{endpoint}?tenant=protocol");
+        let requests = server.requests();
+        let request = requests
+            .iter()
+            .find(|request| {
+                request.path == expected_path
+                    && request.body.as_ref().is_some_and(|body| {
+                        body["model"] == "wire-model"
+                            && body.to_string().contains("provider protocol marker")
+                    })
+            })
+            .unwrap_or_else(|| {
+                let shapes = requests
+                    .iter()
+                    .map(|request| {
+                        (
+                            request.path.clone(),
+                            request.body.as_ref().map(|body| body["model"].clone()),
+                            request.body.as_ref().is_some_and(|body| {
+                                body.to_string().contains("provider protocol marker")
+                            }),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                panic!("protocol endpoint request: {shapes:?}")
+            });
+        let body = request.body.as_ref().expect("JSON request");
+        assert_eq!(body["model"], "wire-model");
+        assert_eq!(request.header("x-provider-test"), Some("present"));
+        assert!(
+            body["tools"]
+                .as_array()
+                .is_some_and(|tools| !tools.is_empty())
+        );
+        match protocol {
+            ProviderProtocol::OpenAiResponses => {
+                assert_eq!(request.authorization.as_deref(), Some("Bearer wire-secret"));
+                assert!(request.header("x-api-key").is_none());
+                assert!(body["input"].is_array());
+            }
+            ProviderProtocol::AnthropicMessages => {
+                assert!(request.authorization.is_none());
+                assert_eq!(request.header("x-api-key"), Some("wire-secret"));
+                assert_eq!(request.header("anthropic-version"), Some("2023-06-01"));
+                assert!(body["messages"].is_array());
+                assert!(body.get("system").is_some());
+            }
+            ProviderProtocol::OpenAiChatCompletions => unreachable!(),
+        }
+        runtime.shutdown().await.expect("runtime shuts down");
+    }
+}
+
 #[test]
 fn desktop_explicit_provider_isolated_from_hostile_ambient_credentials() {
     let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
@@ -455,6 +554,7 @@ async fn auxiliary_web_search_uses_its_catalog_provider() {
         reasoning_options: Vec::new(),
     });
     let mut search_provider = provider(search.url(), "search-secret", "search-wire", "search");
+    search_provider.protocol = ProviderProtocol::OpenAiResponses;
     search_provider
         .query_params
         .insert("tenant".into(), "search".into());

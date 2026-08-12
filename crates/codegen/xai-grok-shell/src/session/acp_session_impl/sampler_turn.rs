@@ -419,6 +419,7 @@ impl SessionActor {
                 temperature: None,
                 top_p: None,
                 api_backend: Default::default(),
+                auth_scheme: Default::default(),
                 extra_headers: Default::default(),
                 query_params: Default::default(),
                 env_http_headers: Default::default(),
@@ -443,7 +444,7 @@ impl SessionActor {
         } else {
             creds.api_key
         };
-        let auth_scheme = model_facts.auth_scheme;
+        let auth_scheme = cfg.auth_scheme;
         let mut extra_headers = cfg.extra_headers;
         crate::agent::config::inject_url_derived_headers(
             &mut extra_headers,

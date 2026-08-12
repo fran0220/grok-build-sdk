@@ -12,7 +12,7 @@ impl Core {
         self.prompt_wire(
             id,
             t,
-            vec![acp::ContentBlock::Text(acp::TextContent::new(x))],
+            vec![serde_json::json!({"type": "text", "text": x})],
             digest,
             serde_json::Value::Null,
             source,
@@ -123,7 +123,7 @@ impl Core {
         &self,
         id: SessionId,
         t: String,
-        blocks: Vec<acp::ContentBlock>,
+        blocks: Vec<serde_json::Value>,
         prompt_digest: String,
         metadata: serde_json::Value,
         source: InputSource,
@@ -158,21 +158,20 @@ impl Core {
         self.save_ledger(&id, &ledger)?;
         let usage_key = (id.0.clone(), t.clone());
         self.turn_usages.borrow_mut().remove(&usage_key);
-        let req = acp::PromptRequest::new(acp::SessionId::new(id.0.clone()), blocks).meta(
-            serde_json::json!({
-                "originTurnId":t,
-                "promptId":t,
-                "originPromptDigest": prompt_digest,
-                "originInputSource": serde_json::to_value(&source).map_err(op)?,
-                "originMetadata": metadata
-            })
-            .as_object()
-            .cloned(),
-        );
+        let meta = serde_json::json!({
+            "originTurnId":t,
+            "promptId":t,
+            "originPromptDigest": prompt_digest,
+            "originInputSource": serde_json::to_value(&source).map_err(op)?,
+            "originMetadata": metadata
+        })
+        .as_object()
+        .cloned()
+        .expect("prompt metadata is an object");
         let started = std::time::Instant::now();
         let response = self
             .agent
-            .prompt(req)
+            .prompt(id.0.clone(), blocks, meta)
             .await
             .map_err(|error| protocol("session/prompt", error));
         let response = match response {
@@ -182,24 +181,23 @@ impl Core {
                 return Err(error);
             }
         };
-        let outcome = match response.stop_reason {
-            acp::StopReason::EndTurn => TurnOutcome::End,
-            acp::StopReason::Cancelled => TurnOutcome::Cancelled,
-            acp::StopReason::MaxTokens => TurnOutcome::MaxTokens,
-            acp::StopReason::MaxTurnRequests => TurnOutcome::MaxTurnRequests,
-            acp::StopReason::Refusal => TurnOutcome::Refusal,
-            _ => {
+        let outcome = match response {
+            EmbeddedStopReason::End => TurnOutcome::End,
+            EmbeddedStopReason::Cancelled => TurnOutcome::Cancelled,
+            EmbeddedStopReason::MaxTokens => TurnOutcome::MaxTokens,
+            EmbeddedStopReason::MaxTurnRequests => TurnOutcome::MaxTurnRequests,
+            EmbeddedStopReason::Refusal => TurnOutcome::Refusal,
+            EmbeddedStopReason::Other => {
                 self.turn_usages.borrow_mut().remove(&usage_key);
                 return Err(Error::Operation("unrecognized Grok stop reason".into()));
             }
         };
-        let raw = serde_json::value::RawValue::from_string(
-            serde_json::json!({"sessionId": id.0}).to_string(),
-        )
-        .map_err(op)?;
         if let Err(error) = self
             .agent
-            .ext_method(acp::ExtRequest::new("origin/session/sync", Arc::from(raw)))
+            .extension(
+                "origin/session/sync",
+                serde_json::json!({"sessionId": id.0}),
+            )
             .await
             .map_err(|error| protocol("origin/session/sync", error))
         {

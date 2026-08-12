@@ -525,6 +525,12 @@ impl SamplingClient {
     pub fn new(config: SamplerConfig) -> Result<Self> {
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        if config.api_backend == ApiBackend::Messages {
+            headers.insert(
+                HeaderName::from_static("anthropic-version"),
+                HeaderValue::from_static("2023-06-01"),
+            );
+        }
         if let Some(ref api_key) = config.api_key {
             match config.auth_scheme {
                 AuthScheme::XApiKey => {
@@ -2464,6 +2470,13 @@ mod tests {
                 .default_headers
                 .get(HeaderName::from_static("x-api-key"))
                 .is_some()
+        );
+        assert_eq!(
+            client
+                .default_headers
+                .get(HeaderName::from_static("anthropic-version"))
+                .and_then(|value| value.to_str().ok()),
+            Some("2023-06-01")
         );
         assert!(client.default_headers.get(AUTHORIZATION).is_none());
     }

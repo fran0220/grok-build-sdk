@@ -1,5 +1,5 @@
-mod acp_client;
 mod authority;
+mod embedded_client;
 mod journal;
 mod lifecycle;
 mod mcp_transport;

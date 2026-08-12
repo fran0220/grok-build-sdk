@@ -12,16 +12,10 @@ use xai_grok_sampling_types::{
     ApiBackend, CompactionAtTokens, CompactionsRemaining, DoomLoopRecoveryPolicy, ReasoningEffort,
 };
 
+pub use xai_grok_sampling_types::AuthScheme;
+
 use crate::attribution::SharedAttributionCallback;
 use crate::retry::{DEFAULT_MAX_RETRIES, RATE_LIMIT_RETRY_THRESHOLD};
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum AuthScheme {
-    #[default]
-    Bearer,
-    XApiKey,
-}
 
 /// All knobs that control a single sampling request.
 ///

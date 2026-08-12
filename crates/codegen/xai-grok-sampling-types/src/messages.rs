@@ -131,15 +131,14 @@ pub enum ContentBlock {
     },
     Thinking {
         thinking: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
         signature: String,
     },
     /// Encrypted reasoning the model chose to redact. Carries only an opaque
     /// `data` blob (never plaintext). Added so a stream that includes one
     /// deserializes instead of failing the whole event parse; behavior-preserving
     /// for producers (never constructed by request-building or the sampler).
-    RedactedThinking {
-        data: String,
-    },
+    RedactedThinking { data: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -480,6 +479,34 @@ mod tests {
             serde_json::to_value(ContentBlock::RedactedThinking { data: "abc".into() }).unwrap();
         assert_eq!(json["type"], "redacted_thinking");
         assert_eq!(json["data"], "abc");
+    }
+
+    #[test]
+    fn thinking_content_block_accepts_and_omits_a_missing_signature() {
+        let event: MessageStreamEvent = serde_json::from_str(
+            r#"{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":"working"}}"#,
+        )
+        .expect("a compatible Messages endpoint may omit the thinking signature");
+
+        let content_block = match event {
+            MessageStreamEvent::ContentBlockStart { content_block, .. } => content_block,
+            other => panic!("expected ContentBlockStart, got {other:?}"),
+        };
+        match &content_block {
+            ContentBlock::Thinking {
+                thinking,
+                signature,
+            } => {
+                assert_eq!(thinking, "working");
+                assert!(signature.is_empty());
+            }
+            other => panic!("expected Thinking, got {other:?}"),
+        }
+
+        let json = serde_json::to_value(content_block).unwrap();
+        assert_eq!(json["type"], "thinking");
+        assert_eq!(json["thinking"], "working");
+        assert!(json.get("signature").is_none());
     }
 
     #[test]

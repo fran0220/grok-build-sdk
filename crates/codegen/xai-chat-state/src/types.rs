@@ -180,6 +180,7 @@ mod tests {
                 temperature: None,
                 top_p: None,
                 api_backend: Default::default(),
+                auth_scheme: xai_grok_sampling_types::AuthScheme::XApiKey,
                 extra_headers: Default::default(),
                 query_params: Default::default(),
                 env_http_headers: Default::default(),
@@ -206,6 +207,10 @@ mod tests {
         assert!(deserialized.conversation.is_empty());
         assert!(deserialized.agent_edited_paths.is_empty());
         assert!(deserialized.last_compaction_prompt_index.is_none());
+        assert_eq!(
+            deserialized.sampling_config.auth_scheme,
+            xai_grok_sampling_types::AuthScheme::XApiKey
+        );
     }
 
     #[test]
@@ -225,6 +230,7 @@ mod tests {
                 temperature: Some(0.7),
                 top_p: None,
                 api_backend: Default::default(),
+                auth_scheme: Default::default(),
                 extra_headers: Default::default(),
                 query_params: Default::default(),
                 env_http_headers: Default::default(),

@@ -32,8 +32,9 @@ pub(super) fn provider(
     api_key: &str,
     model: &str,
     header_value: &str,
-) -> ApiProviderConfig {
-    ApiProviderConfig {
+) -> ProviderConfig {
+    ProviderConfig {
+        protocol: ProviderProtocol::OpenAiChatCompletions,
         base_url,
         api_key: api_key.into(),
         model: Some(model.into()),

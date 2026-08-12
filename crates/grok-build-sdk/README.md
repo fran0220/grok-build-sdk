@@ -1,6 +1,6 @@
 # Grok Build SDK
 
-The `grok-build-sdk` crate is a trusted, in-process Rust boundary around the bundled Grok agent. Its public contract is a typed Rust API: it does not start an ACP service, expose ACP request types, or require an ACP client. `Runtime::start` uses the restricted profile. Trusted applications that need the full agent surface should use `Runtime::builder(config).profile(RuntimeProfile::Desktop)`, explicitly advertise `HostCapabilities`, and install a `HostDelegate` when host filesystem or terminal delegation is required.
+The `grok-build-sdk` crate is a trusted, in-process Rust boundary around the bundled Grok agent. Its public contract is a typed Rust API backed by the shell's native embedded facade; no transport service or transport request types are part of the SDK. `Runtime::start` uses the restricted profile. Trusted applications that need the full agent surface should use `Runtime::builder(config).profile(RuntimeProfile::Desktop)`, explicitly advertise `HostCapabilities`, and install a `HostDelegate` when host filesystem or terminal delegation is required.
 
 ## Explicit providers, not account login
 
@@ -11,23 +11,32 @@ An embedding application can supply every inference credential directly. It does
   `x.ai/models/list` contract, including forward-compatible metadata for
   context-window, agent-harness, and reasoning-effort discovery. It is
   available in both profiles without enabling the generic extension bridge.
-- `RuntimeBuilder::model_provider` or `RuntimeServices::model_providers` selects a base URL, literal API key, provider wire-model slug, request headers, and query parameters independently for each catalog model. When every model has an explicit provider, the legacy `RuntimeConfig.endpoint` and `api_key` may be empty.
+- `RuntimeBuilder::model_provider` or `RuntimeServices::model_providers` selects a protocol, base URL, literal API key, provider wire-model slug, request headers, and query parameters independently for each catalog model. When every model has an explicit provider, the legacy `RuntimeConfig.endpoint` and `api_key` may be empty.
 - `AgentServiceConfig` routes built-in subagent names and the web-search, session-summary, image-description, and prompt-suggestion auxiliary calls to catalog models. Those catalog models can each use a different provider.
 - `MediaProviderConfig` and `MediaServiceConfig` independently enable image generation, image editing, image-to-video, and reference-to-video, including an explicit API URL, key, headers, query parameters, and four model slugs. Query parameters are preserved on image generation/edit and video start/poll requests. The static media credential cannot be replaced by the primary model's rotating credential.
 - `McpServerConfig` injects bounded trusted stdio or Streamable HTTP MCP transports without reading user configuration files. `McpServerConfig::http` and `McpServerConfig::sse` validate the remote endpoint and Host-injected headers before mounting; raw provider credentials can remain behind a Host relay while the SDK receives only a relay-scoped header. `Sse` is a configuration-compatibility alias for a modern Streamable HTTP endpoint; legacy SSE lifecycle behavior is not supported. `InProcessMcpServer` registers SDK-owned servers through direct process-local dispatch, without a child process, reverse RPC, or second MCP state store. `InProcessMcpContext` identifies the runtime, session incarnation, server name, and registration ID on every callback.
 
-Explicit model providers use the repository's real Chat Completions or Responses backends. Media providers must implement the xAI Imagine-compatible image/video endpoints and payloads; this SDK does not pretend that an arbitrary diffusion or video API has that contract. Web search similarly uses Grok's existing model-backed web-search path, not an arbitrary third-party search REST schema. Account-only xAI product services remain separate optional product capabilities and are not implied by a custom API key.
+Explicit model providers use the repository's existing sampler and agent loop. Three provider protocols are supported: OpenAI Chat Completions, OpenAI Responses, and Anthropic Messages. The provider protocol is authoritative for endpoint shape and authentication; the catalog model's legacy `api_backend` cannot override it. Media providers must implement the xAI Imagine-compatible image/video endpoints and payloads; this SDK does not pretend that an arbitrary diffusion or video API has that contract. Web search similarly uses Grok's existing model-backed web-search path, not an arbitrary third-party search REST schema. Account-only xAI product services remain separate optional product capabilities and are not implied by a custom API key.
 
 Provider and MCP secret-bearing types deliberately omit both `Debug` and `Serialize`; they support `Deserialize` for host-owned configuration input without offering an accidental secret-export path. An explicit provider never resolves its key from an environment variable, Grok login, or ambient Grok config. Unoverridden catalog models retain the legacy endpoint/key fallback for compatibility. Optional auxiliary roles are disabled when omitted rather than falling through to an ambient first-party credential.
 
-For a desktop credential boundary, set `ApiProviderConfig.base_url` to the
-Host's loopback OpenAI-compatible relay and set `api_key` to the relay-scoped
-bearer. The SDK sends that value as `Authorization: Bearer …` and does not
-persist the provider configuration. Raw provider credentials can therefore
-remain in the Host's OS-keychain/relay boundary. Catalog or credential changes
-are admitted by draining the current Runtime and starting its replacement with
-the new fixed configuration; the SDK intentionally has no runtime registry or
-mutable provider-credential store.
+Choose a provider constructor according to the relay's wire contract. A base
+URL includes the API prefix but not the operation path (for example,
+`https://api.openai.com/v1`):
+
+```rust
+let chat = ProviderConfig::openai_chat(base_url, api_key, "grok-4.5");
+let responses = ProviderConfig::openai_responses(base_url, api_key, "grok-4.5");
+let messages = ProviderConfig::anthropic(base_url, api_key, "grok-4.5");
+```
+
+OpenAI protocols send `Authorization: Bearer …`. Anthropic Messages sends
+`x-api-key` and `anthropic-version: 2023-06-01`. Custom headers and query
+parameters may be added to the returned configuration, but authentication
+headers cannot be overridden. The SDK does not persist provider configuration.
+Catalog or credential changes are admitted by draining the current Runtime and
+starting its replacement with the new fixed configuration; the SDK
+intentionally has no runtime registry or mutable provider-credential store.
 
 ## Native desktop M1–M4 public-contract map
 
@@ -38,7 +47,7 @@ executable.
 | Milestone concern | Current public contract | Gap / decision |
 |---|---|---|
 | Application model catalog | `RuntimeConfig::models`, `ModelSpec`, `Runtime::list_models` | Complete for a Host-owned fixed catalog. Refresh revisions and connection health remain Host state; restart the drained Runtime to admit a new catalog. |
-| Provider endpoint + relay bearer | `ApiProviderConfig`, `RuntimeBuilder::model_provider` | Complete. `api_key` is the Bearer value and may be a loopback-relay token. Provider raw credentials need not enter the SDK. |
+| Provider endpoint + credential | `ProviderConfig`, `ProviderProtocol`, `RuntimeBuilder::model_provider` | Complete for OpenAI Chat Completions, OpenAI Responses, and Anthropic Messages. `api_key` is sent using the protocol-defined authentication header and may be a loopback-relay token. Provider raw credentials need not enter the SDK. |
 | One Runtime, one Session per Host Thread | `Runtime`, `create_session`, `create_session_with_id`, `load_session`, `resume_session`, `unload_session`, `delete_session` | Complete; no registry or external executable is required. `create_session_with_id` gives the Host a crash-safe, idempotently retryable Thread↔Session identity when `SessionStateStore` is installed; `delete_session` coordinates actor teardown with permanent authority deletion. A timed-out unload retains the exact native actor thread, session-tree registration, SDK binding, and lease for a truthful retry; final Runtime shutdown reports incomplete unloads and transfers unfinished actors to join-based reconciliation rather than detaching them. |
 | Session cwd/model/reasoning | `SessionConfig::{cwd, model, reasoning}`, `Runtime::set_route` | Complete for M1. Explicit reasoning wins; omission resolves to the validated fixed-catalog default on create/load/resume and route changes. |
 | Restart, recovery, receipt, cursor | `PromptReceipt`, `SessionLedger`, rewind receipts, `events_after`, Run reconciliation/attach APIs | Complete for M1. A cursor gap is typed and fails closed. |
@@ -571,7 +580,7 @@ The public session-scoped MCP API covers:
 
 Modern roots, model sampling, and elicitation requests are carried by MRTR `inputRequests`. Roots and sampling may be answered through installed typed host services or an `McpContinuation` created with `McpInputRequired::respond`; elicitation answers are accepted only from the installed `McpElicitationUi`. A continuation is bound to its session incarnation, server, connection generation, operation kind and target; cross-operation reuse, mutation of the projected input round, and reuse after reconnect fail closed, while the opaque `requestState` is returned unchanged. The legacy unrestricted reverse-request path is not used for these roles. Capabilities are advertised only when the corresponding typed service is installed and authorized. Unknown input-request methods fail closed.
 
-The SDK deliberately does not call legacy `resources/subscribe` / `resources/unsubscribe`, expose a generic server-to-client request peer, or add an ACP compatibility service. Deprecated pre-2026 logging and direct roots/sampling request forms are retained only where rmcp's protocol model requires them; they are not the modern public execution path. Negotiated capability fields report what the server advertised for the selected version and remain distinct from host authorization.
+The SDK deliberately does not call legacy `resources/subscribe` / `resources/unsubscribe`, expose a generic server-to-client request peer, or add a transport compatibility service. Deprecated pre-2026 logging and direct roots/sampling request forms are retained only where rmcp's protocol model requires them; they are not the modern public execution path. Negotiated capability fields report what the server advertised for the selected version and remain distinct from host authorization.
 
 ## Session capability layering
 

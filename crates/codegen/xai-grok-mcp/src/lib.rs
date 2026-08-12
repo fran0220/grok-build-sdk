@@ -29,6 +29,10 @@
 pub use rmcp;
 
 pub mod acp_transport;
+/// Protocol-neutral process-local MCP host boundary for embedded runtimes.
+pub mod embedded_transport {
+    pub use crate::acp_transport::EmbeddedMcpInvoker;
+}
 pub mod credentials;
 pub mod liveness;
 pub mod mcp_http_client;

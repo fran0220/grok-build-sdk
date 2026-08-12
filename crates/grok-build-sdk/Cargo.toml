@@ -13,7 +13,6 @@ categories = ["api-bindings", "development-tools"]
 publish = false
 
 [dependencies]
-agent-client-protocol = { workspace = true }
 async-trait = { workspace = true }
 base64 = { workspace = true }
 fs2 = { workspace = true }
@@ -27,7 +26,6 @@ thiserror = { workspace = true }
 tokio = { workspace = true, features = ["rt", "sync", "time"] }
 url = { workspace = true }
 uuid = { workspace = true }
-xai-acp-lib = { workspace = true }
 xai-agent-lifecycle = { workspace = true }
 xai-file-utils = { path = "../codegen/xai-file-utils" }
 xai-grok-mcp = { workspace = true }
@@ -45,6 +43,8 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 xai-grok-test-support = { workspace = true }
+xai-grok-sampler = { workspace = true }
+xai-grok-sampling-types = { path = "../codegen/xai-grok-sampling-types" }
 
 [lints]
 workspace = true

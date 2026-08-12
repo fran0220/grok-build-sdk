@@ -2192,6 +2192,7 @@ async fn retry_after_lost_ack_converges_memory_and_disk_to_authoritative_item() 
             temperature: None,
             top_p: None,
             api_backend: Default::default(),
+            auth_scheme: Default::default(),
             extra_headers: Default::default(),
             query_params: Default::default(),
             env_http_headers: Default::default(),
