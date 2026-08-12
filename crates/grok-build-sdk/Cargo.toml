@@ -11,6 +11,7 @@ readme = "README.md"
 keywords = ["agent", "desktop", "grok", "mcp", "sdk"]
 categories = ["api-bindings", "development-tools"]
 publish = false
+autotests = false
 
 [dependencies]
 async-trait = { workspace = true }
@@ -27,10 +28,8 @@ tokio = { workspace = true, features = ["rt", "sync", "time"] }
 url = { workspace = true }
 uuid = { workspace = true }
 xai-agent-lifecycle = { workspace = true }
-xai-file-utils = { path = "../codegen/xai-file-utils" }
 xai-grok-mcp = { workspace = true }
 xai-grok-shell = { workspace = true }
-xai-grok-tools = { workspace = true }
 
 # Only used by `OsLivenessProbe`, which asks whether a recorded pid still names
 # a live process. There is no portable std equivalent.
@@ -45,6 +44,17 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 xai-grok-test-support = { workspace = true }
 xai-grok-sampler = { workspace = true }
 xai-grok-sampling-types = { path = "../codegen/xai-grok-sampling-types" }
+
+# Keep the ordinary contract suite in one binary. The SDK runtime has a large
+# upstream dependency closure, so one harness avoids linking that closure once
+# per source file. Live provider checks stay separate and opt-in.
+[[test]]
+name = "sdk_contracts"
+path = "tests/sdk_contracts.rs"
+
+[[test]]
+name = "live_provider_protocols"
+path = "tests/live_provider_protocols.rs"
 
 [lints]
 workspace = true
