@@ -440,6 +440,7 @@ impl SessionContextFactory for WorkspaceSessionContextFactory {
                                 image_to_video_model: None,
                                 reference_to_video_model: None,
                                 use_dynamic_api_key_provider: true,
+                                zdr_restricted: false,
                             },
                             WebSearchConfig::Enabled {
                                 api_key: token,

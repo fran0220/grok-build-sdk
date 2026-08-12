@@ -1065,6 +1065,7 @@ mod classify_tests {
                 model_metadata: None,
                 retry_after_secs: None,
                 should_retry: None,
+                error_code: None,
             }))
         };
         assert!(det(StatusCode::BAD_REQUEST));
@@ -1096,6 +1097,7 @@ mod classify_tests {
             SamplingError::StreamError {
                 error_type: "overloaded_error".into(),
                 message: "try again".into(),
+                code: None,
             }
         )));
     }
@@ -1158,6 +1160,7 @@ mod classify_tests {
             model_metadata: None,
             retry_after_secs: None,
             should_retry: None,
+            error_code: None,
         })));
     }
     #[test]
@@ -1188,6 +1191,7 @@ mod classify_tests {
             model_metadata: None,
             retry_after_secs: None,
             should_retry: None,
+            error_code: None,
         }) else {
             panic!("expected Deterministic for 400");
         };
@@ -1200,6 +1204,7 @@ mod classify_tests {
             model_metadata: None,
             retry_after_secs: None,
             should_retry: None,
+            error_code: None,
         }) else {
             panic!("expected Transient for 500");
         };

@@ -720,6 +720,7 @@ mod tests {
             model_metadata: None,
             retry_after_secs: None,
             should_retry,
+            error_code: None,
         }
     }
 
@@ -730,6 +731,7 @@ mod tests {
         assert!(should_retry_side_question(&SamplingError::StreamError {
             error_type: "overloaded_error".into(),
             message: "Overloaded".into(),
+            code: None,
         }));
         assert!(should_retry_side_question(&api(
             500,
@@ -779,6 +781,7 @@ mod tests {
             Err(SamplingError::StreamError {
                 error_type: "overloaded_error".into(),
                 message: "Overloaded".into(),
+                code: None,
             })
         })
         .retry(side_question_retry_policy())
