@@ -7,11 +7,11 @@
 use grok_build_sdk::{
     ApiBackend, Error, HostError, InProcessMcpHandler, InProcessMcpServer, MAX_MCP_ENDPOINT_BYTES,
     MAX_MCP_HEADER_VALUE_BYTES, MAX_MCP_STDIO_ARGS, MAX_MCP_TASK_ID_BYTES,
-    MAX_MCP_TASK_IDENTITY_BYTES, McpElicitationOrigin, McpElicitationService, McpElicitationUi,
-    McpElicitationUiRequest, McpHostContext, McpHostServiceError, McpHostServices,
-    McpInputRequestKind, McpOperationOutcome, McpServerConfig, McpTaskHandle, McpTaskIdentity,
-    McpTaskRecovery, McpTaskStatus, ModelSpec, Runtime, RuntimeConfig, RuntimeProfile,
-    SessionConfig,
+    MAX_MCP_TASK_IDENTITY_BYTES, McpContent, McpElicitationOrigin, McpElicitationService,
+    McpElicitationUi, McpElicitationUiRequest, McpHostContext, McpHostServiceError,
+    McpHostServices, McpInputRequestKind, McpOperationOutcome, McpServerConfig, McpTaskHandle,
+    McpTaskIdentity, McpTaskRecovery, McpTaskStatus, ModelSpec, Runtime, RuntimeConfig,
+    RuntimeProfile, SessionConfig,
 };
 use std::{
     collections::BTreeMap,
@@ -289,6 +289,23 @@ async fn generic_host_services_cannot_install_a_second_elicitation_answer_path()
     assert!(matches!(result, Err(Error::InvalidConfig(_))));
 }
 
+/// Unloads through the documented truthful-retry contract: a teardown that
+/// misses its deadline retains the exact actor, binding and lease, so on a
+/// heavily loaded machine an unload is slower rather than lost.
+async fn unload_with_retries(runtime: &Runtime, session: &grok_build_sdk::SessionId) {
+    let mut last = None;
+    for _ in 0..40 {
+        match runtime.unload_session(session.clone()).await {
+            Ok(()) => return,
+            Err(error) => {
+                last = Some(error);
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            }
+        }
+    }
+    panic!("session unload kept missing its teardown deadline: {last:?}");
+}
+
 async fn wait_for_fixture(runtime: &Runtime, session: &grok_build_sdk::SessionId) {
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
@@ -351,10 +368,7 @@ async fn stable_task_identity_recovers_and_only_the_product_ui_answers_elicitati
     let identity = McpTaskIdentity::from_json_slice(&persisted)
         .expect("identity validates through its bounded durable decoder");
 
-    runtime
-        .unload_session(session.clone())
-        .await
-        .expect("session unloads");
+    unload_with_retries(&runtime, &session).await;
     runtime
         .load_session(session.clone(), session_config(workspace))
         .await
@@ -441,7 +455,449 @@ async fn stable_task_identity_recovers_and_only_the_product_ui_answers_elicitati
         runtime.recover_mcp_task(&unknown).await.unwrap(),
         McpTaskRecovery::RecoveryRequired { identity } if identity == unknown
     ));
+    unload_with_retries(&runtime, &session).await;
     runtime.shutdown().await.expect("runtime shuts down");
+}
+
+/// One recorded HTTP request: the JSON-RPC method it carried and the two
+/// host-injected header values exactly as they arrived on the wire.
+type RecordedRequest = (String, String, String);
+
+struct RemoteState {
+    status: AtomicU8,
+    starts: AtomicU8,
+    requests: Mutex<Vec<RecordedRequest>>,
+}
+
+/// A live Streamable HTTP MCP service for the façade to mount remotely. It
+/// speaks the same modern dialect as the in-process fixtures — discovery,
+/// tools, durable Tasks and elicitation — while recording, for every request,
+/// the header values that actually arrived.
+struct RemoteMcpFixture {
+    url: String,
+    state: Arc<RemoteState>,
+    server: tokio::task::JoinHandle<()>,
+}
+
+impl RemoteMcpFixture {
+    async fn start() -> Self {
+        use axum::{
+            Json, Router,
+            extract::State,
+            http::{HeaderMap, StatusCode},
+            response::{IntoResponse, Response},
+        };
+
+        fn task_body(state: &RemoteState) -> serde_json::Value {
+            if state.status.load(Ordering::Acquire) == 0 {
+                serde_json::json!({
+                    "resultType":"complete",
+                    "taskId":"provider-task-1",
+                    "status":"input_required",
+                    "statusMessage":"waiting for product input",
+                    "createdAt":"2026-08-11T00:00:00Z",
+                    "lastUpdatedAt":"2026-08-11T00:00:01Z",
+                    "ttlMs":60000,
+                    "inputRequests":{
+                        "provider-form":{
+                            "method":"elicitation/create",
+                            "params":{
+                                "mode":"form",
+                                "message":"Choose the output format",
+                                "requestedSchema":{
+                                    "type":"object",
+                                    "properties":{"format":{"type":"string"}},
+                                    "required":["format"]
+                                }
+                            }
+                        }
+                    }
+                })
+            } else {
+                serde_json::json!({
+                    "resultType":"complete",
+                    "taskId":"provider-task-1",
+                    "status":"completed",
+                    "statusMessage":"done",
+                    "createdAt":"2026-08-11T00:00:00Z",
+                    "lastUpdatedAt":"2026-08-11T00:00:02Z",
+                    "ttlMs":60000,
+                    "result":{"resultType":"complete","content":[{"type":"text","text":"done"}]}
+                })
+            }
+        }
+
+        async fn handle(
+            State(state): State<Arc<RemoteState>>,
+            headers: HeaderMap,
+            Json(request): Json<serde_json::Value>,
+        ) -> Response {
+            let method = request["method"].as_str().unwrap_or_default().to_owned();
+            let header = |name: &str| {
+                headers
+                    .get(name)
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or_default()
+                    .to_owned()
+            };
+            state.requests.lock().unwrap().push((
+                method.clone(),
+                header("authorization"),
+                header("x-origin-connection"),
+            ));
+            let id = request.get("id").cloned();
+            let result = match method.as_str() {
+                "server/discover" => {
+                    return (
+                        [("mcp-session-id", "remote-facade-fixture")],
+                        Json(serde_json::json!({
+                            "jsonrpc":"2.0",
+                            "id":id,
+                            "result":{
+                                "resultType":"complete",
+                                "supportedVersions":["2026-07-28"],
+                                "capabilities":{
+                                    "tools":{},
+                                    "extensions":{"io.modelcontextprotocol/tasks":{}}
+                                },
+                                "ttlMs":0,
+                                "cacheScope":"private",
+                                "_meta":{"io.modelcontextprotocol/serverInfo":{
+                                    "name":"remote-facade-fixture",
+                                    "version":"1"
+                                }}
+                            }
+                        })),
+                    )
+                        .into_response();
+                }
+                "tools/list" => serde_json::json!({
+                    "tools":[
+                        {"name":"start","inputSchema":{"type":"object"}},
+                        {"name":"ping","inputSchema":{"type":"object"}}
+                    ]
+                }),
+                "tools/call" if request["params"]["name"] == "ping" => serde_json::json!({
+                    "content":[{"type":"text","text":"remote pong"}],
+                    "isError":false
+                }),
+                "tools/call" if request["params"]["name"] == "start" => {
+                    state.starts.fetch_add(1, Ordering::AcqRel);
+                    state.status.store(0, Ordering::Release);
+                    serde_json::json!({
+                        "resultType":"task",
+                        "taskId":"provider-task-1",
+                        "status":"working",
+                        "statusMessage":"starting",
+                        "createdAt":"2026-08-11T00:00:00Z",
+                        "lastUpdatedAt":"2026-08-11T00:00:00Z",
+                        "ttlMs":60000,
+                        "pollIntervalMs":10
+                    })
+                }
+                "tasks/get" if request["params"]["taskId"] == "provider-task-1" => {
+                    task_body(&state)
+                }
+                "tasks/update" => {
+                    let response = &request["params"]["inputResponses"]["provider-form"];
+                    if response["action"] != "accept" || response["content"]["format"] != "json" {
+                        return Json(serde_json::json!({
+                            "jsonrpc":"2.0",
+                            "id":id,
+                            "error":{"code":-32602,"message":"invalid product UI answer"}
+                        }))
+                        .into_response();
+                    }
+                    state.status.store(1, Ordering::Release);
+                    serde_json::json!({"resultType":"complete"})
+                }
+                method if method.starts_with("notifications/") => {
+                    return StatusCode::ACCEPTED.into_response();
+                }
+                _ => {
+                    return Json(serde_json::json!({
+                        "jsonrpc":"2.0",
+                        "id":id,
+                        "error":{"code":-32601,"message":"Method not found"}
+                    }))
+                    .into_response();
+                }
+            };
+            Json(serde_json::json!({"jsonrpc":"2.0","id":id,"result":result})).into_response()
+        }
+
+        let state = Arc::new(RemoteState {
+            status: AtomicU8::new(0),
+            starts: AtomicU8::new(0),
+            requests: Mutex::new(Vec::new()),
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("remote MCP fixture binds");
+        let addr = listener.local_addr().expect("remote MCP fixture address");
+        // The listen channel also carries the host-injected headers; the
+        // fixture records them, then declines the standing stream so nothing
+        // outlives a Runtime shutdown. The transport treats 405 as a server
+        // without a common SSE stream and continues over POST.
+        async fn sse_stream(State(state): State<Arc<RemoteState>>, headers: HeaderMap) -> Response {
+            let header = |name: &str| {
+                headers
+                    .get(name)
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or_default()
+                    .to_owned()
+            };
+            state.requests.lock().unwrap().push((
+                "GET".into(),
+                header("authorization"),
+                header("x-origin-connection"),
+            ));
+            StatusCode::METHOD_NOT_ALLOWED.into_response()
+        }
+
+        let router = Router::new()
+            .route("/mcp", axum::routing::get(sse_stream).post(handle))
+            .with_state(state.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router)
+                .await
+                .expect("remote MCP fixture serves");
+        });
+        Self {
+            url: format!("http://{addr}/mcp"),
+            state,
+            server,
+        }
+    }
+
+    fn requests(&self) -> Vec<RecordedRequest> {
+        self.state.requests.lock().unwrap().clone()
+    }
+}
+
+impl Drop for RemoteMcpFixture {
+    fn drop(&mut self) {
+        self.server.abort();
+    }
+}
+
+async fn wait_for_remote(runtime: &Runtime, session: &grok_build_sdk::SessionId, server: &str) {
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            if runtime
+                .list_mcp_tools(session, Some(server))
+                .await
+                .is_ok_and(|tools| tools.len() == 2)
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("remote MCP mount initializes");
+}
+
+/// The M4 remote-mount gate, proved over live transports rather than config
+/// validation: `Http` and `Sse` mounts reach a real Streamable HTTP service,
+/// every request carries the host-injected headers exactly as configured, a
+/// durable Task's identity survives a full Runtime restart and reattaches
+/// without replaying `tools/call`, and structured input is answered only by
+/// the product UI channel.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn live_remote_mounts_preserve_headers_task_identity_and_the_product_ui_channel() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let http_fixture = RemoteMcpFixture::start().await;
+    let sse_fixture = RemoteMcpFixture::start().await;
+    let root = TempDir::new().expect("root");
+    let workspace = root.path().join("workspace");
+    std::fs::create_dir(&workspace).expect("workspace");
+    let ui = Arc::new(ProductUi::default());
+    let mounts = || {
+        vec![
+            McpServerConfig::http(
+                "provider-http",
+                http_fixture.url.clone(),
+                BTreeMap::from([
+                    ("authorization".into(), "Bearer relay-scoped-http".into()),
+                    ("x-origin-connection".into(), "connection-7".into()),
+                ]),
+            )
+            .expect("http mount validates"),
+            McpServerConfig::sse(
+                "provider-sse",
+                sse_fixture.url.clone(),
+                BTreeMap::from([
+                    ("authorization".into(), "Bearer relay-scoped-sse".into()),
+                    ("x-origin-connection".into(), "connection-9".into()),
+                ]),
+            )
+            .expect("sse mount validates"),
+        ]
+    };
+
+    let (runtime, _) = Runtime::builder(runtime_config(&root))
+        .profile(RuntimeProfile::Desktop)
+        .mcp_servers(mounts())
+        .mcp_elicitation_ui(ui.clone())
+        .start()
+        .await
+        .expect("runtime starts");
+    let session = runtime
+        .create_session(session_config(workspace.clone()))
+        .await
+        .expect("session starts");
+    wait_for_remote(&runtime, &session, "provider-http").await;
+    wait_for_remote(&runtime, &session, "provider-sse").await;
+
+    let pong = runtime
+        .call_mcp_tool(&session, "provider-sse", "ping", serde_json::json!({}))
+        .await
+        .expect("the Sse alias serves a live Streamable HTTP tool call");
+    assert!(
+        matches!(&pong.content[0], McpContent::Text { text, .. } if text == "remote pong"),
+        "unexpected remote tool result: {pong:?}"
+    );
+
+    let task = runtime
+        .call_mcp_tool_once(
+            &session,
+            "provider-http",
+            "start",
+            serde_json::json!({}),
+            None,
+        )
+        .await
+        .expect("Task starts over the remote mount");
+    let original = match task {
+        McpOperationOutcome::Task { handle, task } => {
+            assert_eq!(task.status, McpTaskStatus::Working);
+            handle
+        }
+        other => panic!("expected Task, got {other:?}"),
+    };
+    let persisted =
+        serde_json::to_vec(&original.durable_identity().expect("stable identity")).unwrap();
+
+    // A full Runtime restart is the strongest reconnect boundary the SDK owns:
+    // the remote service keeps running while every mount, generation and
+    // session actor is torn down and rebuilt.
+    unload_with_retries(&runtime, &session).await;
+    runtime.shutdown().await.expect("first runtime shuts down");
+    let (runtime, _) = Runtime::builder(runtime_config(&root))
+        .profile(RuntimeProfile::Desktop)
+        .mcp_servers(mounts())
+        .mcp_elicitation_ui(ui.clone())
+        .start()
+        .await
+        .expect("second runtime starts");
+    runtime
+        .load_session(session.clone(), session_config(workspace))
+        .await
+        .expect("session reloads after restart");
+    wait_for_remote(&runtime, &session, "provider-http").await;
+
+    let identity = McpTaskIdentity::from_json_slice(&persisted)
+        .expect("host-persisted identity bytes restore across the restart");
+    let recovered = match runtime
+        .recover_mcp_task(&identity)
+        .await
+        .expect("recovery result")
+    {
+        McpTaskRecovery::Reattached { task } => task,
+        other => panic!("Task must reattach after the restart, got {other:?}"),
+    };
+    assert_eq!(
+        http_fixture.state.starts.load(Ordering::Acquire),
+        1,
+        "recovery must query the existing Task without replaying tools/call"
+    );
+    assert_eq!(
+        recovered.handle.durable_identity().unwrap(),
+        identity,
+        "the durable Task identity is preserved across the Runtime restart"
+    );
+
+    assert!(
+        runtime
+            .update_mcp_task(
+                &recovered.handle,
+                BTreeMap::from([(
+                    "provider-form".into(),
+                    serde_json::json!({"action":"accept","content":{"format":"forged"}}),
+                )]),
+            )
+            .await
+            .is_err(),
+        "generic Task updates cannot forge an elicitation answer"
+    );
+    runtime
+        .resolve_mcp_task_input_with_ui(&recovered.handle, BTreeMap::new())
+        .await
+        .expect("product UI resolves Task input over the remote mount");
+    assert_eq!(
+        runtime
+            .get_mcp_task(&recovered.handle)
+            .await
+            .expect("completed status")
+            .status,
+        McpTaskStatus::Completed
+    );
+    {
+        let requests = ui.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(matches!(
+            &requests[0].origin,
+            McpElicitationOrigin::Task { identity: observed, client_id }
+                if observed == &identity && *client_id == recovered.handle.client_id
+        ));
+    }
+
+    for (fixture, bearer, connection, transport) in [
+        (
+            &http_fixture,
+            "Bearer relay-scoped-http",
+            "connection-7",
+            "http",
+        ),
+        (
+            &sse_fixture,
+            "Bearer relay-scoped-sse",
+            "connection-9",
+            "sse",
+        ),
+    ] {
+        let requests = fixture.requests();
+        assert!(
+            !requests.is_empty(),
+            "the {transport} mount received no traffic"
+        );
+        for (method, authorization, origin_connection) in &requests {
+            assert_eq!(
+                authorization, bearer,
+                "{transport} request `{method}` did not carry the host-injected \
+                 Authorization header verbatim"
+            );
+            assert_eq!(
+                origin_connection, connection,
+                "{transport} request `{method}` did not carry the host-injected \
+                 custom header verbatim"
+            );
+        }
+        let discoveries = requests
+            .iter()
+            .filter(|(method, ..)| method == "server/discover")
+            .count();
+        if transport == "http" {
+            assert!(
+                discoveries >= 2,
+                "both Runtime generations must have discovered the {transport} mount"
+            );
+        }
+    }
+
+    unload_with_retries(&runtime, &session).await;
+    runtime.shutdown().await.expect("second runtime shuts down");
 }
 
 #[test]
