@@ -489,12 +489,30 @@ async fn shared_store_fences_admission_from_unload_through_tombstone() {
     let deleting = {
         let runtime = runtime_a.clone();
         let id = id.clone();
-        tokio::spawn(async move { runtime.delete_session(id).await })
+        tokio::spawn(async move {
+            // Deletion first unloads the resident actor, and an unload whose
+            // teardown misses its deadline retains the actor for a truthful
+            // retry. Retrying here is the documented Host pattern; the store
+            // pause still fires exactly once, on the attempt that reaches the
+            // authority delete.
+            loop {
+                match runtime.delete_session(id.clone()).await {
+                    Err(Error::Operation(message))
+                        if message.contains("missed the teardown deadline") =>
+                    {
+                        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                    }
+                    result => break result,
+                }
+            }
+        })
     };
-    tokio::task::spawn_blocking(move || delete_entered.recv())
-        .await
-        .expect("delete observer joins")
-        .expect("A pauses after unload and before tombstone");
+    tokio::task::spawn_blocking(move || {
+        delete_entered.recv_timeout(std::time::Duration::from_secs(120))
+    })
+    .await
+    .expect("delete observer joins")
+    .expect("A pauses after unload and before tombstone");
 
     let inspections_before_b = store.inspect_calls.load(Ordering::Acquire);
     let admission = runtime_b.load_session(id.clone(), session.clone()).await;
