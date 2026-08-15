@@ -259,6 +259,8 @@ impl Core {
                 )));
             }
         }
-        Ok(TurnBindingStatus::Complete { record })
+        Ok(TurnBindingStatus::Complete {
+            record: Box::new(record),
+        })
     }
 }

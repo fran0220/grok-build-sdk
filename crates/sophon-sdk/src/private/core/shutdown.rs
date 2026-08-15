@@ -33,9 +33,7 @@ impl Core {
     }
     pub(super) async fn delete(&self, id: SessionId) -> Result<(), Error> {
         if self.resident.borrow().contains(&id.0) {
-            if let Err(error) = self.unload_inner(id.clone(), false).await {
-                return Err(error);
-            }
+            self.unload_inner(id.clone(), false).await?;
         } else if !self.session_leases.borrow().contains_key(&id.0) {
             let lease = self.acquire_session_lease(&id)?;
             if let Some(lease) = lease {

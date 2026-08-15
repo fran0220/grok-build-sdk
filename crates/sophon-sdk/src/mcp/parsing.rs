@@ -407,25 +407,32 @@ pub(crate) fn parse_mcp_operation_outcome<T>(
                     .map(|request| request.id.clone())
                     .collect(),
             });
-            Ok(McpOperationOutcome::InputRequired { client_id, input })
+            Ok(McpOperationOutcome::InputRequired {
+                client_id,
+                input: Box::new(input),
+            })
         }
         Some("task") => {
             let task = parse_task(session_id, server, client_id, result)?;
             Ok(McpOperationOutcome::Task {
                 handle: task.handle.clone(),
-                task,
+                task: Box::new(task),
             })
         }
         _ => Err(Error::Operation("unsupported MCP operation outcome".into())),
     }
 }
 
+/// What a validated continuation carries forward: the input responses, the
+/// task id, and the client id, each present only when the continuation was.
+pub(crate) type McpContinuationParts = (Option<McpInputResponses>, Option<String>, Option<u64>);
+
 pub(crate) fn validate_mcp_continuation(
     continuation: Option<McpContinuation>,
     session_id: &SessionId,
     server: &str,
     operation: &McpOperationIdentity,
-) -> Result<(Option<McpInputResponses>, Option<String>, Option<u64>), Error> {
+) -> Result<McpContinuationParts, Error> {
     let Some(continuation) = continuation else {
         return Ok((None, None, None));
     };

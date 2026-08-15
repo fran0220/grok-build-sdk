@@ -1060,7 +1060,7 @@ fn validate_sha256_id(value: &str, name: &str) -> Result<(), HarnessError> {
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum TurnBindingStatus {
     Absent,
-    Complete { record: TurnBindingRecord },
+    Complete { record: Box<TurnBindingRecord> },
 }
 
 /// One typed change proposed against an immutable snapshot.

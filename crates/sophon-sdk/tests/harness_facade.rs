@@ -676,7 +676,7 @@ async fn lost_prompt_result_recovers_the_exact_durable_binding_after_restart() {
     let record_bytes = before_restart.to_json_vec().unwrap();
     assert_eq!(
         sophon_sdk::TurnBindingRecord::from_json_slice(&record_bytes).unwrap(),
-        before_restart
+        *before_restart
     );
     runtime.shutdown().await.unwrap();
 

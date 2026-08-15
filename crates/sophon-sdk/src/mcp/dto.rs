@@ -586,11 +586,11 @@ pub enum McpOperationOutcome<T> {
     },
     InputRequired {
         client_id: u64,
-        input: McpInputRequired,
+        input: Box<McpInputRequired>,
     },
     Task {
         handle: McpTaskHandle,
-        task: McpTask,
+        task: Box<McpTask>,
     },
 }
 

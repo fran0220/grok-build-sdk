@@ -238,27 +238,28 @@ async fn typed_permission_policy_parses_routes_and_fails_closed() {
         .unwrap();
     assert_eq!(response["outcome"]["outcome"], "selected");
     assert_eq!(response["outcome"]["optionId"], "always");
-    let requests = policy.requests.lock().unwrap();
-    let request = &requests[0];
-    assert_eq!(request.session_id, "session-typed");
-    assert_eq!(request.tool_call.id, "call-1");
-    assert_eq!(request.tool_call.title.as_deref(), Some("Run tests"));
-    assert_eq!(request.tool_call.kind, Some(crate::ToolKind::Execute));
-    assert_eq!(
-        request.tool_call.raw_input.as_ref().unwrap()["command"],
-        "cargo test"
-    );
-    assert_eq!(request.raw["toolCall"]["rawOutput"]["preview"], true);
-    assert_eq!(
-        request.options.iter().map(|o| o.kind).collect::<Vec<_>>(),
-        vec![
-            crate::ToolPermissionOptionKind::AllowOnce,
-            crate::ToolPermissionOptionKind::AllowAlways,
-            crate::ToolPermissionOptionKind::RejectOnce,
-            crate::ToolPermissionOptionKind::RejectAlways
-        ]
-    );
-    drop(requests);
+    {
+        let requests = policy.requests.lock().unwrap();
+        let request = &requests[0];
+        assert_eq!(request.session_id, "session-typed");
+        assert_eq!(request.tool_call.id, "call-1");
+        assert_eq!(request.tool_call.title.as_deref(), Some("Run tests"));
+        assert_eq!(request.tool_call.kind, Some(crate::ToolKind::Execute));
+        assert_eq!(
+            request.tool_call.raw_input.as_ref().unwrap()["command"],
+            "cargo test"
+        );
+        assert_eq!(request.raw["toolCall"]["rawOutput"]["preview"], true);
+        assert_eq!(
+            request.options.iter().map(|o| o.kind).collect::<Vec<_>>(),
+            vec![
+                crate::ToolPermissionOptionKind::AllowOnce,
+                crate::ToolPermissionOptionKind::AllowAlways,
+                crate::ToolPermissionOptionKind::RejectOnce,
+                crate::ToolPermissionOptionKind::RejectAlways
+            ]
+        );
+    }
 
     let invalid = Arc::new(PermissionPolicy {
         decision: Ok(crate::ToolPermissionDecision::Selected("invented".into())),
@@ -655,12 +656,13 @@ async fn reverse_hook_transport_is_typed_and_fails_closed() {
     let response = client.request("x.ai/hooks/run", payload).await.unwrap();
     assert_eq!(response["decision"], "deny");
     assert_eq!(response["systemMessage"], "policy denied");
-    let calls = hook.0.lock().unwrap();
-    assert_eq!(calls[0].event, crate::AgentHookEvent::PreToolUse);
-    assert_eq!(calls[0].tool_name.as_deref(), Some("write_file"));
-    assert_eq!(calls[0].tool_input.as_ref().unwrap()["path"], "a");
-    assert_eq!(calls[0].raw["future"], 42);
-    drop(calls);
+    {
+        let calls = hook.0.lock().unwrap();
+        assert_eq!(calls[0].event, crate::AgentHookEvent::PreToolUse);
+        assert_eq!(calls[0].tool_name.as_deref(), Some("write_file"));
+        assert_eq!(calls[0].tool_input.as_ref().unwrap()["path"], "a");
+        assert_eq!(calls[0].raw["future"], 42);
+    }
 
     let unknown = serde_json::json!({
         "hookCallbackId":"missing", "hookEventName":"post_tool_use", "sessionId":"s"
