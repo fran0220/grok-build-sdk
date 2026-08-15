@@ -1,9 +1,9 @@
 <div align="center">
 
-<h1>Grok Build SDK</h1>
+<h1>Sophon SDK</h1>
 
-**Grok Build SDK** is an Apache-2.0, embeddable Rust SDK built from the
-published Grok Build source tree. Its `grok-build-sdk` crate gives trusted
+**Sophon SDK** is an Apache-2.0, embeddable Rust SDK built from the published
+Grok Build source tree. Its `sophon-sdk` crate gives trusted
 desktop main processes explicit control over model providers, subagents,
 auxiliary inference, image/video services, MCP transports, host filesystem and
 terminal delegation, typed model-catalog discovery, sessions, replay, and
@@ -14,7 +14,7 @@ consumers can audit the implementation. It is an independent redistribution;
 it is not an official xAI SDK. See [`SOURCE_REV`](SOURCE_REV),
 [`UPSTREAM_GROK_BUILD_COMMIT`](UPSTREAM_GROK_BUILD_COMMIT),
 [`THIRD-PARTY-NOTICES`](THIRD-PARTY-NOTICES), and the SDK's
-[capability and trust-boundary documentation](crates/grok-build-sdk/README.md).
+[capability and trust-boundary documentation](crates/sophon-sdk/README.md).
 
 The upstream **Grok Build** application is SpaceXAI's terminal-based AI coding agent. It runs as a
 full-screen TUI that understands your codebase, edits files, executes shell
@@ -104,7 +104,7 @@ MCP servers, skills, plugins, hooks, headless mode, sandboxing, and more.
 
 | Path | Contents |
 |------|----------|
-| `crates/grok-build-sdk` | Public Rust embedding boundary for trusted desktop main processes |
+| `crates/sophon-sdk` | Public Rust embedding boundary for trusted desktop main processes |
 | `crates/codegen/xai-grok-pager-bin` | Composition-root package; builds the `xai-grok-pager` binary |
 | `crates/codegen/xai-grok-pager` | The TUI: scrollback, prompt, modals, rendering |
 | `crates/codegen/xai-grok-shell` | Agent runtime + leader/stdio/headless entry points |
@@ -130,16 +130,16 @@ cargo fmt --all               # rustfmt.toml at the repo root
 
 ## SDK release status
 
-`grok-build-sdk` is suitable for an Apache-2.0 public source repository and
+`sophon-sdk` is suitable for an Apache-2.0 public source repository and
 pinned Git-tag consumption. It is not currently a crates.io-publishable
 standalone crate: the runtime depends on the bundled workspace's local
 `xai-grok-*` crate closure and workspace patches. See the SDK
-[release-status documentation](crates/grok-build-sdk/README.md#public-release-status)
+[release-status documentation](crates/sophon-sdk/README.md#public-release-status)
 before cutting a public version.
 
 ```toml
 [dependencies]
-grok-build-sdk = { git = "https://github.com/fran0220/grok-build-sdk", tag = "v0.2.0" }
+sophon-sdk = { git = "https://github.com/fran0220/sophon-sdk", tag = "v0.2.0" }
 ```
 
 ## Contributing

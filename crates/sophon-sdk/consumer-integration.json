@@ -1,0 +1,74 @@
+{
+  "manifest_version": 1,
+  "sdk": { "source": "https://github.com/fran0220/sophon-sdk", "revision_policy": "replace SDK_REVISION with an immutable commit", "revision": "SDK_REVISION" },
+  "facade_version": 2,
+  "run_schema_version": 4,
+  "schema_contracts": {
+    "run": {
+      "marker": "xai-agent-lifecycle.run-envelope",
+      "version": 4,
+      "max_envelope_bytes": 16777216,
+      "commit_preparation": "StoreCommit::validate_and_encode",
+      "policy": "persist marker+version; reject missing, older, newer, malformed, or unvalidated state"
+    },
+    "session_evidence": {
+      "marker": "sophon-sdk.session-evidence",
+      "version": 1,
+      "max_document_bytes": 8388608,
+      "cas_digest": "lowercase sha256 over exact payload bytes, prefixed sha256:",
+      "cas_revision": "absent -> 1; present -> checked current+1",
+      "successor_helper": "SessionEvidenceVersion::successor",
+      "policy": "compare revision+digest atomically; returned Committed version must equal SDK-computed successor"
+    },
+    "session_state": {
+      "marker": "sophon-sdk.session-log",
+      "version": 1,
+      "max_object_bytes": 67108864,
+      "max_manifest_bytes": 65536,
+      "target_transcript_segment_bytes": 4194304,
+      "contents": ["transcript_segment_chain_record", "checkpoint_payload", "rewind_operation_payload", "checkpoint_publication_chain_record", "rewind_publication_chain_record", "cas_manifest", "tombstone"],
+      "commit_preparation": "PreparedManifestCas::new",
+      "delete_preparation": "PreparedSessionDelete::new",
+      "status": "production authority when injected through RuntimeBuilder::session_state_store; sole durable source for native transcript/history, rewind state, and compaction checkpoints",
+      "policy": "current-only key+generation-scoped bounded objects and manifest; no GC API; immutable sha256 objects; full expected live document plus validated suffix; compare manifest revision+digest atomically; tombstones prevent ABA; reconcile CommitUnknown by exact authoritative load"
+    }
+  },
+  "migration_policy": "current-only fail-closed; breaking durable schemas require explicit offline migration or deliberate discard before Runtime startup",
+  "async_openai_patch": { "git": "https://github.com/our-forks/async-openai.git", "rev": "95b52ebdedf42143083cf3d6f0e0be7c84e9c808" },
+  "required_host_traits": ["RunStore", "SessionEvidenceStore", "SessionStateStore", "ArtifactStore", "GateProvider", "GoalVerifier", "ApprovalHandler", "TelemetrySink", "ProgramRuntime"],
+  "storage_policy": {
+    "production_authorities": ["RunStore", "SessionEvidenceStore", "SessionStateStore"],
+    "injection": "replaces local defaults; never mirror, write-through, or double-write",
+    "session_evidence": ["SessionLedger", "rewind_intent_or_receipt", "harness_turn_binding"],
+    "host_actions": ["provision", "transactional_revision_and_digest_cas", "migrate_offline", "encrypt", "backup", "manage_lifecycle", "inspect_residency_on_restart", "rearm_deadline_timer", "request_wake_on_timer", "claim_worker_lease", "renew_or_release_worker_lease"],
+    "run_store_commit": "call StoreCommit::validate_and_encode first and atomically CAS expected_revision while storing its prepared envelope and optional finished iteration",
+    "commit_unknown": "fail closed and reconcile by authoritative load; never blindly redispatch",
+    "session_state": ["native_transcript_history", "native_rewind_state", "compaction_checkpoints"],
+    "native_filesystem_remains": ["uncovered_shell_sidecars", "native_terminal_process_and_tool_state"],
+    "event_delivery": "bounded in-memory, not durable evidence"
+  },
+  "public_signatures": {
+    "RunStore": "load(&RunId)->Result<Option<RunEnvelope>,RunError>; list()->Result<Vec<RunEnvelope>,RunError>; commit(StoreCommit)->Result<StoreCommitResult,RunError>",
+    "RunCommitPreparation": "StoreCommit::validate_and_encode(&self)->Result<PreparedStoreCommit,RunError>",
+    "SessionEvidenceStore": "load(&SessionEvidenceKey)->Result<Option<SessionEvidenceDocument>,SessionEvidenceStoreError>; compare_and_swap(&SessionEvidenceKey,Option<&SessionEvidenceVersion>,&[u8])->Result<SessionEvidenceCommit,SessionEvidenceStoreError>",
+    "SessionStateStore": "inspect_slot(&SessionKey)->SessionSlot; load_object(&SessionKey,&SessionGeneration,&SessionObjectId)->Option<SessionObject>; put_object(SessionObject)->ObjectPut; compare_and_swap_manifest(PreparedManifestCas)->ManifestCas; compare_and_delete(PreparedSessionDelete)->SessionDelete",
+    "SessionStateConformance": "run_session_state_conformance; run_session_state_fault_conformance",
+    "StoreInjection": "RuntimeBuilder::run_store(Arc<dyn RunStore>); RuntimeBuilder::session_evidence_store(Arc<dyn SessionEvidenceStore>); RuntimeBuilder::session_state_store(Arc<dyn SessionStateStore>)",
+    "CallerSelectedSession": "Runtime::create_session_with_id(SessionId,SessionConfig)->Result<SessionId,Error>; exact-config retry is idempotent; config drift, tombstone, replay gap, and missing Host authority fail closed",
+    "Residency": "inspect_run_residency; request_run_wake; claim_run_activation; renew_run_activation; release_run_activation; AutonomousTurnLoop::activate_claimed",
+    "ChildMailbox": "admit_run_child; settle_run_child; accept_run_message; transition_run_message; get_run/attach_run for list/join projection",
+    "Harness": "inspect_harness; propose_harness; validate_harness; activate_harness; rollback_harness",
+    "ProgramRuntime": "execute(&self,ProgramIntent,&CredentialRef)->ProgramReceipt; reconcile(&self,&OperationId)->ProgramRecovery; cancel(&self,&ProgramHandle)",
+    "ProgramFacade": "Runtime::execute_program; Runtime::reconcile_program"
+  },
+  "product_wiring": {
+    "scheduler_lease": "ready: Host timer/worker claims durable lease and calls activate_claimed; shell scheduler is not authority",
+    "child_mailbox": "ready for Host placement adapter: durable admission/budget/fenced callbacks/mailbox are authoritative; shell coordinator must only adapt",
+    "program_runtime": "ready when Host implements ProgramRuntime and ArtifactStore; intent-before-execute and uncertain reconciliation are wired",
+    "persistent_kernel": "contract only: Host must implement driver; VM snapshot is not durable truth and no built-in kernel ships",
+    "rhai_workflow": "not product-ready: bounded native Rhai Run driver remains unavailable",
+    "native_compaction": "not fully product-wired: ProgramContext supports durable checkpoint/skill pins, but native shell compaction is not a Run driver"
+  },
+  "run_actions": ["pause", "pause_for", "resume", "steer", "cancel", "approve", "reject", "try_complete", "claim_terminal_report", "tombstone"],
+  "run_events": ["run_created", "run_controlled", "run_woken", "wake_requested", "activation_claimed", "activation_renewed", "activation_released", "recovery_started", "recovery_abandon", "recovery_finished", "iteration_started", "iteration_finished", "harness_proposed", "harness_validated", "harness_activated", "harness_rolled_back", "child_admitted", "child_transitioned", "message_accepted", "message_transitioned", "effect_committed", "effect_claimed", "effect_acknowledged", "effect_reconciled", "strategy_proposed", "strategy_applied", "workflow_proposed", "workflow_validated", "workflow_applied", "workflow_rolled_back"]
+}

@@ -893,12 +893,12 @@ release.
 ## 7. What shipped
 
 Every §5 recommendation was adopted as written, and §6.2 was closed with option
-(a). The contract lives in `crates/grok-build-sdk/src/kernel.rs`, its reference
+(a). The contract lives in `crates/sophon-sdk/src/kernel.rs`, its reference
 backend in `src/kernel/local.rs` (durable records in
 `src/kernel/local/records.rs`), its conformance suite in
 `src/kernel/conformance.rs`, the bounded driver in `src/workflow.rs`, and the
 scriptable kernel the suite runs against in `src/bin/kernel_fixture.rs`. The
-Host-facing tests are `crates/grok-build-sdk/tests/kernel_runtime.rs`.
+Host-facing tests are `crates/sophon-sdk/tests/kernel_runtime.rs`.
 
 ### 7.1 Departures from the sketch
 
