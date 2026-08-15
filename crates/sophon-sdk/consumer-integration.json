@@ -22,7 +22,7 @@
     },
     "session_state": {
       "marker": "sophon-sdk.session-log",
-      "version": 1,
+      "version": 2,
       "max_object_bytes": 67108864,
       "max_manifest_bytes": 65536,
       "target_transcript_segment_bytes": 4194304,

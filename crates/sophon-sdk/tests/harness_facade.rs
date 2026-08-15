@@ -414,7 +414,7 @@ async fn provider_wire_and_receipt_bind_complete_harness_and_effective_route_acr
             .unwrap()
             .sequence
     );
-    assert_eq!(first.sdk_provenance().facade_version(), "0.2.0");
+    assert_eq!(first.sdk_provenance().facade_version(), "0.3.0");
     assert!(first.binding_id().starts_with("sha256:"));
     let encoded = serde_json::to_vec(&first).unwrap();
     assert_eq!(

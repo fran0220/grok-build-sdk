@@ -801,5 +801,5 @@ without relying on a moving branch:
 
 ```toml
 [dependencies]
-sophon-sdk = { git = "https://github.com/fran0220/sophon-sdk", tag = "v0.2.0" }
+sophon-sdk = { git = "https://github.com/fran0220/sophon-sdk", tag = "v0.3.0" }
 ```

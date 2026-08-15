@@ -89,7 +89,7 @@ fn ledger_turn_state_preserves_tagged_camel_case_wire_shape() {
 #[test]
 fn provenance_is_exact_and_never_unknown() {
     let provenance = source_provenance();
-    assert_eq!(provenance.upstream_release, "1.0.1");
+    assert_eq!(provenance.upstream_release, "1.0.3");
     assert_eq!(provenance.facade_version, env!("CARGO_PKG_VERSION"));
     assert_eq!(provenance.fork_commit.len(), 40);
     assert!(

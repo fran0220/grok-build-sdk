@@ -12,7 +12,7 @@ pub struct SourceProvenance {
 }
 pub fn source_provenance() -> SourceProvenance {
     SourceProvenance {
-        upstream_release: "1.0.1",
+        upstream_release: "1.0.3",
         fork_commit: env!("SOPHON_SDK_COMMIT"),
         upstream_source_rev: include_str!("../../../SOURCE_REV").trim(),
         facade_version: env!("CARGO_PKG_VERSION"),
