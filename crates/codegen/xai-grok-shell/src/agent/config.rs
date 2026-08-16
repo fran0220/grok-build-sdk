@@ -1952,21 +1952,25 @@ impl Config {
         cfg.origin_embedded = true;
         cfg.endpoints = EndpointsConfig::origin_embedded();
         cfg.features.telemetry = Some(TelemetryMode::Disabled);
-        cfg.features.feedback = Some(false);
         cfg.features.managed_config = Some(false);
-        cfg.features.web_fetch = Some(false);
-        cfg.features.session_recap = Some(false);
-        cfg.features.turn_summary = Some(false);
+        for feature in [
+            Feature::Feedback,
+            Feature::WebFetch,
+            Feature::SessionRecap,
+            Feature::TurnSummary,
+            Feature::AutoWake,
+        ] {
+            cfg.feature_values.insert(feature, false);
+        }
         cfg.telemetry.trace_upload = Some(false);
         cfg.workflows.enabled = Some(false);
         cfg.cli.auto_update = Some(false);
         cfg.session.load_envrc = Some(false);
         cfg.disable_web_search = true;
-        cfg.cli_no_memory = true;
+        cfg.memory_enabled_override = Some(false);
         cfg.memory_config = None;
         cfg.managed_mcps_enabled = false;
         cfg.managed_mcp_gateway_tools_enabled = false;
-        cfg.auto_wake_enabled = false;
         cfg.remote_settings = None;
         cfg.announcements.clear();
         cfg.marketplace.sources.clear();
@@ -1986,7 +1990,7 @@ impl Config {
         cfg.origin_embedded = true;
         cfg.endpoints = EndpointsConfig::origin_embedded();
         cfg.features.telemetry = Some(TelemetryMode::Disabled);
-        cfg.features.feedback = Some(false);
+        cfg.feature_values.insert(Feature::Feedback, false);
         cfg.features.managed_config = Some(false);
         cfg.telemetry.trace_upload = Some(false);
         cfg.cli.auto_update = Some(false);
@@ -2018,16 +2022,17 @@ mod origin_embedded_tests {
         let cfg = Config::origin_embedded();
         assert!(cfg.origin_embedded);
         assert_eq!(cfg.features.telemetry, Some(TelemetryMode::Disabled));
-        assert_eq!(cfg.features.feedback, Some(false));
+        assert!(!cfg.is_feature_enabled(Feature::Feedback));
         assert_eq!(cfg.features.managed_config, Some(false));
-        assert_eq!(cfg.features.web_fetch, Some(false));
-        assert_eq!(cfg.features.session_recap, Some(false));
-        assert_eq!(cfg.features.turn_summary, Some(false));
+        assert!(!cfg.is_feature_enabled(Feature::WebFetch));
+        assert!(!cfg.is_feature_enabled(Feature::SessionRecap));
+        assert!(!cfg.is_feature_enabled(Feature::TurnSummary));
         assert_eq!(cfg.telemetry.trace_upload, Some(false));
         assert_eq!(cfg.session.load_envrc, Some(false));
         assert!(cfg.disable_web_search);
+        assert_eq!(cfg.memory_enabled_override, Some(false));
         assert!(!cfg.managed_mcps_enabled);
-        assert!(!cfg.auto_wake_enabled);
+        assert!(!cfg.is_feature_enabled(Feature::AutoWake));
         assert!(cfg.marketplace.sources.is_empty());
         assert_eq!(cfg.workflows.enabled, Some(false));
         assert_eq!(cfg.agent.name.as_deref(), Some("grok-build"));
@@ -2039,7 +2044,7 @@ mod origin_embedded_tests {
     fn normal_defaults_keep_normal_startup_gates() {
         let cfg = Config::default();
         assert!(cfg.managed_mcps_enabled);
-        assert!(cfg.auto_wake_enabled);
+        assert!(cfg.is_feature_enabled(Feature::AutoWake));
         assert!(!cfg.disable_web_search);
     }
 
@@ -2049,12 +2054,12 @@ mod origin_embedded_tests {
             Config::defaults_without_env().marketplace.sources.len();
         let cfg = Config::origin_desktop();
         assert!(cfg.origin_embedded);
-        assert_ne!(cfg.features.web_fetch, Some(false));
+        assert_ne!(cfg.feature_values.get(&Feature::WebFetch), Some(&false));
         assert!(!cfg.disable_web_search);
-        assert!(!cfg.cli_no_memory);
+        assert_ne!(cfg.memory_enabled_override, Some(false));
         assert_ne!(cfg.workflows.enabled, Some(false));
         assert!(cfg.managed_mcps_enabled);
-        assert!(cfg.auto_wake_enabled);
+        assert!(cfg.is_feature_enabled(Feature::AutoWake));
         assert_eq!(
             cfg.marketplace.sources.len(),
             default_marketplace_source_count
