@@ -1042,8 +1042,33 @@ impl Runtime {
         target: SessionId,
         request: ExtensionRequest,
     ) -> Result<ExtensionResponse, Error> {
-        self.call(|reply| Command::Fork(source, target, request, reply))
-            .await
+        self.call(|reply| {
+            Command::Fork(
+                source,
+                target,
+                request,
+                crate::session::ForkSessionPublication::Create,
+                reply,
+            )
+        })
+        .await
+    }
+    pub async fn fork_session_create_or_verify(
+        &self,
+        source: SessionId,
+        target: SessionId,
+        request: ExtensionRequest,
+    ) -> Result<ExtensionResponse, Error> {
+        self.call(|reply| {
+            Command::Fork(
+                source,
+                target,
+                request,
+                crate::session::ForkSessionPublication::CreateOrVerify,
+                reply,
+            )
+        })
+        .await
     }
     pub async fn extension_notification(&self, x: ExtensionNotification) -> Result<(), Error> {
         self.call(|r| Command::ExtensionNotification(x, r)).await

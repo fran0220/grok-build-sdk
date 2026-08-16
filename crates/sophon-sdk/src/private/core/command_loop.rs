@@ -206,8 +206,8 @@ impl Core {
                 Command::Extension(x, r) => {
                     let _ = r.send(self.extension_raw(x).await);
                 }
-                Command::Fork(source, target, request, reply) => {
-                    let _ = reply.send(self.fork(source, target, request).await);
+                Command::Fork(source, target, request, publication, reply) => {
+                    let _ = reply.send(self.fork(source, target, request, publication).await);
                 }
                 Command::ExtensionNotification(x, r) => {
                     let _ = r.send(self.extension_notification(x).await);

@@ -35,6 +35,10 @@ pub struct ForkSessionRequest {
     /// The original workspace directory this worktree session was spawned from.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_workspace_dir: Option<String>,
+    /// Retry a caller-selected target by proving that its existing native
+    /// publication came from this exact source snapshot and request.
+    #[serde(default)]
+    pub create_or_verify: bool,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -118,6 +122,7 @@ pub async fn fork_session(
                 &source_info,
                 &target_info,
                 options,
+                request.create_or_verify,
             )
         } else {
             storage.copy_session_data_sync(&source_info, &target_info, options)
@@ -183,6 +188,7 @@ fn copy_authority_fork(
     source_info: &Info,
     target_info: &Info,
     options: CopySessionOptions,
+    create_or_verify: bool,
 ) -> io::Result<crate::session::storage::CopySessionResult> {
     use crate::session::state_authority::{
         ReplayRecord, RewindOperation, SessionIdentity, SessionInspection,
@@ -191,19 +197,6 @@ fn copy_authority_fork(
         filter_rewind_by, rewind_step_for_update, truncate_for_prompt_by,
     };
 
-    if !matches!(
-        authority
-            .inspect(target_info.id.0.as_ref())
-            .map_err(|e| io::Error::other(e.to_string()))?,
-        SessionInspection::Vacant
-    ) {
-        return Err(io::Error::other("fork target identity already exists"));
-    }
-    if storage.session_dir(target_info).exists() {
-        return Err(io::Error::other(
-            "fork target sidecar directory already exists",
-        ));
-    }
     let generation = match authority
         .inspect(source_info.id.0.as_ref())
         .map_err(|e| io::Error::other(e.to_string()))?
@@ -214,7 +207,7 @@ fn copy_authority_fork(
     let source = authority
         .open(SessionIdentity {
             identity: source_info.id.0.to_string(),
-            generation,
+            generation: generation.clone(),
         })
         .map_err(|e| io::Error::other(e.to_string()))?;
     let mut records = Vec::new();
@@ -344,6 +337,71 @@ fn copy_authority_fork(
                 .collect::<Vec<_>>(),
         )
         .len();
+    #[derive(serde::Serialize)]
+    #[serde(rename_all = "camelCase")]
+    struct ForkPublicationProof<'a> {
+        schema: &'static str,
+        source_session_id: &'a str,
+        source_generation: &'a str,
+        source_cwd: &'a str,
+        target_session_id: &'a str,
+        new_cwd: &'a str,
+        new_model_id: &'a Option<String>,
+        target_prompt_index: Option<usize>,
+        session_kind: &'a Option<String>,
+        source_workspace_dir: &'a Option<String>,
+        records: &'a [ReplayRecord],
+    }
+    let target_generation = if create_or_verify {
+        use sha2::{Digest as _, Sha256};
+        let proof = serde_json::to_vec(&ForkPublicationProof {
+            schema: "xai.native-session-fork/1",
+            source_session_id: source_info.id.0.as_ref(),
+            source_generation: &generation,
+            source_cwd: &source_info.cwd,
+            target_session_id: target_info.id.0.as_ref(),
+            new_cwd: &target_info.cwd,
+            new_model_id: &options.new_model_id,
+            target_prompt_index: options.target_prompt_index,
+            session_kind: &options.session_kind,
+            source_workspace_dir: &options.source_workspace_dir,
+            records: &prepared,
+        })
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        format!("fork-sha256:{:x}", Sha256::digest(proof))
+    } else {
+        uuid::Uuid::now_v7().to_string()
+    };
+    match authority
+        .inspect(target_info.id.0.as_ref())
+        .map_err(|error| io::Error::other(error.to_string()))?
+    {
+        SessionInspection::Live {
+            generation: current,
+        } if create_or_verify && current == target_generation => {
+            return storage.verify_fork_sidecars_sync(
+                target_info,
+                updates_copied,
+                chat_messages_copied,
+            );
+        }
+        SessionInspection::Vacant => {}
+        SessionInspection::Live { .. } => {
+            return Err(io::Error::other(
+                "fork target identity already exists with a different source snapshot or request",
+            ));
+        }
+        SessionInspection::Tombstoned { .. } => {
+            return Err(io::Error::other(
+                "fork target identity is permanently tombstoned",
+            ));
+        }
+    }
+    if storage.session_dir(target_info).exists() {
+        return Err(io::Error::other(
+            "fork target sidecar directory already exists without an authoritative publication",
+        ));
+    }
     let sidecars = storage.copy_fork_sidecars_sync(
         source_info,
         target_info,
@@ -354,7 +412,7 @@ fn copy_authority_fork(
     if let Err(error) = authority.publish_fork(
         SessionIdentity {
             identity: target_info.id.0.to_string(),
-            generation: uuid::Uuid::now_v7().to_string(),
+            generation: target_generation,
         },
         prepared,
     ) {
@@ -483,14 +541,28 @@ mod tests {
     impl crate::session::state_authority::NativeSessionStateAuthority for ForkAuthority {
         fn inspect(
             &self,
-            _: &str,
+            identity: &str,
         ) -> Result<
             crate::session::state_authority::SessionInspection,
             crate::session::state_authority::AuthorityError,
         > {
-            Ok(crate::session::state_authority::SessionInspection::Live {
-                generation: self.source.id.generation.clone(),
-            })
+            if identity == self.source.id.identity {
+                return Ok(crate::session::state_authority::SessionInspection::Live {
+                    generation: self.source.id.generation.clone(),
+                });
+            }
+            Ok(self
+                .published
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|(id, _)| id.identity == identity)
+                .map_or(
+                    crate::session::state_authority::SessionInspection::Vacant,
+                    |(id, _)| crate::session::state_authority::SessionInspection::Live {
+                        generation: id.generation.clone(),
+                    },
+                ))
         }
         fn create(
             &self,
@@ -599,6 +671,7 @@ mod tests {
                     target_prompt_index: cut,
                     ..Default::default()
                 },
+                false,
             )
             .unwrap();
             let published = authority.published.lock().unwrap();

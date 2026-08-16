@@ -35,7 +35,7 @@ pub struct ReplayCursor {
 }
 
 #[doc(hidden)]
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub enum RewindOperation {
     AppendPoint { index: u64, payload: Vec<u8> },
     Truncate { index: u64, payload: Vec<u8> },
@@ -43,7 +43,7 @@ pub enum RewindOperation {
 }
 
 #[doc(hidden)]
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub enum ReplayRecord {
     Update(Vec<u8>),
     Checkpoint {
@@ -81,14 +81,14 @@ pub enum NativeCompactionOwner {
 }
 
 #[doc(hidden)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
 pub enum NativeCompactionReason {
     Manual,
     AutomaticThreshold,
 }
 
 #[doc(hidden)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
 pub enum NativeCompactionRequestPath {
     SinglePassVerbatim,
     SinglePassFitted,
@@ -98,7 +98,7 @@ pub enum NativeCompactionRequestPath {
 
 /// One content-free leaf digest over exact canonical semantic request bytes.
 #[doc(hidden)]
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct NativeCompactionDigestFacts {
     pub digest: String,
     pub size_bytes: u64,
@@ -159,7 +159,7 @@ pub struct NativeCompactionPublicationRecord {
 /// Complete content-free metadata required to preserve a historical
 /// compaction publication across a native Session fork.
 #[doc(hidden)]
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct NativeCompactionReplayRecord {
     pub compaction_id: String,
     pub owner: NativeCompactionReplayOwner,
@@ -177,7 +177,7 @@ pub struct NativeCompactionReplayRecord {
 }
 
 #[doc(hidden)]
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub enum NativeCompactionReplayOwner {
     Session {
         session_id: String,
@@ -196,7 +196,7 @@ pub enum NativeCompactionReplayOwner {
 }
 
 #[doc(hidden)]
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct NativeCompactionBase {
     pub session_id: String,
     pub generation: String,

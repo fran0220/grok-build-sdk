@@ -129,6 +129,7 @@ enum Command {
         SessionId,
         SessionId,
         ExtensionRequest,
+        crate::session::ForkSessionPublication,
         Reply<ExtensionResponse>,
     ),
     ExtensionNotification(ExtensionNotification, Reply<()>),

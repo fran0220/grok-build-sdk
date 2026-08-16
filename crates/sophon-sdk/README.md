@@ -194,11 +194,16 @@ operations; the SDK-owned adapter alone owns chunking, bounded chain traversal,
 immutable object staging, CAS publication, and exact `CommitUnknown`
 reconciliation. Conflict, corruption, missing/oversized objects, replay gaps,
 or unresolved acknowledgement uncertainty fail closed. Checkpoint markers and
-payloads, and rewind markers and operations, publish atomically. Full and
-partial forks receive fresh generations. `Runtime::create_session_with_id`
-derives a generation from the exact `SessionConfig`, so retrying the same UUID
-and config after an unknown acknowledgement reopens idempotently, while config
-drift and tombstones are rejected.
+payloads, and rewind markers and operations, publish atomically. Create-only
+full and partial forks receive fresh generations.
+`Runtime::fork_session_create_or_verify` instead requires a caller-selected
+target and derives its generation from the exact source generation, retained
+replay records, cut, and target configuration. A Host can therefore repeat a
+durable fork request after losing the successful response; an exact publication
+is returned, while source or configuration drift, an unrelated live target,
+and tombstones fail closed. `Runtime::create_session_with_id` similarly derives
+a generation from the exact `SessionConfig`, so retrying the same UUID and
+config after an unknown acknowledgement reopens idempotently.
 
 ### Native Session compaction evidence
 
@@ -550,7 +555,7 @@ The SDK does not wrap the TUI. It exposes the stateful agent actor below it:
 | Built-ins, skills and workflows | `list_agent_commands` / `execute_agent_command` |
 | `/implement` | A dynamically discovered skill; it appears as `implement` in the live command catalog and executes through the standard agent-turn path |
 | `/loop` | Direct typed scheduler CRUD via `upsert_scheduled_task`, `list_scheduled_tasks` and `delete_scheduled_task`; the model-interpreted slash command remains discoverable too |
-| Session fork and worktree resume | `fork_session` / `resume_session_in_worktree` |
+| Session fork and worktree resume | `fork_session`, crash-retryable `fork_session_create_or_verify`, and `resume_session_in_worktree` |
 | Workflow discovery | `list_workflows` |
 | Subagent execution | Model-driven task tools in a normal Turn; live inspection and cancellation via `list_running_subagents`, `get_subagent` and `cancel_subagent` |
 | Tool approval policy | `ToolPermissionHandler`; selected option IDs are checked against the agent's request before they are accepted |

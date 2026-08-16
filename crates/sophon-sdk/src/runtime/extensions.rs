@@ -252,31 +252,76 @@ impl Runtime {
         source: &SessionId,
         request: &ForkSessionRequest,
     ) -> Result<ForkSessionReceipt, Error> {
+        self.fork_session_with_publication(
+            source,
+            request,
+            crate::session::ForkSessionPublication::Create,
+        )
+        .await
+    }
+    /// Creates a caller-selected persisted conversation branch, or returns the
+    /// exact prior publication when the same request committed before its
+    /// response was lost. Any difference in source snapshot, cut, or target
+    /// configuration fails closed. The returned child is not resident until
+    /// the host calls [`Runtime::load_session`].
+    pub async fn fork_session_create_or_verify(
+        &self,
+        source: &SessionId,
+        request: &ForkSessionRequest,
+    ) -> Result<ForkSessionReceipt, Error> {
+        if request.new_session_id.is_none() {
+            return Err(Error::InvalidConfig(
+                "create-or-verify fork requires a caller-selected target session id".into(),
+            ));
+        }
+        self.fork_session_with_publication(
+            source,
+            request,
+            crate::session::ForkSessionPublication::CreateOrVerify,
+        )
+        .await
+    }
+    async fn fork_session_with_publication(
+        &self,
+        source: &SessionId,
+        request: &ForkSessionRequest,
+        publication: crate::session::ForkSessionPublication,
+    ) -> Result<ForkSessionReceipt, Error> {
         let target = request
             .new_session_id
             .clone()
             .unwrap_or_else(|| uuid::Uuid::now_v7().to_string());
-        let value = self
-            .inner
-            .fork_session(
-                source.clone(),
-                SessionId::from_stored(target.clone()),
-                ExtensionRequest {
-                    method: "x.ai/session/fork".into(),
-                    params: serde_json::json!({
-                    "sourceSessionId": source.as_str(),
-                    "sourceCwd": request.source_cwd,
-                    "newCwd": request.new_cwd,
-                    "newSessionId": target,
-                    "newModelId": request.new_model_id,
-                    "targetPromptIndex": request.target_prompt_index,
-                    "sessionKind": request.session_kind,
-                    "sourceWorkspaceDir": request.source_workspace_dir
-                    }),
-                },
-            )
-            .await?
-            .result;
+        let extension = ExtensionRequest {
+            method: "x.ai/session/fork".into(),
+            params: serde_json::json!({
+            "sourceSessionId": source.as_str(),
+            "sourceCwd": request.source_cwd,
+            "newCwd": request.new_cwd,
+            "newSessionId": target,
+            "newModelId": request.new_model_id,
+            "targetPromptIndex": request.target_prompt_index,
+            "sessionKind": request.session_kind,
+            "sourceWorkspaceDir": request.source_workspace_dir,
+            "createOrVerify": publication == crate::session::ForkSessionPublication::CreateOrVerify
+            }),
+        };
+        let response = match publication {
+            crate::session::ForkSessionPublication::Create => {
+                self.inner
+                    .fork_session(source.clone(), SessionId::from_stored(target), extension)
+                    .await?
+            }
+            crate::session::ForkSessionPublication::CreateOrVerify => {
+                self.inner
+                    .fork_session_create_or_verify(
+                        source.clone(),
+                        SessionId::from_stored(target),
+                        extension,
+                    )
+                    .await?
+            }
+        };
+        let value = response.result;
         serde_json::from_value(value)
             .map_err(|e| Error::Operation(format!("invalid session/fork response: {e}")))
     }

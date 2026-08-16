@@ -548,6 +548,102 @@ async fn shared_store_fences_admission_from_unload_through_tombstone() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fork_create_or_verify_recovers_a_lost_response_and_rejects_different_proofs() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let server = MockInferenceServer::start().await.expect("mock server");
+    let root = TempDir::new().expect("temp root");
+    let workspace = root.path().join("workspace");
+    let child_workspace = root.path().join("child-workspace");
+    std::fs::create_dir(&workspace).expect("workspace");
+    std::fs::create_dir(&child_workspace).expect("child workspace");
+    let config = runtime_config(&root, server.url());
+    let store = Arc::new(
+        LocalSessionStateStore::new(root.path().join("host-state")).expect("Host Session store"),
+    );
+    let (runtime, _) = Runtime::builder(config.clone())
+        .session_state_store(store.clone())
+        .start()
+        .await
+        .expect("Runtime starts");
+    let source = runtime
+        .create_session(session_config(workspace.clone()))
+        .await
+        .expect("source session");
+    runtime
+        .prompt(&source, "fork-source-turn", "source state")
+        .await
+        .expect("source turn settles");
+    runtime
+        .unload_session(source.clone())
+        .await
+        .expect("source unloads");
+    let target = uuid::Uuid::now_v7().to_string();
+    let request = ForkSessionRequest {
+        source_cwd: workspace.clone(),
+        new_cwd: child_workspace.clone(),
+        new_session_id: Some(target.clone()),
+        new_model_id: None,
+        target_prompt_index: None,
+        session_kind: Some("derived".into()),
+        source_workspace_dir: Some(workspace.clone()),
+    };
+    let committed = runtime
+        .fork_session_create_or_verify(&source, &request)
+        .await
+        .expect("initial fork commits");
+    // Simulate a response lost after commit: discard it, restart every SDK
+    // process-local component, and retry only from the durable request.
+    runtime.shutdown().await.expect("Runtime shuts down");
+
+    let (runtime, _) = Runtime::builder(config)
+        .session_state_store(store)
+        .start()
+        .await
+        .expect("Runtime restarts");
+    let recovered = runtime
+        .fork_session_create_or_verify(&source, &request)
+        .await
+        .expect("exact retry verifies the committed fork");
+    assert_eq!(recovered, committed);
+    assert_eq!(recovered.new_session_id.as_str(), target);
+
+    let mut different_config = request.clone();
+    different_config.new_cwd = root.path().join("different-child-workspace");
+    assert!(
+        runtime
+            .fork_session_create_or_verify(&source, &different_config)
+            .await
+            .is_err(),
+        "the same target must reject different target configuration"
+    );
+    assert!(
+        runtime.fork_session(&source, &request).await.is_err(),
+        "the original create-only API must retain strict target collision behavior"
+    );
+
+    runtime
+        .load_session(source.clone(), session_config(workspace))
+        .await
+        .expect("source reloads");
+    runtime
+        .prompt(&source, "fork-source-later-turn", "later source state")
+        .await
+        .expect("later source turn settles");
+    runtime
+        .unload_session(source.clone())
+        .await
+        .expect("advanced source unloads");
+    assert!(
+        runtime
+            .fork_session_create_or_verify(&source, &request)
+            .await
+            .is_err(),
+        "a source snapshot that advanced after the commit must not verify"
+    );
+    runtime.shutdown().await.expect("Runtime shuts down");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn fork_holds_unloaded_source_and_target_leases_through_publication() {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let server = MockInferenceServer::start().await.expect("mock server");

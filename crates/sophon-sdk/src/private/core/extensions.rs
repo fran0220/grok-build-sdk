@@ -141,10 +141,18 @@ impl Core {
         source: SessionId,
         target: SessionId,
         request: ExtensionRequest,
+        publication: crate::session::ForkSessionPublication,
     ) -> Result<ExtensionResponse, Error> {
         if source == target {
             return Err(Error::InvalidConfig(
                 "fork source and target must be different".into(),
+            ));
+        }
+        if publication == crate::session::ForkSessionPublication::CreateOrVerify
+            && self.session_state_store.is_none()
+        {
+            return Err(Error::InvalidConfig(
+                "create-or-verify fork requires a Host session state authority".into(),
             ));
         }
         // The store leases are fail-fast. Acquire absent identities in stable

@@ -357,6 +357,31 @@ impl JsonlStorageAdapter {
         })
     }
 
+    /// Reconstructs a fork receipt after the native authority proves that the
+    /// exact publication already committed. Sidecars are deliberately not
+    /// rewritten: once a child is visible they may contain newer session
+    /// state, while the immutable native generation remains the retry proof.
+    pub(crate) fn verify_fork_sidecars_sync(
+        &self,
+        target_info: &Info,
+        updates_copied: usize,
+        chat_messages_copied: usize,
+    ) -> io::Result<CopySessionResult> {
+        self.read_summary_sync(target_info)?;
+        let target_dir = self.session_dir(target_info);
+        Ok(CopySessionResult {
+            chat_messages_copied,
+            updates_copied,
+            plan_state_copied: self.plan_file(target_info).is_file(),
+            plan_mode_state_copied: self.plan_mode_state_file(target_info).is_file(),
+            signals_copied: self.signals_file(target_info).is_file(),
+            tool_state_copied: target_dir.join("tool_state.json").is_file(),
+            announcement_state_copied: self.announcement_state_file(target_info).is_file(),
+            compaction_segments_copied: 0,
+            compaction_checkpoints_copied: 0,
+        })
+    }
+
     /// Fully synchronous implementation of `copy_session_data`, for use on a
     /// blocking thread; every caller reaches it through `spawn_blocking`.
     pub(crate) fn copy_session_data_sync(

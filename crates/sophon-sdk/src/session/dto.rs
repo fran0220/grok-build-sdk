@@ -40,6 +40,12 @@ pub struct ForkSessionReceipt {
     pub new_model_id: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ForkSessionPublication {
+    Create,
+    CreateOrVerify,
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum WorktreeCopyMode {
