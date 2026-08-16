@@ -482,7 +482,12 @@ pub struct RuntimeOptions {
     pub tool_permission_handler: Option<Arc<dyn ToolPermissionHandler>>,
     pub mcp_host_services: xai_grok_mcp::servers::McpHostServices,
     pub mcp_elicitation_ui: Option<Arc<dyn McpElicitationUi>>,
+    /// In-process MCP servers mounted on every Desktop Session. Retained for
+    /// compatibility with the original Runtime-wide registration contract.
     pub in_process_mcp_servers: Vec<InProcessMcpServer>,
+    /// In-process endpoints available for selection by Session capability
+    /// layers. Registration alone does not mount these endpoints.
+    pub session_in_process_mcp_servers: Vec<InProcessMcpServer>,
     pub agent_hooks: Vec<AgentHookRegistration>,
 }
 impl Default for RuntimeOptions {
@@ -503,6 +508,7 @@ impl Default for RuntimeOptions {
             mcp_host_services: xai_grok_mcp::servers::McpHostServices::default(),
             mcp_elicitation_ui: None,
             in_process_mcp_servers: Vec::new(),
+            session_in_process_mcp_servers: Vec::new(),
             agent_hooks: Vec::new(),
         }
     }

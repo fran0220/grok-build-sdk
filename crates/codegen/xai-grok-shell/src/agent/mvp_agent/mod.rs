@@ -1478,7 +1478,7 @@ impl MvpAgent {
         *self.embedded_mcp.borrow_mut() = Some((servers, invoker));
     }
 
-    pub(super) fn embedded_mcp_servers(
+    pub(crate) fn embedded_mcp_servers(
         &self,
     ) -> Option<(
         Vec<xai_grok_mcp::servers::AcpServerEntry>,

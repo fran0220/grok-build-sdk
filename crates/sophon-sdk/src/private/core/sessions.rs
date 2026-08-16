@@ -132,6 +132,36 @@ impl Core {
             .map(to_embedded_mcp_server)
             .collect()
     }
+
+    /// Runtime-wide registrations remain mounted for compatibility; selected
+    /// registrations are added only for the effective Session layer.
+    pub(super) fn in_process_mcp_servers_for(
+        &self,
+        capabilities: &ResolvedCapabilities,
+    ) -> Vec<EmbeddedMcpRegistration> {
+        if self.options.profile == crate::RuntimeProfile::Restricted {
+            return Vec::new();
+        }
+        self.options
+            .in_process_mcp_servers
+            .iter()
+            .chain(
+                capabilities
+                    .in_process_mcp_services
+                    .iter()
+                    .filter_map(|name| {
+                        self.options
+                            .session_in_process_mcp_servers
+                            .iter()
+                            .find(|server| server.name == *name)
+                    }),
+            )
+            .map(|server| EmbeddedMcpRegistration {
+                name: server.name.clone(),
+                server_id: server.server_id.clone(),
+            })
+            .collect()
+    }
     pub(super) fn emit(&self, id: &SessionId, u: EventUpdate, t: Option<String>) {
         let event = self.retain_event(id, u, t);
         self.publish_event(event);
@@ -295,6 +325,7 @@ impl Core {
             effective_reasoning.clone(),
             harness_digest,
             capabilities.resolution.clone(),
+            capabilities.in_process_mcp_services.clone(),
         );
         let mut meta = self.session_meta(&config, effective_reasoning.as_deref(), &capabilities)?;
         if let Some((id, generation)) = &requested {
@@ -309,9 +340,10 @@ impl Core {
         }
         let x = self
             .agent
-            .new_session(
+            .new_session_with_embedded_mcp(
                 config.cwd.clone(),
                 self.mcp_servers_for(&capabilities),
+                self.in_process_mcp_servers_for(&capabilities),
                 meta,
             )
             .await
@@ -434,6 +466,7 @@ impl Core {
             effective_reasoning.clone(),
             harness_digest,
             capabilities.resolution.clone(),
+            capabilities.in_process_mcp_services.clone(),
         );
         let active_guard = ActiveMcpBindingGuard::new(self.mcp_bindings.clone(), id.0.clone());
         let meta = self.session_meta(&config, effective_reasoning.as_deref(), &capabilities)?;
@@ -456,20 +489,22 @@ impl Core {
         lease_admission.dispatch_uncertain();
         if resume {
             self.agent
-                .resume_session(
+                .resume_session_with_embedded_mcp(
                     id.0.clone(),
                     config.cwd,
                     self.mcp_servers_for(&capabilities),
+                    self.in_process_mcp_servers_for(&capabilities),
                     meta,
                 )
                 .await
                 .map_err(|error| protocol("session/resume", error))?;
         } else {
             self.agent
-                .load_session(
+                .load_session_with_embedded_mcp(
                     id.0.clone(),
                     config.cwd,
                     self.mcp_servers_for(&capabilities),
+                    self.in_process_mcp_servers_for(&capabilities),
                     meta,
                 )
                 .await

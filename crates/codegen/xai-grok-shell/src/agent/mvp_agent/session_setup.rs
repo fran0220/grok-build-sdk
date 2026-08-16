@@ -1163,6 +1163,7 @@ impl MvpAgent {
                     .cmd_tx
                     .send(crate::session::SessionCommand::UpdateMcpServers {
                         mcp_servers,
+                        embedded_mcp: None,
                         respond_to: tx,
                     });
             });

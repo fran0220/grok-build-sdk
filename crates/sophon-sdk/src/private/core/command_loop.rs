@@ -257,6 +257,16 @@ impl Core {
                                         .in_process_mcp_servers
                                         .iter()
                                         .any(|embedded| embedded.name == *name)
+                                        || self
+                                            .session_bindings
+                                            .borrow()
+                                            .get(id.as_str())
+                                            .is_some_and(|binding| {
+                                                binding
+                                                    .in_process_mcp_services
+                                                    .iter()
+                                                    .any(|active| active == name)
+                                            })
                                 }) =>
                             {
                                 Err(Error::InvalidConfig(

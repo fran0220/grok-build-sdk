@@ -133,6 +133,7 @@ struct ResidentSessionBinding {
     reasoning: Option<String>,
     harness_digest: Option<HarnessDigest>,
     capabilities: CapabilityResolution,
+    in_process_mcp_services: Vec<String>,
 }
 
 impl ResidentSessionBinding {
@@ -141,6 +142,7 @@ impl ResidentSessionBinding {
         effective_reasoning: Option<String>,
         harness_digest: Option<HarnessDigest>,
         capabilities: CapabilityResolution,
+        in_process_mcp_services: Vec<String>,
     ) -> Self {
         Self {
             cwd: config.cwd.clone(),
@@ -148,6 +150,7 @@ impl ResidentSessionBinding {
             reasoning: effective_reasoning,
             harness_digest,
             capabilities,
+            in_process_mcp_services,
         }
     }
 }

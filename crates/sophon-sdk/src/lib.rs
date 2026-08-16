@@ -184,7 +184,7 @@ mod workflow;
 
 pub use capability::{
     AgentServiceContribution, CapabilityBinding, CapabilityError, CapabilityKind, CapabilityLayer,
-    CapabilityOrigin, CapabilityResolution, MAX_CAPABILITY_LAYER_ENTRIES,
+    CapabilityOrigin, CapabilityResolution, InProcessMcpContribution, MAX_CAPABILITY_LAYER_ENTRIES,
     MAX_CAPABILITY_NAME_BYTES, MaskedCapability, SkillContribution,
 };
 pub use config::*;

@@ -4850,7 +4850,14 @@ impl MvpAgent {
                 });
             let (acp_mcp_servers, embedded_mcp_invoker) =
                 if let Some((servers, invoker)) = self.embedded_mcp_servers() {
-                    (servers, Some(invoker))
+                    let selected = if crate::session::acp_mcp::declares_acp_mcp_servers(
+                        session_meta,
+                    ) {
+                        crate::session::acp_mcp::parse_acp_mcp_servers(session_meta)
+                    } else {
+                        servers
+                    };
+                    (selected, Some(invoker))
                 } else {
                     (
                         crate::session::acp_mcp::parse_acp_mcp_servers(session_meta),

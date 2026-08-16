@@ -282,9 +282,10 @@ pub struct EmbeddedCloseResponse {
     pub meta: Option<Map<String, Value>>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct EmbeddedMcpRegistration {
     pub name: String,
+    #[serde(rename = "serverId")]
     pub server_id: String,
 }
 
@@ -294,6 +295,17 @@ pub struct EmbeddedAgent {
 }
 
 impl EmbeddedAgent {
+    fn select_embedded_mcp_servers(
+        mut meta: Map<String, Value>,
+        servers: Vec<EmbeddedMcpRegistration>,
+    ) -> Map<String, Value> {
+        meta.insert(
+            xai_grok_mcp::wire::MCP_SERVERS.to_owned(),
+            serde_json::to_value(servers).expect("embedded MCP registrations serialize"),
+        );
+        meta
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         cfg: &Config,
@@ -382,6 +394,21 @@ impl EmbeddedAgent {
             .map_err(Into::into)
     }
 
+    pub async fn new_session_with_embedded_mcp(
+        &self,
+        cwd: PathBuf,
+        mcp_servers: Vec<EmbeddedMcpServer>,
+        embedded_mcp_servers: Vec<EmbeddedMcpRegistration>,
+        meta: Map<String, Value>,
+    ) -> Result<String, EmbeddedError> {
+        self.new_session(
+            cwd,
+            mcp_servers,
+            Self::select_embedded_mcp_servers(meta, embedded_mcp_servers),
+        )
+        .await
+    }
+
     pub async fn load_session(
         &self,
         session_id: String,
@@ -405,6 +432,23 @@ impl EmbeddedAgent {
             .map_err(Into::into)
     }
 
+    pub async fn load_session_with_embedded_mcp(
+        &self,
+        session_id: String,
+        cwd: PathBuf,
+        mcp_servers: Vec<EmbeddedMcpServer>,
+        embedded_mcp_servers: Vec<EmbeddedMcpRegistration>,
+        meta: Map<String, Value>,
+    ) -> Result<(), EmbeddedError> {
+        self.load_session(
+            session_id,
+            cwd,
+            mcp_servers,
+            Self::select_embedded_mcp_servers(meta, embedded_mcp_servers),
+        )
+        .await
+    }
+
     pub async fn resume_session(
         &self,
         session_id: String,
@@ -426,6 +470,41 @@ impl EmbeddedAgent {
             .await
             .map(drop)
             .map_err(Into::into)
+    }
+
+    pub async fn resume_session_with_embedded_mcp(
+        &self,
+        session_id: String,
+        cwd: PathBuf,
+        mcp_servers: Vec<EmbeddedMcpServer>,
+        embedded_mcp_servers: Vec<EmbeddedMcpRegistration>,
+        meta: Map<String, Value>,
+    ) -> Result<(), EmbeddedError> {
+        self.resume_session(
+            session_id,
+            cwd,
+            mcp_servers,
+            Self::select_embedded_mcp_servers(meta, embedded_mcp_servers),
+        )
+        .await
+    }
+
+    pub async fn update_session_mcp_servers(
+        &self,
+        session_id: String,
+        mcp_servers: Vec<EmbeddedMcpServer>,
+        embedded_mcp_servers: Vec<EmbeddedMcpRegistration>,
+    ) -> Result<(), EmbeddedError> {
+        self.extension(
+            "x.ai/session/update_mcp_servers",
+            serde_json::json!({
+                "sessionId": session_id,
+                "mcpServers": mcp_servers,
+                "embeddedMcpServers": embedded_mcp_servers,
+            }),
+        )
+        .await
+        .map(drop)
     }
 
     pub async fn prompt(

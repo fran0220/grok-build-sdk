@@ -124,7 +124,7 @@ pub(super) fn validate(c: &RuntimeConfig, options: &RuntimeOptions) -> Result<()
             "the MCP elicitation UI channel requires the Desktop profile".into(),
         ));
     }
-    let mut names: HashSet<&str> = options
+    let mut external_names: HashSet<&str> = options
         .services
         .mcp_servers
         .iter()
@@ -134,11 +134,18 @@ pub(super) fn validate(c: &RuntimeConfig, options: &RuntimeOptions) -> Result<()
             | crate::McpServerConfig::Sse { name, .. } => name.as_str(),
         })
         .collect();
+    let mut registration_names = HashSet::new();
     let mut ids = HashSet::new();
     if options.in_process_mcp_servers.iter().any(|server| {
         server.name.trim().is_empty()
             || server.server_id.trim().is_empty()
-            || !names.insert(server.name.as_str())
+            || !external_names.insert(server.name.as_str())
+            || !registration_names.insert(server.name.as_str())
+            || !ids.insert(server.server_id.as_str())
+    }) || options.session_in_process_mcp_servers.iter().any(|server| {
+        crate::capability::validate_capability_name(&server.name).is_err()
+            || server.server_id.trim().is_empty()
+            || !registration_names.insert(server.name.as_str())
             || !ids.insert(server.server_id.as_str())
     }) {
         return Err(Error::InvalidConfig(
@@ -304,6 +311,7 @@ pub(super) fn mount_conversation_tools(options: &mut RuntimeOptions) -> Result<(
     let taken = options
         .in_process_mcp_servers
         .iter()
+        .chain(options.session_in_process_mcp_servers.iter())
         .any(|server| server.name == crate::CONVERSATION_TOOL_SERVER)
         || options
             .services
@@ -377,9 +385,11 @@ pub(super) fn capabilities_for(options: &RuntimeOptions) -> RuntimeCapabilities 
     descriptors.push(crate::CapabilityDescriptor {
         namespace: "sdk:in-process-mcp".into(),
         enabled: options.profile == crate::RuntimeProfile::Desktop
-            && !options.in_process_mcp_servers.is_empty(),
+            && (!options.in_process_mcp_servers.is_empty()
+                || !options.session_in_process_mcp_servers.is_empty()),
         disabled_reason: (options.profile != crate::RuntimeProfile::Desktop
-            || options.in_process_mcp_servers.is_empty())
+            || (options.in_process_mcp_servers.is_empty()
+                && options.session_in_process_mcp_servers.is_empty()))
         .then(|| {
             if options.profile == crate::RuntimeProfile::Restricted {
                 "restricted profile".into()

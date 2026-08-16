@@ -113,6 +113,7 @@ pub(crate) fn merge_and_send_managed_mcp_update(
     cmd_tx
         .send(crate::session::SessionCommand::UpdateMcpServers {
             mcp_servers: merged,
+            embedded_mcp: None,
             respond_to: tx,
         })
         .is_ok()

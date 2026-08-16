@@ -102,6 +102,17 @@ impl RuntimeBuilder {
         self.options.in_process_mcp_servers = value.into_iter().collect();
         self
     }
+    /// Registers application-owned in-process MCP endpoints that capability
+    /// layers may mount by name on individual Sessions. Unlike
+    /// [`RuntimeBuilder::in_process_mcp_servers`], registration does not make
+    /// these endpoints visible Runtime-wide.
+    pub fn session_in_process_mcp_servers(
+        mut self,
+        value: impl IntoIterator<Item = InProcessMcpServer>,
+    ) -> Self {
+        self.options.session_in_process_mcp_servers = value.into_iter().collect();
+        self
+    }
     /// Installs typed roots and sampling services used to fulfill MCP 2026
     /// MRTR input requests. Generic elicitation services are rejected at
     /// startup; use [`RuntimeBuilder::mcp_elicitation_ui`] so only the product

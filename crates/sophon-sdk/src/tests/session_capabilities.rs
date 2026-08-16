@@ -67,6 +67,23 @@ async fn await_mcp_tool(runtime: &Runtime, id: &SessionId, tool: &str) -> bool {
     .is_ok()
 }
 
+async fn await_mcp_server(runtime: &Runtime, id: &SessionId, server: &str, present: bool) {
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let found = runtime
+                .list_mcp_servers(id, false)
+                .await
+                .is_ok_and(|servers| servers.iter().any(|entry| entry.name == server));
+            if found == present {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("MCP server visibility reaches the expected state");
+}
+
 /// (a) Two Sessions on one Runtime carry different layers, and every Turn sees
 /// only its own contributions plus the unmasked general ones.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -149,6 +166,87 @@ async fn concurrent_sessions_carry_independent_capability_layers() {
         alpha_resolution.names(CapabilityKind::McpService),
         vec!["general-mcp", "project-mcp"]
     );
+    runtime.shutdown().await.expect("shutdown");
+}
+
+/// A registered endpoint is only a Runtime catalog entry. Session layers
+/// select it independently, can add/remove it between Turns, and preserve the
+/// original Runtime-wide in-process registration behavior.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn in_process_mcp_contributions_are_session_scoped_and_replaceable() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let sampling = MockInferenceServer::start()
+        .await
+        .expect("sampling provider");
+    let root = TempDir::new().expect("root");
+    let workspace = root.path().join("workspace");
+    std::fs::create_dir_all(&workspace).expect("workspace");
+    let contexts = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let fixture = || {
+        Arc::new(InProcessFixture {
+            contexts: contexts.clone(),
+        })
+    };
+    let (runtime, _) = Runtime::builder(runtime_config(&root, sampling.url()))
+        .profile(RuntimeProfile::Desktop)
+        .in_process_mcp_servers([InProcessMcpServer::new(
+            "runtime-fixture",
+            "runtime-fixture-id",
+            fixture(),
+        )])
+        .session_in_process_mcp_servers([InProcessMcpServer::new(
+            "session-fixture",
+            "session-fixture-id",
+            fixture(),
+        )])
+        .start()
+        .await
+        .expect("desktop runtime");
+    let selected = CapabilityLayer::new()
+        .in_process_mcp_service(InProcessMcpContribution::new("session-fixture"));
+    let alpha = runtime
+        .create_session_with_capabilities(session_config(workspace.clone()), selected.clone())
+        .await
+        .expect("selected session");
+    let beta = runtime
+        .create_session(session_config(workspace.clone()))
+        .await
+        .expect("unselected session");
+
+    await_mcp_server(&runtime, &alpha, "runtime-fixture", true).await;
+    await_mcp_server(&runtime, &beta, "runtime-fixture", true).await;
+    await_mcp_server(&runtime, &alpha, "session-fixture", true).await;
+    await_mcp_server(&runtime, &beta, "session-fixture", false).await;
+    assert_eq!(
+        runtime
+            .session_capabilities(&alpha)
+            .await
+            .expect("selected capabilities")
+            .origin(CapabilityKind::McpService, "session-fixture"),
+        Some(CapabilityOrigin::Session)
+    );
+
+    runtime
+        .set_session_capabilities(&beta, selected.clone())
+        .await
+        .expect("mount selected endpoint");
+    await_mcp_server(&runtime, &beta, "session-fixture", true).await;
+    runtime
+        .set_session_capabilities(&beta, CapabilityLayer::new())
+        .await
+        .expect("unmount selected endpoint");
+    await_mcp_server(&runtime, &beta, "session-fixture", false).await;
+    await_mcp_server(&runtime, &beta, "runtime-fixture", true).await;
+
+    runtime
+        .unload_session(alpha.clone())
+        .await
+        .expect("unload selected session");
+    runtime
+        .load_session_with_capabilities(alpha.clone(), session_config(workspace), selected)
+        .await
+        .expect("load selected session");
+    await_mcp_server(&runtime, &alpha, "session-fixture", true).await;
     runtime.shutdown().await.expect("shutdown");
 }
 
@@ -358,6 +456,27 @@ async fn capability_layers_decode_additively_and_fail_closed() {
     assert!(matches!(
         runtime
             .create_session_with_capabilities(session_config(workspace.clone()), duplicate)
+            .await,
+        Err(Error::InvalidConfig(_))
+    ));
+    let duplicate_mcp_name = CapabilityLayer::new()
+        .mcp_service(stdio_mcp(root.path(), "dup-mcp", "external"))
+        .in_process_mcp_service(InProcessMcpContribution::new("dup-mcp"));
+    assert!(matches!(
+        duplicate_mcp_name.validate(),
+        Err(CapabilityError::Duplicate {
+            kind: CapabilityKind::McpService,
+            ..
+        })
+    ));
+    let unknown_in_process = CapabilityLayer::new()
+        .in_process_mcp_service(InProcessMcpContribution::new("not-registered"));
+    assert!(matches!(
+        runtime
+            .create_session_with_capabilities(
+                session_config(workspace.clone()),
+                unknown_in_process,
+            )
             .await,
         Err(Error::InvalidConfig(_))
     ));

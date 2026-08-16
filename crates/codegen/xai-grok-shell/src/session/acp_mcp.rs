@@ -51,6 +51,10 @@ pub(crate) fn parse_acp_mcp_servers(meta: Option<&acp::Meta>) -> Vec<AcpServerEn
     servers
 }
 
+pub(crate) fn declares_acp_mcp_servers(meta: Option<&acp::Meta>) -> bool {
+    meta.is_some_and(|meta| meta.contains_key(wire::MCP_SERVERS))
+}
+
 /// Reverse-RPC invoker for in-process SDK MCP servers.
 ///
 /// Each [`invoke`](AcpReverseInvoker::invoke) sends one `x.ai/mcp/sdk_call` reverse request

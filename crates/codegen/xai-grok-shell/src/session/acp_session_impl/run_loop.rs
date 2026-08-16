@@ -1279,7 +1279,11 @@ pub(super) async fn run_session(
                         SessionCommand::UpdateAttachPolicy { startup_hints } => {
                             session.apply_attach_policy(&startup_hints);
                         }
-                        SessionCommand::UpdateMcpServers { mcp_servers, respond_to } => {
+                        SessionCommand::UpdateMcpServers {
+                            mcp_servers,
+                            embedded_mcp,
+                            respond_to,
+                        } => {
                             if session.startup_hints.is_subagent {
                                 tracing::debug!(
                                     session_id = %session.session_info.id.0,
@@ -1309,7 +1313,20 @@ pub(super) async fn run_session(
                             // `mcp_state` lock across the emit.
                             let (diff, dispatch_event_tx, generation) = {
                                 let mut mcp_state = session.mcp_state.lock().await;
-                                let diff = mcp_state.update_configs_diff(mcp_servers);
+                                let embedded_diff = embedded_mcp.and_then(|(servers, invoker)| {
+                                    mcp_state.update_acp_servers_diff(servers, invoker)
+                                });
+                                let external_diff = mcp_state.update_configs_diff(mcp_servers);
+                                let diff = match (embedded_diff, external_diff) {
+                                    (None, None) => None,
+                                    (Some(diff), None) | (None, Some(diff)) => Some(diff),
+                                    (Some(mut embedded), Some(external)) => {
+                                        embedded.added.extend(external.added);
+                                        embedded.removed.extend(external.removed);
+                                        embedded.retained.extend(external.retained);
+                                        Some(embedded)
+                                    }
+                                };
                                 let tx = mcp_state.client_event_tx();
                                 let generation = mcp_state.generation();
                                 (diff, tx, generation)

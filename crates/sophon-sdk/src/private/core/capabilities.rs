@@ -19,6 +19,18 @@ pub(in crate::private) fn general_layer(
         layer = layer.mcp_service(server.clone());
     }
     layer.validate()?;
+    for service in layer.in_process_mcp_service_contributions() {
+        if !options
+            .session_in_process_mcp_servers
+            .iter()
+            .any(|server| server.name == service.name())
+        {
+            return Err(crate::CapabilityError::UnregisteredInProcessMcpService(
+                service.name().to_owned(),
+            )
+            .into());
+        }
+    }
     Ok(layer)
 }
 
@@ -45,6 +57,18 @@ impl Core {
                 return Err(Error::InvalidConfig(format!(
                     "agent service '{name}' routes to model '{model}', which is not in the fixed catalog"
                 )));
+            }
+        }
+        for name in &resolved.in_process_mcp_services {
+            if !self
+                .options
+                .session_in_process_mcp_servers
+                .iter()
+                .any(|server| &server.name == name)
+            {
+                return Err(
+                    crate::CapabilityError::UnregisteredInProcessMcpService(name.clone()).into(),
+                );
             }
         }
         for server in &resolved.mcp_services {
@@ -91,11 +115,14 @@ impl Core {
             .iter()
             .map(to_embedded_mcp_server)
             .collect();
-        self.extension::<serde_json::Value>(
-            "x.ai/session/update_mcp_servers",
-            serde_json::json!({"sessionId": id.as_str(), "mcpServers": mcp_servers}),
-        )
-        .await?;
+        self.agent
+            .update_session_mcp_servers(
+                id.as_str().to_owned(),
+                mcp_servers,
+                self.in_process_mcp_servers_for(resolved),
+            )
+            .await
+            .map_err(|error| protocol("session/update_mcp_servers", error))?;
         self.agent.reload_skills_for_session(&id.0);
         Ok(())
     }
@@ -120,6 +147,7 @@ impl Core {
             .get_mut(&id.0)
             .ok_or_else(|| Error::Operation("session binding is unavailable".into()))?;
         binding.capabilities = resolved.resolution.clone();
+        binding.in_process_mcp_services = resolved.in_process_mcp_services.clone();
         Ok(resolved.resolution)
     }
 

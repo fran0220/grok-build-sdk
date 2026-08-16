@@ -504,6 +504,10 @@ pub enum SessionCommand {
     /// completes (or immediately if configs are unchanged).
     UpdateMcpServers {
         mcp_servers: Vec<acp::McpServer>,
+        embedded_mcp: Option<(
+            Vec<xai_grok_mcp::servers::AcpServerEntry>,
+            std::sync::Arc<dyn xai_grok_mcp::acp_transport::AcpReverseInvoker>,
+        )>,
         respond_to: oneshot::Sender<Result<(), acp::Error>>,
     },
     /// Re-apply per-attachment policy (MCP init strategy, delivery tools)

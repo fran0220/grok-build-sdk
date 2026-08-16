@@ -77,6 +77,8 @@ pub enum CapabilityError {
     RelativeSkillRoot { name: String },
     #[error("agent service '{name}' must name a model")]
     MissingModel { name: String },
+    #[error("in-process mcp service '{0}' is not registered on this runtime")]
+    UnregisteredInProcessMcpService(String),
     #[error("the general layer and the runtime services both contribute the mcp service '{0}'")]
     GeneralCollision(String),
     #[error("capability layers require the Desktop profile")]
@@ -178,6 +180,28 @@ impl AgentServiceContribution {
     }
 }
 
+/// A reference to an application-owned in-process MCP endpoint registered on
+/// the Runtime. The endpoint is mounted only on Sessions whose effective
+/// capability layer contains this contribution.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct InProcessMcpContribution {
+    name: String,
+}
+
+impl InProcessMcpContribution {
+    pub fn new(name: impl Into<String>) -> Self {
+        Self { name: name.into() }
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn validate(&self) -> Result<(), CapabilityError> {
+        validate_capability_name(&self.name)
+    }
+}
+
 /// One layer's complete capability contribution.
 ///
 /// Deliberately neither `Debug` nor `Serialize`: MCP mounts carry transport
@@ -189,6 +213,8 @@ pub struct CapabilityLayer {
     skills: Vec<SkillContribution>,
     #[serde(default)]
     mcp_services: Vec<McpServerConfig>,
+    #[serde(default)]
+    in_process_mcp_services: Vec<InProcessMcpContribution>,
     #[serde(default)]
     agent_services: Vec<AgentServiceContribution>,
 }
@@ -218,6 +244,19 @@ impl CapabilityLayer {
         self
     }
 
+    pub fn in_process_mcp_service(mut self, value: InProcessMcpContribution) -> Self {
+        self.in_process_mcp_services.push(value);
+        self
+    }
+
+    pub fn in_process_mcp_services(
+        mut self,
+        value: impl IntoIterator<Item = InProcessMcpContribution>,
+    ) -> Self {
+        self.in_process_mcp_services.extend(value);
+        self
+    }
+
     pub fn agent_service(mut self, value: AgentServiceContribution) -> Self {
         self.agent_services.push(value);
         self
@@ -232,7 +271,10 @@ impl CapabilityLayer {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.skills.is_empty() && self.mcp_services.is_empty() && self.agent_services.is_empty()
+        self.skills.is_empty()
+            && self.mcp_services.is_empty()
+            && self.in_process_mcp_services.is_empty()
+            && self.agent_services.is_empty()
     }
 
     pub fn skill_contributions(&self) -> &[SkillContribution] {
@@ -243,6 +285,10 @@ impl CapabilityLayer {
         &self.mcp_services
     }
 
+    pub fn in_process_mcp_service_contributions(&self) -> &[InProcessMcpContribution] {
+        &self.in_process_mcp_services
+    }
+
     pub fn agent_service_contributions(&self) -> &[AgentServiceContribution] {
         &self.agent_services
     }
@@ -251,7 +297,10 @@ impl CapabilityLayer {
     /// a relative skill root, a routeless agent service, or an oversized set.
     pub fn validate(&self) -> Result<(), CapabilityError> {
         bound(CapabilityKind::Skill, self.skills.len())?;
-        bound(CapabilityKind::McpService, self.mcp_services.len())?;
+        bound(
+            CapabilityKind::McpService,
+            self.mcp_services.len() + self.in_process_mcp_services.len(),
+        )?;
         bound(CapabilityKind::AgentService, self.agent_services.len())?;
         for skill in &self.skills {
             skill.validate()?;
@@ -259,13 +308,20 @@ impl CapabilityLayer {
         for service in &self.mcp_services {
             validate_capability_name(service.name())?;
         }
+        for service in &self.in_process_mcp_services {
+            service.validate()?;
+        }
         for service in &self.agent_services {
             service.validate()?;
         }
         reject_duplicates(CapabilityKind::Skill, self.skills.iter().map(|s| s.name()))?;
         reject_duplicates(
             CapabilityKind::McpService,
-            self.mcp_services.iter().map(McpServerConfig::name),
+            self.mcp_services.iter().map(McpServerConfig::name).chain(
+                self.in_process_mcp_services
+                    .iter()
+                    .map(|service| service.name()),
+            ),
         )?;
         reject_duplicates(
             CapabilityKind::AgentService,
@@ -357,6 +413,7 @@ pub(crate) struct ResolvedCapabilities {
     pub(crate) resolution: CapabilityResolution,
     pub(crate) skill_roots: Vec<PathBuf>,
     pub(crate) mcp_services: Vec<McpServerConfig>,
+    pub(crate) in_process_mcp_services: Vec<String>,
     pub(crate) agent_services: BTreeMap<String, String>,
 }
 
@@ -375,6 +432,12 @@ pub(crate) fn resolve_capabilities(
         .mcp_services
         .iter()
         .map(McpServerConfig::name)
+        .chain(
+            session
+                .in_process_mcp_services
+                .iter()
+                .map(|service| service.name()),
+        )
         .collect();
     let session_agents: std::collections::BTreeSet<&str> =
         session.agent_services.iter().map(|s| s.name()).collect();
@@ -418,6 +481,23 @@ pub(crate) fn resolve_capabilities(
         );
         resolved.mcp_services.push(service.clone());
     }
+    for service in &general.in_process_mcp_services {
+        if session_mcp.contains(service.name()) {
+            resolved.resolution.masked.push(MaskedCapability {
+                kind: CapabilityKind::McpService,
+                name: service.name().to_owned(),
+            });
+            continue;
+        }
+        resolved.bind(
+            CapabilityKind::McpService,
+            service.name(),
+            CapabilityOrigin::General,
+        );
+        resolved
+            .in_process_mcp_services
+            .push(service.name().to_owned());
+    }
     for service in &session.mcp_services {
         resolved.bind(
             CapabilityKind::McpService,
@@ -425,6 +505,16 @@ pub(crate) fn resolve_capabilities(
             CapabilityOrigin::Session,
         );
         resolved.mcp_services.push(service.clone());
+    }
+    for service in &session.in_process_mcp_services {
+        resolved.bind(
+            CapabilityKind::McpService,
+            service.name(),
+            CapabilityOrigin::Session,
+        );
+        resolved
+            .in_process_mcp_services
+            .push(service.name().to_owned());
     }
 
     for service in &general.agent_services {

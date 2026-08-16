@@ -221,11 +221,14 @@ impl Core {
             Rc::new(client),
         ));
         if options.profile == crate::RuntimeProfile::Desktop
-            && (!options.in_process_mcp_servers.is_empty() || !options.mcp_host_services.is_empty())
+            && (!options.in_process_mcp_servers.is_empty()
+                || !options.session_in_process_mcp_servers.is_empty()
+                || !options.mcp_host_services.is_empty())
         {
             let servers = options
                 .in_process_mcp_servers
                 .iter()
+                .chain(options.session_in_process_mcp_servers.iter())
                 .map(|server| EmbeddedMcpRegistration {
                     name: server.name.clone(),
                     server_id: server.server_id.clone(),
@@ -234,6 +237,7 @@ impl Core {
             let handlers = options
                 .in_process_mcp_servers
                 .iter()
+                .chain(options.session_in_process_mcp_servers.iter())
                 .map(|server| {
                     (
                         server.server_id.clone(),

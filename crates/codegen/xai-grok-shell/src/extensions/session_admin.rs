@@ -560,6 +560,7 @@ async fn handle_update_mcp_servers(agent: &MvpAgent, args: &acp::ExtRequest) -> 
     struct Params {
         session_id: acp::SessionId,
         mcp_servers: Vec<acp::McpServer>,
+        embedded_mcp_servers: Option<Vec<xai_grok_mcp::servers::AcpServerEntry>>,
     }
 
     let params: Params = parse_params(args)?;
@@ -587,12 +588,41 @@ async fn handle_update_mcp_servers(agent: &MvpAgent, args: &acp::ExtRequest) -> 
         &compat,
         scope,
     );
+    let embedded_mcp = match params.embedded_mcp_servers {
+        None => None,
+        Some(selected) => {
+            let registration = agent.embedded_mcp_servers();
+            if registration.is_none() && selected.is_empty() {
+                None
+            } else {
+                let (registered, invoker) = registration.ok_or_else(|| {
+                    acp::Error::invalid_params().data("no in-process MCP servers are registered")
+                })?;
+                let mut names = std::collections::HashSet::new();
+                if selected.iter().any(|server| {
+                    !names.insert(server.name.as_str()) || !registered.contains(server)
+                }) {
+                    return Err(acp::Error::invalid_params().data(
+                        "embedded MCP selection contains an unknown or duplicate registration",
+                    ));
+                }
+                Some((
+                    selected,
+                    xai_grok_mcp::acp_transport::bind_embedded_invoker(
+                        params.session_id.0.to_string(),
+                        invoker,
+                    ),
+                ))
+            }
+        }
+    };
 
     let (tx, rx) = tokio::sync::oneshot::channel();
     handle
         .cmd_tx
         .send(SessionCommand::UpdateMcpServers {
             mcp_servers: merged,
+            embedded_mcp,
             respond_to: tx,
         })
         .map_err(|_| acp::Error::internal_error().data("session closed"))?;
@@ -773,6 +803,7 @@ async fn handle_reload_project_mcp_servers(agent: &MvpAgent, args: &acp::ExtRequ
             .cmd_tx
             .send(SessionCommand::UpdateMcpServers {
                 mcp_servers: merged,
+                embedded_mcp: None,
                 respond_to: tx,
             })
             .is_ok()

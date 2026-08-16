@@ -625,7 +625,7 @@ impl InitProgress {
 ///
 /// `Deserialize`d straight from a `_meta["x.ai/mcp/servers"]` entry, so the
 /// `serverId` wire field name is declared (and serde-checked) exactly once here.
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AcpServerEntry {
     pub name: McpServerName,
     #[serde(rename = "serverId")]
@@ -820,6 +820,77 @@ impl McpState {
         self.owned_clients
             .retain(|name, _| !reserved.contains(name.as_str()));
         self.acp_mcp = Some(AcpMcpRegistry { servers, invoker });
+    }
+
+    /// Diff and replace the Session's in-process registrations while keeping
+    /// unchanged clients alive. This is the in-process counterpart of
+    /// [`Self::update_configs_diff`].
+    pub fn update_acp_servers_diff(
+        &mut self,
+        servers: Vec<AcpServerEntry>,
+        invoker: Arc<dyn crate::acp_transport::AcpReverseInvoker>,
+    ) -> Option<McpConfigDiff> {
+        let old = self
+            .acp_mcp
+            .as_ref()
+            .map(|registry| registry.servers.as_slice())
+            .unwrap_or_default();
+        if old == servers.as_slice() {
+            return None;
+        }
+
+        let old_by_name: HashMap<&str, &str> = old
+            .iter()
+            .map(|entry| (entry.name.as_str(), entry.server_id.as_str()))
+            .collect();
+        let new_by_name: HashMap<&str, &str> = servers
+            .iter()
+            .map(|entry| (entry.name.as_str(), entry.server_id.as_str()))
+            .collect();
+        let mut removed = Vec::new();
+        let mut added = Vec::new();
+        let mut retained = Vec::new();
+        for (name, old_id) in &old_by_name {
+            match new_by_name.get(name) {
+                Some(new_id) if new_id == old_id => retained.push((*name).to_owned()),
+                Some(_) | None => removed.push((*name).to_owned()),
+            }
+        }
+        for (name, new_id) in &new_by_name {
+            if old_by_name.get(name) != Some(new_id) {
+                added.push((*name).to_owned());
+            }
+        }
+
+        let reserved: std::collections::HashSet<&str> =
+            servers.iter().map(|entry| entry.name.as_str()).collect();
+        for config in &self.configs {
+            let name = mcp_server_name(config);
+            if reserved.contains(name) && !removed.iter().any(|removed| removed == name) {
+                removed.push(name.to_owned());
+            }
+        }
+
+        for name in &removed {
+            self.owned_clients.remove(name);
+            self.auth_required.remove(name);
+            self.init_progress.mark_handshake_complete(name);
+            let prefix = format!("{}{}", name, MCP_TOOL_NAME_DELIMITER);
+            self.mcp_tool_meta
+                .retain(|key, _| !key.starts_with(&prefix));
+            self.disabled_tool_registrations
+                .retain(|key, _| !key.starts_with(&prefix));
+        }
+        self.configs
+            .retain(|config| !reserved.contains(mcp_server_name(config)));
+        self.acp_mcp = (!servers.is_empty()).then_some(AcpMcpRegistry { servers, invoker });
+        self.init_progress.cancel();
+        self.generation = self.generation.wrapping_add(1);
+        Some(McpConfigDiff {
+            added,
+            removed,
+            retained,
+        })
     }
 
     /// In-process registrations own their tool namespace. Ignore later
