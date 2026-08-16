@@ -634,6 +634,7 @@ async fn explicit_subagent_model_uses_its_configured_provider() {
         .insert("general-purpose".into(), "child-model".into());
     let (runtime, _) = Runtime::builder(config)
         .profile(RuntimeProfile::Desktop)
+        .yolo_mode(true)
         .model_provider(
             "test-model",
             provider(parent.url(), "parent-secret", "parent-wire", "parent"),
