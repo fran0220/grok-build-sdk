@@ -2,6 +2,7 @@
 //! session. Split from `acp_agent.rs`, whose trait impl delegates all four.
 //!
 //! [session setup]: https://agentclientprotocol.com/protocol/v1/session-setup
+use super::reasoning_effort::{EffortTarget, NewSessionEffort, split_new_session_effort};
 use super::*;
 use super::session_lifecycle::CloseOutcome;
 /// Refusals resume must give verbatim, so a test cannot mistake some other
@@ -504,13 +505,20 @@ impl MvpAgent {
                 origin_client.clone(),
             )
         });
-        if let Some(effort) = self.models_manager.current_reasoning_effort()
-            && self
-                .models_manager
-                .model_supports_reasoning_effort(&session_sampling.model)
-        {
-            session_sampling.reasoning_effort = Some(effort);
-        }
+        let effort_route = split_new_session_effort(
+            resolved_custom_model,
+            parse_reasoning_effort_meta(arguments.meta.as_ref()),
+        );
+        let spawn_effort = match effort_route {
+            NewSessionEffort::Spawn(effort) => Some(effort),
+            NewSessionEffort::Switch(_) | NewSessionEffort::None => None,
+        };
+        self.models_manager.apply_supported_effort(
+            &mut session_sampling,
+            spawn_effort.or_else(|| self.models_manager.current_reasoning_effort()),
+            &session_id,
+            EffortTarget::SummaryClient,
+        );
         let (summary_client, summary_model) = self.build_summary_client(&session_sampling)?;
         let relay_sync = self.start_relay_sync(&session_id, &session_info);
         let model_id = match &session_initial_model {
@@ -548,13 +556,16 @@ impl MvpAgent {
             crate::session::persistence::new_with_storage_root(
                 &session_info,
                 model_id,
-                summary_client,
-                self.storage_mode.get(),
-                Some(self.auth_manager.clone()),
-                relay_sync,
-                Some(self.gateway.clone()),
-                summary_model,
-                registry_title_sync,
+                crate::session::persistence::SessionDeps {
+                    sampling_client: summary_client,
+                    storage_mode: self.storage_mode.get(),
+                    auth_manager: Some(self.auth_manager.clone()),
+                    relay_sync,
+                    gateway: Some(self.gateway.clone()),
+                    session_summary_model: summary_model,
+                    registry_title_sync,
+                    search_index: self.search_index_cell(),
+                },
                 !self.origin_restricted(),
                 self.storage_root.clone(),
                 self.session_state_authority.clone(),
@@ -608,6 +619,7 @@ impl MvpAgent {
                     session_meta: arguments.meta.as_ref(),
                     model_agent_type: model_agent_type.as_deref(),
                     session_model_id,
+                    initial_reasoning_effort: spawn_effort,
                     session_yolo_mode,
                     session_auto_mode: session_auto_mode && !session_yolo_mode,
                     prompt_display_cwd: None,
@@ -664,26 +676,32 @@ impl MvpAgent {
             });
         }
         if let Some(model_id) = resolved_custom_model {
-            let route_meta = self
-                .origin_embedded
-                .then(|| embedded_route_from_meta(arguments.meta.as_ref()))
-                .transpose()?
-                .and_then(|(_, meta)| meta);
-            let apply_result = crate::timed!(log: "new_session: set_session_model", {
+            let switch_effort = match effort_route {
+                NewSessionEffort::Switch(effort) => Some(effort),
+                NewSessionEffort::Spawn(_) | NewSessionEffort::None => None,
+            };
+            let switched = crate::timed!(log: "new_session: set_session_model", {
                 crate::agent::handlers::model_switch::apply(
                     self,
-                    acp::SetSessionModelRequest::new(
-                        session_id.clone(),
-                        acp::ModelId::new(model_id),
-                    )
-                    .meta(route_meta),
+                    acp::SetSessionModelRequest::new(session_id.clone(), acp::ModelId::new(model_id)),
+                    switch_effort,
                 )
                 .await
             });
-            if self.origin_embedded {
-                apply_result?;
+            match switched {
+                Ok(_) => {
+                    tracing::debug!(session_id = %session_id.0, "new_session: set_session_model")
+                }
+                Err(err) if self.origin_embedded => return Err(err),
+                Err(err) => {
+                    tracing::warn!(
+                        session_id = %session_id.0,
+                        error = ?err,
+                        requested_effort = ?switch_effort,
+                        "new_session: set_session_model failed; session keeps spawn defaults"
+                    )
+                }
             }
-            tracing::debug!(session_id = %session_id.0, "new_session: set_session_model");
         }
         if let Some(requested) = disallowed_custom {
             let current = self.models_manager.current_model_id();
@@ -887,6 +905,7 @@ impl MvpAgent {
             }
             drop(flush_timer);
         }
+        let initial_reasoning_effort = parse_reasoning_effort_meta(request_meta.as_ref());
         let origin_client = self.origin_client_info_from_meta(request_meta.as_ref());
         let embedded_route = self
             .origin_embedded
@@ -906,9 +925,15 @@ impl MvpAgent {
             .as_ref()
             .map(|(model, _)| model.clone())
             .unwrap_or_else(|| self.models_manager.current_model_id());
-        let load_session_sampling = self.resolve_sampling_config_for_model(
+        let mut load_session_sampling = self.resolve_sampling_config_for_model(
             &load_model_id,
             origin_client.clone(),
+        );
+        self.models_manager.apply_supported_effort(
+            &mut load_session_sampling,
+            initial_reasoning_effort,
+            &session_id,
+            EffortTarget::SummaryClient,
         );
         let (summary_client, summary_model) = self.build_summary_client(&load_session_sampling)?;
         let relay_sync = self.start_relay_sync(&session_id, &session_info);
@@ -950,14 +975,17 @@ impl MvpAgent {
         };
         let (persistence_info, persistence) = crate::session::persistence::load_light(
             &session_info,
-            summary_client,
-            self.storage_mode.get(),
-            Some(self.auth_manager.clone()),
             backend.as_ref(),
-            relay_sync,
-            Some(self.gateway.clone()),
-            summary_model,
-            registry_title_sync,
+            crate::session::persistence::SessionDeps {
+                sampling_client: summary_client,
+                storage_mode: self.storage_mode.get(),
+                auth_manager: Some(self.auth_manager.clone()),
+                relay_sync,
+                gateway: Some(self.gateway.clone()),
+                session_summary_model: summary_model,
+                registry_title_sync,
+                search_index: self.search_index_cell(),
+            },
             !self.origin_restricted(),
             self.storage_root.clone(),
             self.session_state_authority.clone(),
@@ -1104,6 +1132,7 @@ impl MvpAgent {
                     session_meta: request_meta.as_ref(),
                     model_agent_type: persisted_agent_name.as_deref(),
                     session_model_id,
+                    initial_reasoning_effort: None,
                     session_yolo_mode,
                     session_auto_mode: session_auto_mode && !session_yolo_mode,
                     prompt_display_cwd,
@@ -1183,10 +1212,12 @@ impl MvpAgent {
             crate::agent::handlers::model_switch::apply(
                 self,
                 acp::SetSessionModelRequest::new(session_id.clone(), model).meta(meta),
+                initial_reasoning_effort,
             )
             .await?;
         } else {
-            self.restore_persisted_model(&session_id, &summary).await;
+            self.restore_persisted_model(&session_id, &summary, initial_reasoning_effort)
+                .await;
         }
         let (model_state, response_meta) = self
             .build_attach_response_meta(&session_id, &summary, persist_data, code_restore_info)
@@ -1460,10 +1491,11 @@ impl MvpAgent {
     /// Model-restore phase: point the actor at the persisted model without
     /// writing the global `current_model_id` (shared across leader clients).
     /// A vanished model falls back within its family, or blocks prompts.
-    async fn restore_persisted_model(
+    pub(super) async fn restore_persisted_model(
         &self,
         session_id: &acp::SessionId,
         summary: &crate::session::persistence::Summary,
+        initial_reasoning_effort: Option<ReasoningEffort>,
     ) {
         let session_id = session_id.clone();
         let persisted_model = summary.current_model_id.clone();
@@ -1581,20 +1613,20 @@ impl MvpAgent {
         );
         {
             let _timer = crate::instrumentation_timer!("session.restore_model");
-            let restore_meta = summary.reasoning_effort.map(|effort| {
-                let mut map = acp::Meta::new();
-                map.insert(
-                    REASONING_EFFORT_META_KEY.to_string(),
-                    reasoning_effort_meta_value(effort),
-                );
-                map
-            });
-            let _ = crate::agent::handlers::model_switch::apply(
+            let restore_effort = initial_reasoning_effort.or(summary.reasoning_effort);
+            if let Err(err) = crate::agent::handlers::model_switch::apply(
                 self,
-                acp::SetSessionModelRequest::new(session_id.to_owned(), model_id)
-                    .meta(restore_meta),
+                acp::SetSessionModelRequest::new(session_id.to_owned(), model_id),
+                restore_effort,
             )
-            .await;
+            .await
+            {
+                tracing::warn!(
+                    session_id = %session_id.0,
+                    error = ?err,
+                    "load_session: restoring persisted model/effort failed; session keeps spawn defaults"
+                );
+            }
         }
     }
     /// Response phase: assemble the attach `_meta`, including the running

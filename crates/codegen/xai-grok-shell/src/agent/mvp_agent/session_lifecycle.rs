@@ -1,6 +1,17 @@
 //! Session lifecycle, roster deltas, and the idle-session supervisor for [`MvpAgent`].
 //! Co-located `#[path]`-style child of `mvp_agent` (`use super::*`) so the `impl`
 //! block keeps access to `MvpAgent`'s private fields.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::todo,
+        clippy::unimplemented
+    )
+)]
 use super::*;
 
 /// Release every process-global authority owned by an embedded session, but
