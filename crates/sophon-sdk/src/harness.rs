@@ -1108,6 +1108,9 @@ pub enum HarnessEvidenceKind {
     /// A recorded before/after evaluation of a refinement's own acceptance
     /// check.
     Evaluation,
+    /// A committed evolution-ledger refinement event, named by its
+    /// content-addressed event ID.
+    Refinement,
 }
 
 /// Immutable reference to the evidence that produced a refinement. It carries

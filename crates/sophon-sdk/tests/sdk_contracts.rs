@@ -6,6 +6,8 @@ mod artifact_vault;
 mod build_provenance;
 #[path = "conversation_facade.rs"]
 mod conversation_facade;
+#[path = "evolution_ledger.rs"]
+mod evolution_ledger;
 #[path = "harness_facade.rs"]
 mod harness_facade;
 #[path = "harness_store.rs"]

@@ -11,6 +11,7 @@ mod autonomous;
 mod compaction;
 mod conversation;
 mod evidence;
+mod evolution;
 mod harness;
 mod kernel;
 mod prime;
@@ -67,6 +68,20 @@ pub use evidence::{
     SESSION_EVIDENCE_SCHEMA_VERSION, SessionEvidenceCommit, SessionEvidenceDocument,
     SessionEvidenceKey, SessionEvidenceKind, SessionEvidenceStore, SessionEvidenceStoreError,
     SessionEvidenceVersion, run_session_evidence_conformance,
+};
+pub use evolution::{
+    AppliedEdit, EVOLUTION_STATE_SCHEMA_VERSION, EVOLUTION_STORE_SCHEMA_MARKER,
+    EVOLUTION_STORE_SCHEMA_VERSION, EvolutionCommit, EvolutionError, EvolutionState,
+    EvolutionStore, EvolutionStoreError, HARNESS_SUPPLEMENT_BEGIN, HARNESS_SUPPLEMENT_END,
+    HarnessEntry, HarnessEntryKind, HarnessScope, HarnessSkillContract, LocalEvolutionStore,
+    MAX_EVOLUTION_STATE_BYTES, MAX_HARNESS_ENTRIES_PER_SCOPE, MAX_HARNESS_ENTRY_CONTENT_BYTES,
+    MAX_HARNESS_ENTRY_ID_BYTES, MAX_HARNESS_ENTRY_TITLE_BYTES, MAX_HARNESS_SCOPE_CONTENT_BYTES,
+    MAX_HARNESS_SKILL_ARGUMENTS, MAX_PLANNER_TRANSCRIPT_BYTES, MAX_REFINEMENT_EDITS,
+    MAX_REFINEMENT_EVENT_BYTES, MAX_REFINEMENT_TEXT_BYTES, MAX_RENDERED_REFINEMENT_HISTORY,
+    NO_REFINEMENT_REPLY, REFINEMENT_EVENT_SCHEMA_VERSION, RefinementAction, RefinementEdit,
+    RefinementEvent, RefinementEventKind, RefinementPlanner, RefinementProposal, RejectedEdit,
+    evolution_commit_reconciled, evolved_refinement, parse_planner_reply,
+    render_harness_supplement, run_evolution_store_conformance,
 };
 pub use harness::{
     CompleteEventCursor, HARNESS_SNAPSHOT_SCHEMA_VERSION, HARNESS_STORE_SCHEMA_MARKER,
