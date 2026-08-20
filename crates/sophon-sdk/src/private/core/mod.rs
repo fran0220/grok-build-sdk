@@ -133,6 +133,7 @@ struct ResidentSessionBinding {
     reasoning: Option<String>,
     harness_digest: Option<HarnessDigest>,
     capabilities: CapabilityResolution,
+    mcp_services: Vec<crate::McpServerConfig>,
     in_process_mcp_services: Vec<String>,
 }
 
@@ -142,6 +143,7 @@ impl ResidentSessionBinding {
         effective_reasoning: Option<String>,
         harness_digest: Option<HarnessDigest>,
         capabilities: CapabilityResolution,
+        mcp_services: Vec<crate::McpServerConfig>,
         in_process_mcp_services: Vec<String>,
     ) -> Self {
         Self {
@@ -150,6 +152,7 @@ impl ResidentSessionBinding {
             reasoning: effective_reasoning,
             harness_digest,
             capabilities,
+            mcp_services,
             in_process_mcp_services,
         }
     }

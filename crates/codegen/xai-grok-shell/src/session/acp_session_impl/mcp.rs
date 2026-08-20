@@ -118,6 +118,7 @@ impl SessionActor {
             .strip_prefix(&prefix)
             .unwrap_or(&qualified_name)
             .to_string();
+        mcp_state.record_tool_icons(qualified_name.clone(), reg.icons.clone());
         if let Some(meta) = reg.meta.as_ref() {
             mcp_state
                 .mcp_tool_meta
@@ -135,6 +136,7 @@ impl SessionActor {
                         display_name: None,
                         description: Some(reg.description.clone()),
                         meta: Some(meta.clone()),
+                        icons: reg.icons.clone(),
                         enabled: !mcp_state.is_tool_disabled(server_name, &unqualified),
                     });
             }
@@ -1318,6 +1320,8 @@ impl SessionActor {
                                     .strip_prefix(&prefix)
                                     .unwrap_or(&qualified_name)
                                     .to_string();
+                                mcp_state
+                                    .record_tool_icons(qualified_name.clone(), reg.icons.clone());
                                 if let Some(meta) = reg.meta.as_ref() {
                                     mcp_state
                                         .mcp_tool_meta
@@ -1335,6 +1339,7 @@ impl SessionActor {
                                                 display_name: None,
                                                 description: Some(reg.description.clone()),
                                                 meta: Some(meta.clone()),
+                                                icons: reg.icons.clone(),
                                                 enabled: !mcp_state
                                                     .is_tool_disabled(&server_name, &unqualified),
                                             });
@@ -1559,6 +1564,7 @@ impl SessionActor {
                         .strip_prefix(&prefix)
                         .unwrap_or(&qualified_name)
                         .to_string();
+                    mcp_state.record_tool_icons(qualified_name.clone(), reg.icons.clone());
                     if let Some(meta) = reg.meta.as_ref() {
                         mcp_state
                             .mcp_tool_meta

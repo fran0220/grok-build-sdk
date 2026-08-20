@@ -2118,8 +2118,8 @@ async fn try_call_tool_http_mcperror_recovers_then_retry_succeeds() {
     );
     assert_eq!(
         handles.init_version.lock().as_deref(),
-        Some("2025-11-25"),
-        "initialize must offer protocolVersion 2025-11-25"
+        None,
+        "modern discovery must not send a legacy initialize request"
     );
 
     let jsonl = std::fs::read_to_string(tmp.path().join("events.jsonl")).unwrap();
@@ -3424,7 +3424,7 @@ async fn is_healthy_pending_does_not_block_on_handshake() {
 fn make_client_info_pins_protocol_version() {
     assert_eq!(
         McpClient::make_client_info("test-srv", None).protocol_version,
-        rmcp::model::ProtocolVersion::V_2025_11_25
+        rmcp::model::ProtocolVersion::V_2026_07_28
     );
 }
 
@@ -3569,4 +3569,90 @@ fn apply_stdio_env_session_id_cannot_be_shadowed() {
         .and_then(|(_, v)| v)
         .map(|v| v.to_string_lossy().into_owned());
     assert_eq!(value.as_deref(), Some("sess-real"));
+}
+
+#[test]
+fn mcp_icon_from_rmcp_drops_empty_and_disallowed_src() {
+    assert!(McpIcon::from_rmcp(rmcp::model::Icon::new("   ")).is_none());
+    assert!(
+        McpIcon::from_rmcp(rmcp::model::Icon::new("http://insecure.example/icon.png")).is_none()
+    );
+    assert!(McpIcon::from_rmcp(rmcp::model::Icon::new("javascript:alert(1)")).is_none());
+
+    let icon = rmcp::model::Icon::new("https://example.com/icon.png")
+        .with_mime_type("image/png")
+        .with_sizes(vec!["48x48".to_string()])
+        .with_theme(rmcp::model::IconTheme::Dark);
+    let converted = McpIcon::from_rmcp(icon).unwrap();
+    assert_eq!(converted.src, "https://example.com/icon.png");
+    assert_eq!(converted.mime_type.as_deref(), Some("image/png"));
+    assert_eq!(converted.sizes.as_deref(), Some(&["48x48".to_string()][..]));
+    assert_eq!(converted.theme, Some(McpIconTheme::Dark));
+
+    let padded = rmcp::model::Icon::new("  https://example.com/padded.png  ");
+    assert_eq!(
+        McpIcon::from_rmcp(padded).unwrap().src,
+        "https://example.com/padded.png"
+    );
+
+    let data = rmcp::model::Icon::new("data:image/png;base64,aaa");
+    assert!(McpIcon::from_rmcp(data).is_some());
+}
+
+#[test]
+fn mcp_icon_from_rmcp_list_caps_count_and_src_bytes() {
+    let many: Vec<_> = (0..20)
+        .map(|i| rmcp::model::Icon::new(format!("https://example.com/{i}.png")))
+        .collect();
+    assert_eq!(
+        McpIcon::from_rmcp_list(Some(many)).len(),
+        MAX_MCP_ICONS_PER_ENTITY
+    );
+
+    let huge = format!("https://example.com/{}", "x".repeat(MAX_MCP_ICON_SRC_BYTES));
+    assert!(McpIcon::from_rmcp(rmcp::model::Icon::new(huge)).is_none());
+}
+
+#[test]
+fn mcp_icon_from_rmcp_caps_mime_type_and_sizes() {
+    let long_mime = "a".repeat(MAX_MCP_ICON_MIME_TYPE_BYTES + 1);
+    let converted = McpIcon::from_rmcp(
+        rmcp::model::Icon::new("https://example.com/icon.png").with_mime_type(long_mime),
+    )
+    .unwrap();
+    assert_eq!(converted.mime_type, None);
+
+    let many_sizes: Vec<_> = (0..20).map(|i| format!("{i}x{i}")).collect();
+    let converted = McpIcon::from_rmcp(
+        rmcp::model::Icon::new("https://example.com/icon.png").with_sizes(many_sizes),
+    )
+    .unwrap();
+    assert_eq!(
+        converted.sizes.as_ref().map(|s| s.len()),
+        Some(MAX_MCP_ICON_SIZES)
+    );
+
+    let long_token = "x".repeat(MAX_MCP_ICON_SIZE_TOKEN_BYTES + 1);
+    let converted = McpIcon::from_rmcp(
+        rmcp::model::Icon::new("https://example.com/icon.png")
+            .with_sizes(vec![long_token, "48x48".to_string()]),
+    )
+    .unwrap();
+    assert_eq!(converted.sizes.as_deref(), Some(&["48x48".to_string()][..]));
+}
+
+#[test]
+fn record_tool_icons_insert_empty_removes() {
+    let mut state = McpState::new(vec![]);
+    let name = "server__tool".to_string();
+    let icons = vec![McpIcon {
+        src: "https://example.com/a.png".to_string(),
+        mime_type: None,
+        sizes: None,
+        theme: None,
+    }];
+    state.record_tool_icons(name.clone(), icons);
+    assert_eq!(state.mcp_tool_icons.get(&name).map(|v| v.len()), Some(1));
+    state.record_tool_icons(name.clone(), Vec::new());
+    assert!(!state.mcp_tool_icons.contains_key(&name));
 }

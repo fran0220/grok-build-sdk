@@ -325,6 +325,7 @@ impl Core {
             effective_reasoning.clone(),
             harness_digest,
             capabilities.resolution.clone(),
+            capabilities.mcp_services.clone(),
             capabilities.in_process_mcp_services.clone(),
         );
         let mut meta = self.session_meta(&config, effective_reasoning.as_deref(), &capabilities)?;
@@ -466,6 +467,7 @@ impl Core {
             effective_reasoning.clone(),
             harness_digest,
             capabilities.resolution.clone(),
+            capabilities.mcp_services.clone(),
             capabilities.in_process_mcp_services.clone(),
         );
         let active_guard = ActiveMcpBindingGuard::new(self.mcp_bindings.clone(), id.0.clone());

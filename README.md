@@ -42,6 +42,12 @@ for the version of the code present in this tree.
 `UPSTREAM_GROK_BUILD_COMMIT` records the corresponding public
 `xai-org/grok-build` snapshot used by the SDK's automated upstream sync.
 
+The synchronized public snapshot is the upstream 1.0.6 source line at commit
+`19d42e35c07a9c9244f03f6df0c4c353f970d4f9` (`SOURCE_REV` records the embedded
+source revision). No public 1.0.7 tag or release was available at sync time;
+the commit and source-revision files are therefore the authoritative basis
+until an official 1.0.7 snapshot is published.
+
 </div>
 
 ---

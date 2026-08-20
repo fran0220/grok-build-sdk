@@ -790,6 +790,7 @@ impl MvpAgent {
             );
             insert_applied_tool_overrides(obj, applied_tool_overrides.as_ref());
         }
+        self.attach_status_line(&session_id, arguments.meta.as_ref(), init);
         #[cfg(all(feature = "local-workspace", unix))]
         local_ws_reap_guard.disarm();
         embedded_root_guard.disarm();
@@ -1077,6 +1078,7 @@ impl MvpAgent {
                 no_replay,
             )
             .await?;
+        self.attach_status_line(&session_id, request_meta.as_ref(), init);
         let ClientCaps {
             code_nav: client_code_nav_enabled,
             terminal: client_terminal,

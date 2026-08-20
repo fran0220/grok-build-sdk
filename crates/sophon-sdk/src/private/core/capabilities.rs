@@ -110,19 +110,29 @@ impl Core {
             id.as_str(),
             self.capability_meta(resolved).as_ref(),
         );
-        let mcp_servers: Vec<EmbeddedMcpServer> = resolved
-            .mcp_services
-            .iter()
-            .map(to_embedded_mcp_server)
-            .collect();
-        self.agent
-            .update_session_mcp_servers(
-                id.as_str().to_owned(),
-                mcp_servers,
-                self.in_process_mcp_servers_for(resolved),
-            )
-            .await
-            .map_err(|error| protocol("session/update_mcp_servers", error))?;
+        let mcp_changed = self
+            .session_bindings
+            .borrow()
+            .get(id.as_str())
+            .is_none_or(|binding| {
+                binding.mcp_services != resolved.mcp_services
+                    || binding.in_process_mcp_services != resolved.in_process_mcp_services
+            });
+        if mcp_changed {
+            let mcp_servers: Vec<EmbeddedMcpServer> = resolved
+                .mcp_services
+                .iter()
+                .map(to_embedded_mcp_server)
+                .collect();
+            self.agent
+                .update_session_mcp_servers(
+                    id.as_str().to_owned(),
+                    mcp_servers,
+                    self.in_process_mcp_servers_for(resolved),
+                )
+                .await
+                .map_err(|error| protocol("session/update_mcp_servers", error))?;
+        }
         self.agent.reload_skills_for_session(&id.0);
         Ok(())
     }
@@ -147,6 +157,7 @@ impl Core {
             .get_mut(&id.0)
             .ok_or_else(|| Error::Operation("session binding is unavailable".into()))?;
         binding.capabilities = resolved.resolution.clone();
+        binding.mcp_services = resolved.mcp_services.clone();
         binding.in_process_mcp_services = resolved.in_process_mcp_services.clone();
         Ok(resolved.resolution)
     }

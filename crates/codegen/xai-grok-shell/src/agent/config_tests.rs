@@ -7492,7 +7492,6 @@ fn remote_settings_disarm_requires_prod_proxy_when_keys_embedded() {
         true,
     );
 }
-
 fn assert_no_ambient_endpoint_credentials(cfg: &Config) {
     let endpoints = &cfg.endpoints;
     assert!(endpoints.alpha_test_key.is_none());
@@ -7552,4 +7551,40 @@ fn origin_desktop_keeps_features_inside_isolated_boundary() {
     assert_eq!(cfg.features.telemetry, Some(TelemetryMode::Disabled));
     assert_eq!(cfg.cli.auto_update, Some(false));
     assert_no_ambient_endpoint_credentials(&cfg);
+}
+
+#[test]
+fn a_status_line_the_parser_could_not_read_in_full_reaches_grok_inspect() {
+    use super::super::config_model_override_parse::{ConfigWarningKind, WarningTarget};
+    let raw_config: toml::Value = toml::from_str(
+        r#"
+            [ui]
+            theme = "kanagawa"
+
+            [ui.status_line]
+            type = "disabled"
+            padding = "2"
+            colour = "red"
+            "#,
+    )
+    .unwrap();
+    let cfg = Config::new_from_toml_cfg(&raw_config).expect("a typo must not fail the config");
+    let warnings = |path: &str, kind: ConfigWarningKind| {
+        cfg.config_warnings
+            .iter()
+            .filter(|w| {
+                w.kind == kind
+                    && matches!(&w.target, WarningTarget::ConfigKey { path: p } if p == path)
+            })
+            .count()
+    };
+    assert_eq!(
+        warnings("ui.status_line", ConfigWarningKind::InvalidValue),
+        1
+    );
+    assert_eq!(
+        warnings("ui.status_line.colour", ConfigWarningKind::UnknownField),
+        1
+    );
+    assert_eq!(cfg.ui.theme.as_deref(), Some("kanagawa"));
 }

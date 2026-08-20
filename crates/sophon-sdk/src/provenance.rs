@@ -12,7 +12,10 @@ pub struct SourceProvenance {
 }
 pub fn source_provenance() -> SourceProvenance {
     SourceProvenance {
-        upstream_release: "1.0.3",
+        // The public upstream snapshot currently carries the 1.0.6 crate
+        // version. No public 1.0.7 tag or release was available when this
+        // snapshot was synchronized; keep the commit fields authoritative.
+        upstream_release: "1.0.6",
         fork_commit: env!("SOPHON_SDK_COMMIT"),
         upstream_source_rev: include_str!("../../../SOURCE_REV").trim(),
         facade_version: env!("CARGO_PKG_VERSION"),

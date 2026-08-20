@@ -136,6 +136,7 @@ async fn create_test_actor_with_memory(
         .map_or_else(Default::default, |mc| mc.initial_injection.clone());
     SessionActor {
         projects_chat_history: true,
+        status_wake: Default::default(),
         session_info: SessionInfo {
             id: acp::SessionId::new("test-memory"),
             cwd: cwd.as_str().to_string(),
@@ -242,6 +243,7 @@ async fn create_test_actor_with_memory(
         agent: std::cell::RefCell::new(test_agent_default().await),
         last_reported_branch: std::sync::Arc::new(parking_lot::Mutex::new(None)),
         git_head_enabled: false,
+        status_line_enabled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         models_manager: Default::default(),
         display_cwd: std::sync::OnceLock::new(),
         active_agent_type: parking_lot::Mutex::new(None),
