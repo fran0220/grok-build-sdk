@@ -9,8 +9,10 @@ An embedding application can supply every inference credential directly. It does
 - `RuntimeConfig.models` defines the fixed catalog and backend contract.
 - `Runtime::list_models` reads that live host-owned catalog through the typed
   `x.ai/models/list` contract, including forward-compatible metadata for
-  context-window, agent-harness, and reasoning-effort discovery. It is
+  context-window, model-family, agent-harness, and reasoning-effort discovery. It is
   available in both profiles without enabling the generic extension bridge.
+- `ModelSpec::model_family` optionally supplies that stable family identifier;
+  `Runtime::list_models` exposes it as `AvailableModel.metadata["modelFamily"]`.
 - `RuntimeBuilder::model_provider` or `RuntimeServices::model_providers` selects a protocol, base URL, literal API key, provider wire-model slug, request headers, and query parameters independently for each catalog model. When every model has an explicit provider, the legacy `RuntimeConfig.endpoint` and `api_key` may be empty.
 - `AgentServiceConfig` routes built-in subagent names and the web-search, session-summary, image-description, and prompt-suggestion auxiliary calls to catalog models. Those catalog models can each use a different provider.
 - `MediaProviderConfig` and `MediaServiceConfig` independently enable image generation, image editing, image-to-video, and reference-to-video, including an explicit API URL, key, headers, query parameters, and four model slugs. Query parameters are preserved on image generation/edit and video start/poll requests. The static media credential cannot be replaced by the primary model's rotating credential.
@@ -571,7 +573,7 @@ All production transports use rmcp 3.1.2 and the modern discovery lifecycle. The
 
 The public session-scoped MCP API covers:
 
-- server/tool catalogs with transport and setup credentials removed, plus tool calls and tool/server enablement; explicit catalog calls retain server-provided tool metadata and negotiated capability details for hosts that request them;
+- server/tool catalogs with transport and setup credentials removed, plus tool calls and tool/server enablement; explicit catalog calls retain server-provided tool metadata, plugin source labels, negotiated capability details, and bounded `https://`/`data:image/*` protocol icons for hosts that request them;
 - resource list, resource-template list and resource reads, including single-round MRTR continuations;
 - prompt list/get and prompt/resource argument completion, including single-round MRTR continuations;
 - single-round tool calls with typed complete, input-required, and Task outcomes;
@@ -581,7 +583,14 @@ The public session-scoped MCP API covers:
 - protocol ping;
 - HTTP OAuth status/start and atomic server replacement;
 - SDK-owned, identity-aware, full-duplex in-process MCP servers through `InProcessMcpHandler`; their bounded notification peer is invalidated when the owning session incarnation is unloaded or replaced;
-- typed server-status, tools-changed and initialization-progress events. Push events omit raw payloads, status details, tool metadata and capability-extension values; unknown MCP control-plane notifications are suppressed rather than exposing unreviewed configuration data.
+- typed server-status, tools-changed and initialization-progress events. Tools-changed events retain bounded protocol icons but omit raw payloads and tool metadata; status details and capability-extension values also remain omitted, and unknown MCP control-plane notifications are suppressed rather than exposing unreviewed configuration data.
+
+MCP method names, server-status wire types, model-list envelopes, tool entries,
+and icon ingest limits come from the bundled native crates rather than an SDK
+copy. The public `McpServerConfig`, MRTR/Task identities, and in-process binding
+types remain SDK-owned deliberately: they enforce the Host's redaction,
+durability, and session-incarnation contracts rather than mirroring transport
+implementation types.
 
 Modern roots, model sampling, and elicitation requests are carried by MRTR `inputRequests`. Roots and sampling may be answered through installed typed host services or an `McpContinuation` created with `McpInputRequired::respond`; elicitation answers are accepted only from the installed `McpElicitationUi`. A continuation is bound to its session incarnation, server, connection generation, operation kind and target; cross-operation reuse, mutation of the projected input round, and reuse after reconnect fail closed, while the opaque `requestState` is returned unchanged. The legacy unrestricted reverse-request path is not used for these roles. Capabilities are advertised only when the corresponding typed service is installed and authorized. Unknown input-request methods fail closed.
 

@@ -46,6 +46,12 @@ fn typed_mcp_catalog_is_allowlist_redacted() {
     let servers = parse_mcp_servers(&serde_json::json!({
         "servers": [{
             "name": "fixture",
+            "displayName": "Fixture MCP",
+            "sourceLabel": "plugin: fixture",
+            "icons": [
+                {"src": " https://example.com/server.png ", "mimeType": " image/png "},
+                {"src": "http://insecure.example/server.png"}
+            ],
             "source": "local",
             "type": "stdio",
             "command": "/secret/command",
@@ -55,7 +61,11 @@ fn typed_mcp_catalog_is_allowlist_redacted() {
             "session": {
                 "enabled": true,
                 "status": "ready",
-                "tools": [{"name": "echo", "enabled": true}]
+                "tools": [{
+                    "name": "echo",
+                    "enabled": true,
+                    "icons": [{"src": "data:image/png;base64,aaa", "sizes": ["48x48"]}]
+                }]
             }
         }]
     }))
@@ -71,7 +81,41 @@ fn typed_mcp_catalog_is_allowlist_redacted() {
         assert!(!json.contains(secret), "redacted catalog leaked {secret}");
     }
     assert_eq!(servers[0].transport, McpTransportKind::Stdio);
+    assert_eq!(servers[0].source_label.as_deref(), Some("plugin: fixture"));
+    assert_eq!(servers[0].icons.len(), 1);
+    assert_eq!(servers[0].icons[0].src, "https://example.com/server.png");
+    assert_eq!(servers[0].icons[0].mime_type.as_deref(), Some("image/png"));
     assert_eq!(servers[0].tools[0].name, "echo");
+    assert_eq!(servers[0].tools[0].icons.len(), 1);
+    assert_eq!(
+        servers[0].tools[0].icons[0].src,
+        "data:image/png;base64,aaa"
+    );
+}
+
+#[test]
+fn mcp_catalog_normalizes_auth_and_setup_statuses() {
+    let servers = parse_mcp_servers(&serde_json::json!({
+        "servers": [
+            {
+                "name": "auth",
+                "source": "local",
+                "type": "http",
+                "url": "",
+                "session": {"enabled": true, "authRequired": true}
+            },
+            {
+                "name": "setup",
+                "source": "local",
+                "type": "http",
+                "url": "",
+                "session": {"enabled": false, "setupRequired": true}
+            }
+        ]
+    }))
+    .expect("catalog parses");
+    assert_eq!(servers[0].status, Some(McpServerStatus::NeedsAuth));
+    assert_eq!(servers[1].status, Some(McpServerStatus::SetupRequired));
 }
 
 fn test_subscription(

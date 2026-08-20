@@ -2228,7 +2228,7 @@ impl acp::Agent for MvpAgent {
             "x.ai/workspaces/list" => {
                 crate::agent::handlers::workspaces::handle(self, &args).await
             }
-            "x.ai/models/list" => {
+            crate::cli_models::MODELS_LIST_METHOD => {
                 crate::agent::handlers::models::handle(self, &args).await
             }
             "x.ai/session/updates" => {

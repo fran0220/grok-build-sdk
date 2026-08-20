@@ -12,6 +12,7 @@ async fn explicit_model_providers_route_endpoint_auth_headers_and_wire_model() {
     config.api_key.clear();
     config.models.push(ModelSpec {
         id: "deep-model".into(),
+        model_family: None,
         context_window: 65_536,
         api_backend: ApiBackend::ChatCompletions,
         supports_reasoning: false,
@@ -280,6 +281,7 @@ async fn auxiliary_session_summary_uses_its_catalog_provider() {
     config.api_key.clear();
     config.models.push(ModelSpec {
         id: "utility-model".into(),
+        model_family: None,
         context_window: 32_768,
         api_backend: ApiBackend::ChatCompletions,
         supports_reasoning: false,
@@ -359,6 +361,7 @@ async fn auxiliary_image_description_uses_its_catalog_provider() {
     config.api_key.clear();
     config.models.push(ModelSpec {
         id: "vision-model".into(),
+        model_family: None,
         context_window: 32_768,
         api_backend: ApiBackend::ChatCompletions,
         supports_reasoning: false,
@@ -433,6 +436,7 @@ async fn auxiliary_prompt_suggestion_uses_its_catalog_provider() {
     config.api_key.clear();
     config.models.push(ModelSpec {
         id: "suggestion-model".into(),
+        model_family: None,
         context_window: 32_768,
         api_backend: ApiBackend::ChatCompletions,
         supports_reasoning: false,
@@ -547,6 +551,7 @@ async fn auxiliary_web_search_uses_its_catalog_provider() {
     config.api_key.clear();
     config.models.push(ModelSpec {
         id: "search-model".into(),
+        model_family: None,
         context_window: 32_768,
         api_backend: ApiBackend::Responses,
         supports_reasoning: false,
@@ -622,6 +627,7 @@ async fn explicit_subagent_model_uses_its_configured_provider() {
     config.api_key.clear();
     config.models.push(ModelSpec {
         id: "child-model".into(),
+        model_family: None,
         context_window: 65_536,
         api_backend: ApiBackend::ChatCompletions,
         supports_reasoning: false,

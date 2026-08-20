@@ -78,13 +78,19 @@ fn default_true() -> bool {
     true
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct McpListResponse {
     pub servers: Vec<McpServerEntry>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+/// Decode the canonical `x.ai/mcp/list` result without requiring embedded
+/// consumers to duplicate the catalog wire schema.
+pub fn parse_mcp_list_value(raw: serde_json::Value) -> serde_json::Result<Vec<McpServerEntry>> {
+    serde_json::from_value::<McpListResponse>(raw).map(|response| response.servers)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct McpServerEntry {
     pub name: String,
@@ -110,7 +116,7 @@ pub struct McpServerEntry {
 /// Distinct from `acp::McpServer` (session/new input) because:
 /// - HTTP: exposes `scope`/`scope_id`/`scope_name` for connector selection, NOT headers (auth tokens stay private)
 /// - Stdio: same structure but optimized for JSON wire format
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum McpServerConfig {
     #[serde(rename = "http")]
@@ -135,7 +141,7 @@ pub enum McpServerConfig {
     ManagedGateway,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct McpEnvVar {
     pub name: String,
     pub value: String,
@@ -172,7 +178,7 @@ pub enum McpServerSource {
     Local,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct McpServerSessionState {
     pub enabled: bool,
@@ -188,11 +194,12 @@ pub struct McpServerSessionState {
     pub negotiated: Option<serde_json::Value>,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum McpSessionStatus {
     Ready,
     Initializing,
+    #[serde(alias = "setup_required")]
     SetupRequired,
     Unavailable,
 }
@@ -321,6 +328,7 @@ pub struct McpToolsChanged {
 // duplicating definitions.
 pub use crate::session::mcp_dispatcher::{
     McpServerStatus, McpServerStatusPayload, McpServerStatusReason, SERVER_STATUS_METHOD,
+    TASK_STATUS_METHOD,
 };
 
 #[derive(Debug, Deserialize)]
@@ -2687,6 +2695,7 @@ mod tests {
         let mut entry = McpServerEntry {
             name: "secret".to_owned(),
             display_name: None,
+            icons: Vec::new(),
             source: McpServerSource::Local,
             source_label: None,
             setup: None,
@@ -2755,6 +2764,7 @@ mod tests {
                 }],
                 auth_required: false,
                 setup_required: false,
+                negotiated: None,
             }),
         };
         let json = serde_json::to_value(&entry).unwrap();

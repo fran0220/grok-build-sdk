@@ -2322,6 +2322,22 @@ fn acp_model_meta_includes_agent_type_when_present() {
     assert_eq!(meta["agentType"], "codex");
     assert_eq!(meta["totalContextTokens"], 256_000);
 }
+
+#[test]
+fn acp_model_meta_includes_model_family_when_present() {
+    let mut models = IndexMap::new();
+    let mut entry = test_model_entry("test-model", "https://test.api/v1", None, None, None);
+    entry.info.model_family = Some("xai".to_string());
+    models.insert("test-model".to_string(), entry);
+    let acp_models = to_acp_model_info(&models);
+    let meta = acp_models
+        .values()
+        .next()
+        .and_then(|model| model.meta.as_ref())
+        .expect("meta should be present");
+    assert_eq!(meta["modelFamily"], "xai");
+}
+
 #[test]
 fn acp_model_meta_always_includes_agent_type() {
     let mut models = IndexMap::new();

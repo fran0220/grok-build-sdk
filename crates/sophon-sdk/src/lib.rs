@@ -143,8 +143,8 @@ pub(crate) use tokio::sync::mpsc;
 /// Typed MCP 2026 client-role services. SDK users implement these traits
 /// directly; no transport service or raw shell protocol is exposed.
 pub use xai_grok_mcp::servers::{
-    McpElicitationService, McpHostContext, McpHostServiceError, McpHostServices, McpRootsService,
-    McpSamplingService,
+    McpElicitationService, McpHostContext, McpHostServiceError, McpHostServices, McpIcon,
+    McpIconTheme, McpRootsService, McpSamplingService,
 };
 
 /// Authoritative data models used by the typed MCP host-service traits.

@@ -388,6 +388,31 @@ fn known_mcp_notifications_are_typed_and_unknown_methods_fail_closed() {
         .is_none()
     );
 
+    let tools_changed = typed_mcp_notification(
+        "x.ai/mcp/tools_changed",
+        &serde_json::json!({
+            "sessionId": "session-1",
+            "serverName": "fixture",
+            "tools": [{
+                "name": "echo",
+                "icons": [
+                    {"src": "https://example.com/tool.png"},
+                    {"src": "javascript:alert(1)"}
+                ],
+                "_meta": {"token": "must-not-escape"}
+            }]
+        }),
+    )
+    .expect("typed tools-changed event");
+    assert!(matches!(
+        tools_changed,
+        EventUpdate::McpToolsChanged(crate::McpToolsChangedEvent { tools, .. })
+            if tools.len() == 1
+                && tools[0].icons.len() == 1
+                && tools[0].icons[0].src == "https://example.com/tool.png"
+                && tools[0].meta.is_null()
+    ));
+
     let servers = typed_mcp_notification(
         "x.ai/mcp/servers_updated",
         &serde_json::json!({
@@ -396,6 +421,7 @@ fn known_mcp_notifications_are_typed_and_unknown_methods_fail_closed() {
                 "name": "fixture",
                 "source": "local",
                 "type": "stdio",
+                "command": "",
                 "env": [{"name": "TOKEN", "value": "must-not-escape"}],
                 "session": {
                     "enabled": true,

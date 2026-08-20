@@ -457,7 +457,8 @@ impl Client {
                 xai_grok_shell::origin_runtime::resolve_root_session(session_id, None)
             })
             .unwrap_or_else(|| SessionId::runtime_events().0);
-        let is_mcp_notification = method.starts_with("x.ai/mcp/");
+        let is_mcp_notification =
+            method.starts_with(xai_grok_shell::extensions::mcp::mcp_methods::PREFIX);
         let update = match typed_mcp_notification(method, &payload) {
             Some(update) => update,
             None if is_mcp_notification => return Ok(()),
@@ -552,43 +553,17 @@ pub(super) fn typed_mcp_notification(
     payload: &serde_json::Value,
 ) -> Option<EventUpdate> {
     match method {
-        "x.ai/mcp/server_status" => {
+        xai_grok_shell::extensions::mcp::SERVER_STATUS_METHOD => {
+            let payload: xai_grok_shell::extensions::mcp::McpServerStatusPayload =
+                serde_json::from_value(payload.clone()).ok()?;
             Some(EventUpdate::McpServerStatus(crate::McpServerStatusEvent {
-                name: payload["name"].as_str()?.to_owned(),
-                source: match payload["source"].as_str() {
-                    Some("local") => crate::McpServerSource::Local,
-                    Some("managed") => crate::McpServerSource::Managed,
-                    _ => crate::McpServerSource::Unknown,
-                },
-                status: match payload["status"].as_str() {
-                    Some("ready") => crate::McpServerStatus::Ready,
-                    Some("initializing") => crate::McpServerStatus::Initializing,
-                    Some("setuprequired") | Some("setup_required") => {
-                        crate::McpServerStatus::SetupRequired
-                    }
-                    Some("unavailable") => crate::McpServerStatus::Unavailable,
-                    Some("needsauth") | Some("needs_auth") => crate::McpServerStatus::NeedsAuth,
-                    _ => crate::McpServerStatus::Unknown,
-                },
-                reason: match payload["reason"].as_str() {
-                    Some("transport_closed") => crate::McpServerStatusReason::TransportClosed,
-                    Some("handshake_failed") => crate::McpServerStatusReason::HandshakeFailed,
-                    Some("config_added") => crate::McpServerStatusReason::ConfigAdded,
-                    Some("config_removed") => crate::McpServerStatusReason::ConfigRemoved,
-                    Some("config_changed") => crate::McpServerStatusReason::ConfigChanged,
-                    Some("disabled") => crate::McpServerStatusReason::Disabled,
-                    Some("auth_expired") => crate::McpServerStatusReason::AuthExpired,
-                    Some("initialized") => crate::McpServerStatusReason::Initialized,
-                    Some("restart_succeeded") => crate::McpServerStatusReason::RestartSucceeded,
-                    Some("restart_failed") => crate::McpServerStatusReason::RestartFailed,
-                    Some("managed_token_refreshed") => {
-                        crate::McpServerStatusReason::ManagedTokenRefreshed
-                    }
-                    _ => crate::McpServerStatusReason::Unknown,
-                },
+                name: payload.name,
+                source: crate::project_mcp_source(payload.source),
+                status: crate::project_mcp_status(payload.status),
+                reason: crate::project_mcp_status_reason(payload.reason),
             }))
         }
-        "x.ai/mcp/task_status" => {
+        xai_grok_shell::extensions::mcp::TASK_STATUS_METHOD => {
             let session_id = SessionId(payload["sessionId"].as_str()?.to_owned());
             let server = payload["server"].as_str()?;
             let client_id = payload["clientId"].as_u64()?;
@@ -624,22 +599,19 @@ pub(super) fn typed_mcp_notification(
                 last_updated_at,
             }))
         }
-        "x.ai/mcp/tools_changed" => {
-            let server_name = payload["serverName"]
-                .as_str()
-                .filter(|name| !name.is_empty())
-                .map(str::to_owned);
-            let tools = payload["tools"]
-                .as_array()
+        xai_grok_shell::extensions::mcp::mcp_methods::TOOLS_CHANGED => {
+            let payload: xai_grok_shell::extensions::mcp::McpToolsChanged =
+                serde_json::from_value(payload.clone()).ok()?;
+            let server_name = (!payload.server_name.is_empty()).then_some(payload.server_name);
+            let tools = payload
+                .tools
                 .into_iter()
-                .flatten()
-                .map(|tool| crate::McpToolInfo {
-                    server: server_name.clone().unwrap_or_default(),
-                    name: tool["name"].as_str().unwrap_or_default().to_owned(),
-                    display_name: tool["displayName"].as_str().map(str::to_owned),
-                    description: tool["description"].as_str().map(str::to_owned),
-                    enabled: tool["enabled"].as_bool().unwrap_or(true),
-                    meta: serde_json::Value::Null,
+                .map(|tool| {
+                    crate::project_mcp_tool_entry(
+                        server_name.as_deref().unwrap_or_default(),
+                        tool,
+                        false,
+                    )
                 })
                 .collect();
             Some(EventUpdate::McpToolsChanged(crate::McpToolsChangedEvent {
@@ -647,13 +619,13 @@ pub(super) fn typed_mcp_notification(
                 tools,
             }))
         }
-        "x.ai/mcp/init_progress" => Some(EventUpdate::McpInitializationProgress(
-            crate::McpInitializationProgress {
+        xai_grok_shell::extensions::mcp::mcp_methods::INIT_PROGRESS => Some(
+            EventUpdate::McpInitializationProgress(crate::McpInitializationProgress {
                 connected: payload["connected"].as_u64()?.try_into().ok()?,
                 total: payload["total"].as_u64()?.try_into().ok()?,
-            },
-        )),
-        "x.ai/mcp/servers_updated" => {
+            }),
+        ),
+        xai_grok_shell::extensions::mcp::mcp_methods::SERVERS_UPDATED => {
             let mut catalog = serde_json::Map::new();
             catalog.insert("servers".to_owned(), payload.get("mcpServers")?.clone());
             crate::parse_mcp_servers(&serde_json::Value::Object(catalog))

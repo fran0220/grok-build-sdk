@@ -142,22 +142,19 @@ pub struct McpIcon {
 }
 
 impl McpIcon {
-    /// Convert an rmcp icon with ingest rules: trim `src`, allow only
-    /// `https://` and `data:image/…`, drop empty/oversized values.
-    pub fn from_rmcp(icon: rmcp::model::Icon) -> Option<Self> {
-        let src = icon.src.trim();
+    /// Apply the protocol-icon ingest policy to an already decoded wire icon.
+    /// This is shared by rmcp discovery and embedded SDK catalog projection so
+    /// neither boundary can bypass the source and size limits.
+    pub fn sanitized(mut self) -> Option<Self> {
+        let src = self.src.trim();
         if src.is_empty() || src.len() > MAX_MCP_ICON_SRC_BYTES {
             return None;
         }
         if !is_allowed_mcp_icon_src(src) {
             return None;
         }
-        let theme = match icon.theme {
-            Some(rmcp::model::IconTheme::Light) => Some(McpIconTheme::Light),
-            Some(rmcp::model::IconTheme::Dark) => Some(McpIconTheme::Dark),
-            _ => None,
-        };
-        let mime_type = icon.mime_type.and_then(|mime| {
+        self.src = src.to_owned();
+        self.mime_type = self.mime_type.and_then(|mime| {
             let mime = mime.trim();
             if mime.is_empty() || mime.len() > MAX_MCP_ICON_MIME_TYPE_BYTES {
                 None
@@ -165,7 +162,7 @@ impl McpIcon {
                 Some(mime.to_owned())
             }
         });
-        let sizes = icon.sizes.map(|sizes| {
+        self.sizes = self.sizes.map(|sizes| {
             sizes
                 .into_iter()
                 .filter_map(|size| {
@@ -179,13 +176,35 @@ impl McpIcon {
                 .take(MAX_MCP_ICON_SIZES)
                 .collect::<Vec<_>>()
         });
-        let sizes = sizes.filter(|sizes| !sizes.is_empty());
-        Some(Self {
-            src: src.to_owned(),
-            mime_type,
-            sizes,
+        self.sizes = self.sizes.filter(|sizes| !sizes.is_empty());
+        Some(self)
+    }
+
+    /// Sanitize and bound a decoded icon list using the same policy as MCP
+    /// discovery.
+    pub fn sanitized_list(icons: Vec<Self>) -> Vec<Self> {
+        icons
+            .into_iter()
+            .filter_map(Self::sanitized)
+            .take(MAX_MCP_ICONS_PER_ENTITY)
+            .collect()
+    }
+
+    /// Convert an rmcp icon with ingest rules: trim `src`, allow only
+    /// `https://` and `data:image/…`, drop empty/oversized values.
+    pub fn from_rmcp(icon: rmcp::model::Icon) -> Option<Self> {
+        let theme = match icon.theme {
+            Some(rmcp::model::IconTheme::Light) => Some(McpIconTheme::Light),
+            Some(rmcp::model::IconTheme::Dark) => Some(McpIconTheme::Dark),
+            _ => None,
+        };
+        Self {
+            src: icon.src,
+            mime_type: icon.mime_type,
+            sizes: icon.sizes,
             theme,
-        })
+        }
+        .sanitized()
     }
 
     pub fn from_rmcp_list(icons: Option<Vec<rmcp::model::Icon>>) -> Vec<Self> {

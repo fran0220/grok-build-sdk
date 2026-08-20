@@ -548,6 +548,7 @@ mod tests {
                 base_url: "https://api.x.ai/v1".to_string(),
                 model: "grok-4".to_string(),
                 extra_headers: Default::default(),
+                query_params: Default::default(),
                 alpha_test_key: None,
                 allowed_domains: None,
                 excluded_domains: None,

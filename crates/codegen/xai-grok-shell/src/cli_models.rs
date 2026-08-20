@@ -6,6 +6,8 @@ use xai_acp_lib::{AcpAgentTx, acp_send};
 
 use crate::agent::config::Config as AgentConfig;
 
+pub const MODELS_LIST_METHOD: &str = "x.ai/models/list";
+
 /// Status for the `grok models` banner (display order ≠ sampling priority; see [`AuthStatus::resolve`]).
 #[derive(Debug, PartialEq, Eq)]
 pub enum AuthStatus {
@@ -86,7 +88,7 @@ pub async fn list_models(
 pub async fn fetch_model_state(acp_tx: &AcpAgentTx) -> Result<acp::SessionModelState> {
     let params = serde_json::value::to_raw_value(&serde_json::json!({}))?;
     let resp: acp::ExtResponse = acp_send(
-        acp::ExtRequest::new("x.ai/models/list", params.into()),
+        acp::ExtRequest::new(MODELS_LIST_METHOD, params.into()),
         acp_tx,
     )
     .await?;
@@ -96,8 +98,14 @@ pub async fn fetch_model_state(acp_tx: &AcpAgentTx) -> Result<acp::SessionModelS
 /// Parse an `x.ai/models/list` payload; a handler error wins over a
 /// missing result.
 fn parse_models_list_response(raw: &str) -> Result<acp::SessionModelState> {
+    parse_models_list_value(serde_json::from_str(raw)?)
+}
+
+/// Decode the canonical `x.ai/models/list` extension envelope without making
+/// embedded consumers mirror ACP's model-state DTOs.
+pub fn parse_models_list_value(raw: serde_json::Value) -> Result<acp::SessionModelState> {
     let parsed: crate::session::ExtMethodResult<acp::SessionModelState> =
-        serde_json::from_str(raw)?;
+        serde_json::from_value(raw)?;
     if let Some(err) = parsed.error {
         anyhow::bail!("models/list failed: {err}");
     }

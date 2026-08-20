@@ -45,57 +45,136 @@ pub(crate) fn parse_mcp_authentication_state(status: &str) -> McpAuthenticationS
     }
 }
 
+pub(crate) fn project_mcp_source(
+    source: xai_grok_shell::extensions::mcp::McpServerSource,
+) -> McpServerSource {
+    match source {
+        xai_grok_shell::extensions::mcp::McpServerSource::Local => McpServerSource::Local,
+        xai_grok_shell::extensions::mcp::McpServerSource::Managed => McpServerSource::Managed,
+    }
+}
+
+pub(crate) fn project_mcp_status(
+    status: xai_grok_shell::extensions::mcp::McpServerStatus,
+) -> McpServerStatus {
+    match status {
+        xai_grok_shell::extensions::mcp::McpServerStatus::Ready => McpServerStatus::Ready,
+        xai_grok_shell::extensions::mcp::McpServerStatus::Initializing => {
+            McpServerStatus::Initializing
+        }
+        xai_grok_shell::extensions::mcp::McpServerStatus::Unavailable => {
+            McpServerStatus::Unavailable
+        }
+        xai_grok_shell::extensions::mcp::McpServerStatus::NeedsAuth => McpServerStatus::NeedsAuth,
+    }
+}
+
+pub(crate) fn project_mcp_status_reason(
+    reason: xai_grok_shell::extensions::mcp::McpServerStatusReason,
+) -> McpServerStatusReason {
+    use xai_grok_shell::extensions::mcp::McpServerStatusReason as Native;
+    match reason {
+        Native::TransportClosed => McpServerStatusReason::TransportClosed,
+        Native::HandshakeFailed => McpServerStatusReason::HandshakeFailed,
+        Native::ConfigAdded => McpServerStatusReason::ConfigAdded,
+        Native::ConfigRemoved => McpServerStatusReason::ConfigRemoved,
+        Native::ConfigChanged => McpServerStatusReason::ConfigChanged,
+        Native::Disabled => McpServerStatusReason::Disabled,
+        Native::AuthExpired => McpServerStatusReason::AuthExpired,
+        Native::Initialized => McpServerStatusReason::Initialized,
+        Native::RestartSucceeded => McpServerStatusReason::RestartSucceeded,
+        Native::RestartFailed => McpServerStatusReason::RestartFailed,
+        Native::ManagedTokenRefreshed => McpServerStatusReason::ManagedTokenRefreshed,
+    }
+}
+
+pub(crate) fn project_mcp_tool_entry(
+    server: &str,
+    tool: xai_grok_shell::extensions::mcp::McpToolEntry,
+    include_meta: bool,
+) -> McpToolInfo {
+    McpToolInfo {
+        server: server.to_owned(),
+        name: tool.name,
+        display_name: tool.display_name,
+        description: tool.description,
+        icons: McpIcon::sanitized_list(tool.icons),
+        enabled: tool.enabled,
+        meta: include_meta
+            .then_some(tool.meta)
+            .flatten()
+            .unwrap_or(serde_json::Value::Null),
+    }
+}
+
+fn project_mcp_session_status(
+    status: xai_grok_shell::extensions::mcp::McpSessionStatus,
+) -> McpServerStatus {
+    use xai_grok_shell::extensions::mcp::McpSessionStatus as Native;
+    match status {
+        Native::Ready => McpServerStatus::Ready,
+        Native::Initializing => McpServerStatus::Initializing,
+        Native::SetupRequired => McpServerStatus::SetupRequired,
+        Native::Unavailable => McpServerStatus::Unavailable,
+    }
+}
+
+fn project_mcp_transport(
+    config: &xai_grok_shell::extensions::mcp::McpServerConfig,
+) -> McpTransportKind {
+    use xai_grok_shell::extensions::mcp::McpServerConfig as Native;
+    match config {
+        Native::Stdio { .. } => McpTransportKind::Stdio,
+        Native::Http { .. } => McpTransportKind::Http,
+        Native::ManagedGateway => McpTransportKind::ManagedGateway,
+    }
+}
+
 pub(crate) fn parse_mcp_servers(value: &serde_json::Value) -> Result<Vec<McpServerSummary>, Error> {
-    let entries = value
-        .get("servers")
-        .and_then(|v| v.as_array())
-        .ok_or_else(|| Error::Operation("invalid MCP catalog response".into()))?;
+    let entries = xai_grok_shell::extensions::mcp::parse_mcp_list_value(value.clone())
+        .map_err(|error| Error::Operation(format!("invalid MCP catalog response: {error}")))?;
     Ok(entries
-        .iter()
-        .map(|v| {
-            let name = v["name"].as_str().unwrap_or_default().to_owned();
-            let session = &v["session"];
-            let tools = session["tools"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .map(|t| McpToolInfo {
-                    server: name.clone(),
-                    name: t["name"].as_str().unwrap_or_default().into(),
-                    display_name: t["displayName"].as_str().map(Into::into),
-                    description: t["description"].as_str().map(Into::into),
-                    enabled: t["enabled"].as_bool().unwrap_or(true),
-                    meta: t.get("_meta").cloned().unwrap_or(serde_json::Value::Null),
-                })
-                .collect();
+        .into_iter()
+        .map(|entry| {
+            let name = entry.name;
+            let transport = project_mcp_transport(&entry.config);
+            let (enabled, status, auth_required, setup_required, tools, negotiated) =
+                if let Some(session) = entry.session {
+                    let status = if session.auth_required {
+                        Some(McpServerStatus::NeedsAuth)
+                    } else if session.setup_required {
+                        Some(McpServerStatus::SetupRequired)
+                    } else {
+                        session.status.map(project_mcp_session_status)
+                    };
+                    (
+                        session.enabled,
+                        status,
+                        session.auth_required,
+                        session.setup_required,
+                        session
+                            .tools
+                            .into_iter()
+                            .map(|tool| project_mcp_tool_entry(&name, tool, true))
+                            .collect(),
+                        session.negotiated,
+                    )
+                } else {
+                    (false, None, false, false, Vec::new(), None)
+                };
             McpServerSummary {
                 name,
-                display_name: v["displayName"].as_str().map(Into::into),
-                source: match v["source"].as_str() {
-                    Some("local") => McpServerSource::Local,
-                    Some("managed") => McpServerSource::Managed,
-                    _ => McpServerSource::Unknown,
-                },
-                transport: match v["type"].as_str() {
-                    Some("stdio") => McpTransportKind::Stdio,
-                    Some("http") => McpTransportKind::Http,
-                    Some("sse") => McpTransportKind::Sse,
-                    Some("managedGateway") => McpTransportKind::ManagedGateway,
-                    _ => McpTransportKind::Unknown,
-                },
-                enabled: session["enabled"].as_bool().unwrap_or(false),
-                status: session["status"].as_str().map(|s| match s {
-                    "ready" => McpServerStatus::Ready,
-                    "initializing" => McpServerStatus::Initializing,
-                    "setuprequired" | "setup_required" => McpServerStatus::SetupRequired,
-                    "unavailable" => McpServerStatus::Unavailable,
-                    "needsauth" | "needs_auth" => McpServerStatus::NeedsAuth,
-                    _ => McpServerStatus::Unknown,
-                }),
-                auth_required: session["authRequired"].as_bool().unwrap_or(false),
-                setup_required: session["setupRequired"].as_bool().unwrap_or(false),
+                display_name: entry.display_name,
+                source_label: entry.source_label,
+                icons: McpIcon::sanitized_list(entry.icons),
+                source: project_mcp_source(entry.source),
+                transport,
+                enabled,
+                status,
+                auth_required,
+                setup_required,
                 tools,
-                negotiated: session.get("negotiated").and_then(|negotiated| {
+                negotiated: negotiated.as_ref().and_then(|negotiated| {
                     let protocol_version = negotiated["protocolVersion"].as_str()?.to_owned();
                     let capabilities = negotiated.get("capabilities")?.clone();
                     let extensions: BTreeMap<String, serde_json::Value> =

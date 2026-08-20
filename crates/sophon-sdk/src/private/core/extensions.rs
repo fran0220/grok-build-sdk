@@ -49,45 +49,22 @@ impl Core {
         serde_json::from_value(response).map_err(op)
     }
     pub(super) async fn list_models(&self) -> Result<ModelCatalog, Error> {
-        #[derive(serde::Deserialize)]
-        struct ModelsListResult {
-            result: Option<SessionModelState>,
-            error: Option<serde_json::Value>,
-        }
-        #[derive(serde::Deserialize)]
-        #[serde(rename_all = "camelCase")]
-        struct SessionModelState {
-            current_model_id: String,
-            available_models: Vec<SessionModelInfo>,
-            #[serde(rename = "_meta")]
-            meta: Option<SessionMeta>,
-        }
-        #[derive(serde::Deserialize)]
-        #[serde(rename_all = "camelCase")]
-        struct SessionModelInfo {
-            model_id: String,
-            name: String,
-            description: Option<String>,
-            #[serde(rename = "_meta")]
-            meta: Option<SessionMeta>,
-        }
-
-        let response: ModelsListResult = self
-            .extension("x.ai/models/list", serde_json::json!({}))
-            .await?;
-        if let Some(error) = response.error {
-            return Err(Error::Operation(format!("models/list failed: {error}")));
-        }
-        let state = response
-            .result
-            .ok_or_else(|| Error::Operation("models/list response missing result".into()))?;
+        let response = self
+            .agent
+            .extension(
+                xai_grok_shell::cli_models::MODELS_LIST_METHOD,
+                serde_json::json!({}),
+            )
+            .await
+            .map_err(|error| protocol(xai_grok_shell::cli_models::MODELS_LIST_METHOD, error))?;
+        let state = xai_grok_shell::cli_models::parse_models_list_value(response).map_err(op)?;
         Ok(ModelCatalog {
-            current_model_id: state.current_model_id,
+            current_model_id: state.current_model_id.0.to_string(),
             available_models: state
                 .available_models
                 .into_iter()
                 .map(|model| AvailableModel {
-                    id: model.model_id,
+                    id: model.model_id.0.to_string(),
                     name: model.name,
                     description: model.description,
                     metadata: model.meta,

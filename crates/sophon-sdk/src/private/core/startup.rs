@@ -137,6 +137,7 @@ impl Core {
             let entry: ModelEntryConfig = serde_json::from_value(serde_json::json!({
                 "id": model.id,
                 "model": provider_model,
+                "model_family": model.model_family,
                 "base_url": base_url,
                 "api_key": api_key,
                 "extra_headers": extra_headers,

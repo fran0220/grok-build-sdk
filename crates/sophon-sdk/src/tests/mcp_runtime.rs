@@ -1122,6 +1122,7 @@ async fn live_gateway_model_calls_sdk_owned_mcp_and_journals_the_turn() {
         session_storage: root.path().join("sessions"),
         models: vec![ModelSpec {
             id: "grok-4.5".into(),
+            model_family: None,
             context_window: 131_072,
             api_backend: ApiBackend::ChatCompletions,
             supports_reasoning: false,

@@ -236,6 +236,7 @@ fn runtime_config(root: &TempDir, endpoint: String) -> RuntimeConfig {
         models: vec![
             ModelSpec {
                 id: "fast".into(),
+                model_family: None,
                 context_window: 131_072,
                 api_backend: ApiBackend::ChatCompletions,
                 supports_reasoning: true,
@@ -244,6 +245,7 @@ fn runtime_config(root: &TempDir, endpoint: String) -> RuntimeConfig {
             },
             ModelSpec {
                 id: "deep".into(),
+                model_family: None,
                 context_window: 131_072,
                 api_backend: ApiBackend::ChatCompletions,
                 supports_reasoning: true,

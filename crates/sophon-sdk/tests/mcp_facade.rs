@@ -31,6 +31,7 @@ fn runtime_config(root: &TempDir) -> RuntimeConfig {
         session_storage: root.path().join("sessions"),
         models: vec![ModelSpec {
             id: "test-model".into(),
+            model_family: None,
             context_window: 131_072,
             api_backend: ApiBackend::ChatCompletions,
             supports_reasoning: false,

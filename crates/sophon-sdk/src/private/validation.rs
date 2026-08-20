@@ -4,12 +4,16 @@ pub(super) fn validate(c: &RuntimeConfig, options: &RuntimeOptions) -> Result<()
     if c.models.is_empty() {
         return Err(Error::InvalidConfig("model catalog is required".into()));
     }
-    if c.models
-        .iter()
-        .any(|m| m.id.trim().is_empty() || NonZeroU64::new(m.context_window).is_none())
-    {
+    if c.models.iter().any(|m| {
+        m.id.trim().is_empty()
+            || m.model_family
+                .as_deref()
+                .is_some_and(|family| family.trim().is_empty() || family.len() > 128)
+            || NonZeroU64::new(m.context_window).is_none()
+    }) {
         return Err(Error::InvalidConfig(
-            "model id and non-zero context window are required".into(),
+            "model id, optional bounded model family, and non-zero context window are required"
+                .into(),
         ));
     }
     if c.models.iter().any(|model| {
@@ -425,7 +429,7 @@ pub(super) fn capabilities_for(options: &RuntimeOptions) -> RuntimeCapabilities 
         host_requirement: None,
     });
     descriptors.push(crate::CapabilityDescriptor {
-        namespace: "x.ai/models/list".into(),
+        namespace: xai_grok_shell::cli_models::MODELS_LIST_METHOD.into(),
         enabled: true,
         disabled_reason: None,
         effect_class: "read".into(),

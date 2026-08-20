@@ -2,6 +2,7 @@
 // Licensed under the Apache License, Version 2.0.
 
 use crate::*;
+use xai_grok_shell::extensions::mcp::mcp_methods;
 
 fn validate_non_ui_responses(
     input: &McpInputRequired,
@@ -48,7 +49,7 @@ impl Runtime {
     ) -> Result<Vec<McpServerSummary>, Error> {
         let value = self
             .mcp_ext(
-                "x.ai/mcp/list",
+                mcp_methods::LIST,
                 serde_json::json!({
                     "sessionId": id.as_str(),
                     "cache": !refresh,
@@ -83,7 +84,7 @@ impl Runtime {
         tool: &str,
         arguments: serde_json::Value,
     ) -> Result<McpToolResult, Error> {
-        let v = self.mcp_ext("x.ai/mcp/call", serde_json::json!({"sessionId":id.as_str(),"server":server,"tool":tool,"arguments":arguments})).await?;
+        let v = self.mcp_ext(xai_grok_mcp::wire::MCP_CALL, serde_json::json!({"sessionId":id.as_str(),"server":server,"tool":tool,"arguments":arguments})).await?;
         parse_tool_result(v)
     }
     /// Checks liveness of one initialized MCP server using the protocol ping.
@@ -155,7 +156,7 @@ impl Runtime {
     ) -> Result<McpReadResourceResult, Error> {
         let v = self
             .mcp_ext(
-                "x.ai/mcp/read_resource",
+                mcp_methods::READ_RESOURCE,
                 serde_json::json!({"sessionId":id.as_str(),"server":server,"uri":uri}),
             )
             .await?;
@@ -197,7 +198,7 @@ impl Runtime {
     ) -> Result<McpResources, Error> {
         let value = self
             .mcp_ext(
-                "x.ai/mcp/resources/list",
+                mcp_methods::LIST_RESOURCES,
                 serde_json::json!({"sessionId": id.as_str(), "server": server}),
             )
             .await?;
@@ -235,7 +236,7 @@ impl Runtime {
     ) -> Result<Vec<McpPromptInfo>, Error> {
         let value = self
             .mcp_ext(
-                "x.ai/mcp/prompts/list",
+                mcp_methods::LIST_PROMPTS,
                 serde_json::json!({"sessionId": id.as_str(), "server": server}),
             )
             .await?;
@@ -258,7 +259,7 @@ impl Runtime {
         name: &str,
         arguments: Option<serde_json::Map<String, serde_json::Value>>,
     ) -> Result<McpPromptResult, Error> {
-        let raw = self.mcp_ext("x.ai/mcp/prompts/get", serde_json::json!({"sessionId": id.as_str(), "server": server, "name": name, "arguments": arguments})).await?;
+        let raw = self.mcp_ext(mcp_methods::GET_PROMPT, serde_json::json!({"sessionId": id.as_str(), "server": server, "name": name, "arguments": arguments})).await?;
         Ok(McpPromptResult { raw })
     }
     /// Executes exactly one MCP 2026 prompts/get round.
@@ -590,7 +591,7 @@ impl Runtime {
                 "MCP completion reference must be 'prompt' or 'resource'".into(),
             ));
         }
-        let raw = self.mcp_ext("x.ai/mcp/complete", serde_json::json!({"sessionId": id.as_str(), "server": server, "reference": reference, "target": target, "argument": argument, "value": value, "context": context})).await?;
+        let raw = self.mcp_ext(mcp_methods::COMPLETE, serde_json::json!({"sessionId": id.as_str(), "server": server, "reference": reference, "target": target, "argument": argument, "value": value, "context": context})).await?;
         Ok(McpCompletionResult {
             values: raw["values"]
                 .as_array()
@@ -607,7 +608,7 @@ impl Runtime {
     pub async fn mcp_auth_status(&self, id: &SessionId) -> Result<Vec<McpAuthStatus>, Error> {
         let v = self
             .mcp_ext(
-                "x.ai/mcp/auth_status",
+                mcp_methods::AUTH_STATUS,
                 serde_json::json!({"session_id":id.as_str()}),
             )
             .await?;
@@ -630,7 +631,7 @@ impl Runtime {
     ) -> Result<McpAuthStatus, Error> {
         let v = self
             .mcp_ext(
-                "x.ai/mcp/auth_trigger",
+                mcp_methods::AUTH_TRIGGER,
                 serde_json::json!({"session_id":id.as_str(),"server_name":server}),
             )
             .await?;
@@ -647,7 +648,7 @@ impl Runtime {
         server: &str,
         enabled: bool,
     ) -> Result<(), Error> {
-        self.mcp_ext("x.ai/mcp/toggle",serde_json::json!({"session_id":id.as_str(),"server_name":server,"enabled":enabled,"session_local":true})).await.map(drop)
+        self.mcp_ext(mcp_methods::TOGGLE,serde_json::json!({"session_id":id.as_str(),"server_name":server,"enabled":enabled,"session_local":true})).await.map(drop)
     }
     /// Changes tool state only in this session.
     pub async fn set_mcp_tool_enabled(
@@ -657,7 +658,7 @@ impl Runtime {
         tool: &str,
         enabled: bool,
     ) -> Result<(), Error> {
-        self.mcp_ext("x.ai/mcp/toggle_tool",serde_json::json!({"session_id":id.as_str(),"server_name":server,"tool_name":tool,"enabled":enabled,"session_local":true})).await.map(drop)
+        self.mcp_ext(mcp_methods::TOGGLE_TOOL,serde_json::json!({"session_id":id.as_str(),"server_name":server,"tool_name":tool,"enabled":enabled,"session_local":true})).await.map(drop)
     }
     /// Atomically replaces the session's client-provided MCP server set. The
     /// receipt contains names only and never echoes transport credentials.
@@ -668,11 +669,7 @@ impl Runtime {
     ) -> Result<McpServerReplacementReceipt, Error> {
         let names = servers
             .iter()
-            .map(|s| match s {
-                McpServerConfig::Stdio { name, .. }
-                | McpServerConfig::Http { name, .. }
-                | McpServerConfig::Sse { name, .. } => name.clone(),
-            })
+            .map(|server| server.name().to_owned())
             .collect::<Vec<_>>();
         self.inner.replace_mcp_servers(id, servers).await?;
         Ok(McpServerReplacementReceipt {

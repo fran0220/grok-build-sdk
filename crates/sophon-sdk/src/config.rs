@@ -705,6 +705,10 @@ pub enum PromptBlock {
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct ModelSpec {
     pub id: String,
+    /// Optional stable family used for discovery metadata and model-switch
+    /// compatibility. It does not change provider routing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_family: Option<String>,
     pub context_window: u64,
     pub api_backend: ApiBackend,
     pub supports_reasoning: bool,

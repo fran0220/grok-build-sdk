@@ -29,6 +29,7 @@ async fn fixed_model_catalog_is_typed_and_available_in_restricted_profile() {
         metadata.get("agentType"),
         Some(&serde_json::json!("grok-build"))
     );
+    assert_eq!(metadata.get("modelFamily"), Some(&serde_json::json!("xai")));
     assert!(runtime.capabilities().features.iter().any(|capability| {
         capability.namespace == "x.ai/models/list"
             && capability.enabled
@@ -466,6 +467,7 @@ async fn session_replay_probe_snapshots_binding_route_journal_ledger_and_residen
     config.models = vec![
         ModelSpec {
             id: "default-route".into(),
+            model_family: None,
             context_window: 131_072,
             api_backend: ApiBackend::ChatCompletions,
             supports_reasoning: true,
@@ -474,6 +476,7 @@ async fn session_replay_probe_snapshots_binding_route_journal_ledger_and_residen
         },
         ModelSpec {
             id: "updated-route".into(),
+            model_family: None,
             context_window: 131_072,
             api_backend: ApiBackend::ChatCompletions,
             supports_reasoning: true,
@@ -625,6 +628,7 @@ async fn route_changes_preserve_the_prompt_and_existing_conversation() {
     config.models = vec![
         ModelSpec {
             id: "fast-route".into(),
+            model_family: None,
             context_window: 131_072,
             api_backend: ApiBackend::ChatCompletions,
             supports_reasoning: true,
@@ -633,6 +637,7 @@ async fn route_changes_preserve_the_prompt_and_existing_conversation() {
         },
         ModelSpec {
             id: "advanced-route".into(),
+            model_family: None,
             context_window: 131_072,
             api_backend: ApiBackend::ChatCompletions,
             supports_reasoning: true,

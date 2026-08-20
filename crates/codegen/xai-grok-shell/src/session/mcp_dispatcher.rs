@@ -56,7 +56,7 @@ pub(crate) const COALESCE_WINDOW: Duration = Duration::from_millis(50);
 
 /// Method name for the ACP push.
 pub const SERVER_STATUS_METHOD: &str = "x.ai/mcp/server_status";
-pub(crate) const TASK_STATUS_METHOD: &str = "x.ai/mcp/task_status";
+pub const TASK_STATUS_METHOD: &str = "x.ai/mcp/task_status";
 
 /// JSON payload pushed over ACP. Fields written in camelCase per ACP
 /// convention.
@@ -99,6 +99,7 @@ pub enum McpServerStatus {
     /// disabled/unconfigured.
     Unavailable,
     /// OAuth required but not yet acquired.
+    #[serde(alias = "needs_auth")]
     NeedsAuth,
 }
 

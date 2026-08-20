@@ -50,6 +50,10 @@ pub struct McpToolInfo {
     pub name: String,
     pub display_name: Option<String>,
     pub description: Option<String>,
+    /// Bounded protocol icons already filtered by the native MCP ingest
+    /// policy. No transport or authentication data is included.
+    #[serde(default)]
+    pub icons: Vec<McpIcon>,
     pub enabled: bool,
     #[serde(default)]
     pub meta: serde_json::Value,
@@ -60,6 +64,13 @@ pub struct McpToolInfo {
 pub struct McpServerSummary {
     pub name: String,
     pub display_name: Option<String>,
+    /// Human-readable ownership such as `plugin: example`, when supplied by
+    /// the native catalog. Setup values and transport configuration remain
+    /// redacted.
+    pub source_label: Option<String>,
+    /// Bounded server icons from MCP discovery.
+    #[serde(default)]
+    pub icons: Vec<McpIcon>,
     pub source: McpServerSource,
     pub transport: McpTransportKind,
     pub enabled: bool,

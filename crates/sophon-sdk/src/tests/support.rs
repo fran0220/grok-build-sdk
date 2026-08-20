@@ -8,6 +8,7 @@ pub(super) fn runtime_config(root: &TempDir, endpoint: String) -> RuntimeConfig 
         session_storage: root.path().join("sessions"),
         models: vec![ModelSpec {
             id: "test-model".into(),
+            model_family: Some("xai".into()),
             context_window: 131_072,
             api_backend: ApiBackend::ChatCompletions,
             supports_reasoning: false,

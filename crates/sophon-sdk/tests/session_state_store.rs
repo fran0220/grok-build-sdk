@@ -51,6 +51,7 @@ fn runtime_builder_accepts_host_session_state_authority() {
         session_storage: "/tmp/sophon-sdk-contract-sessions".into(),
         models: vec![ModelSpec {
             id: "contract-model".into(),
+            model_family: None,
             context_window: 1024,
             api_backend: ApiBackend::ChatCompletions,
             supports_reasoning: false,

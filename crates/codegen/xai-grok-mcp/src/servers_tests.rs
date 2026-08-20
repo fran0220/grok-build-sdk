@@ -3642,6 +3642,36 @@ fn mcp_icon_from_rmcp_caps_mime_type_and_sizes() {
 }
 
 #[test]
+fn mcp_icon_wire_sanitization_uses_the_discovery_policy() {
+    let icons = vec![
+        McpIcon {
+            src: " http://insecure.example/icon.png ".to_string(),
+            mime_type: None,
+            sizes: None,
+            theme: None,
+        },
+        McpIcon {
+            src: " https://example.com/icon.png ".to_string(),
+            mime_type: Some(" image/png ".to_string()),
+            sizes: Some(vec![
+                " 48x48 ".to_string(),
+                "x".repeat(MAX_MCP_ICON_SIZE_TOKEN_BYTES + 1),
+            ]),
+            theme: Some(McpIconTheme::Dark),
+        },
+    ];
+    let sanitized = McpIcon::sanitized_list(icons);
+    assert_eq!(sanitized.len(), 1);
+    assert_eq!(sanitized[0].src, "https://example.com/icon.png");
+    assert_eq!(sanitized[0].mime_type.as_deref(), Some("image/png"));
+    assert_eq!(
+        sanitized[0].sizes.as_deref(),
+        Some(&["48x48".to_string()][..])
+    );
+    assert_eq!(sanitized[0].theme, Some(McpIconTheme::Dark));
+}
+
+#[test]
 fn record_tool_icons_insert_empty_removes() {
     let mut state = McpState::new(vec![]);
     let name = "server__tool".to_string();
