@@ -9,10 +9,15 @@
 //! so the two facts a transcript needs are read here against the runtime's
 //! typed output instead of by field-name archaeology in every Host.
 //!
-//! Both accessors answer only for the shapes the runtime reports
+//! Both readings answer only for the shapes the runtime reports
 //! structurally, and return `None` for everything else, including output this
 //! version of the SDK does not model. An absent answer means "not reported",
 //! never "nothing happened" — a caller draws no number rather than a zero.
+//!
+//! They are free functions over the output itself, with the [`ToolEvent`]
+//! methods as the convenience: a Host that carried a call's output through
+//! its own storage holds that JSON and not the event it arrived on, and must
+//! not have to rebuild an event to read it back.
 
 use crate::*;
 use xai_grok_tools::types::output::{SearchReplaceOutput, ToolOutput};
@@ -34,60 +39,69 @@ impl ToolEditStat {
     }
 }
 
-impl ToolEvent {
-    /// Lines added and removed, summed over every edit the call applied.
-    ///
-    /// Answers for a call that settled as an applied search/replace edit and
-    /// carried its per-edit details — the shape the runtime's edit tools
-    /// report. A call of another kind, one that failed, and one that applied
-    /// without details all answer `None`.
-    pub fn edit_stat(&self) -> Option<ToolEditStat> {
-        let ToolOutput::SearchReplace(SearchReplaceOutput::EditsApplied(applied)) =
-            parsed_output(self.raw_output.as_deref()?)?
-        else {
-            return None;
-        };
-        if applied.edits.details.is_empty() {
-            return None;
-        }
-        let mut stat = ToolEditStat::default();
-        for detail in &applied.edits.details {
-            // Both sides empty with context around them is a blank line going
-            // in: the file grew by a line that neither string spells. Without
-            // context it is an empty file written empty, which changed no
-            // lines and must not be counted as one.
-            if detail.old_string.is_empty() && detail.new_string.is_empty() {
-                if !detail.context_before.is_empty() || !detail.context_after.is_empty() {
-                    stat.added += 1;
-                }
-                continue;
+/// Lines added and removed, summed over every edit one call applied.
+///
+/// Answers for a call that settled as an applied search/replace edit and
+/// carried its per-edit details — the shape the runtime's edit tools report.
+/// Output of another kind, a failed edit, and an edit applied without details
+/// all answer `None`.
+pub fn tool_edit_stat(raw_output: &str) -> Option<ToolEditStat> {
+    let ToolOutput::SearchReplace(SearchReplaceOutput::EditsApplied(applied)) =
+        parsed_output(raw_output)?
+    else {
+        return None;
+    };
+    if applied.edits.details.is_empty() {
+        return None;
+    }
+    let mut stat = ToolEditStat::default();
+    for detail in &applied.edits.details {
+        // Both sides empty with context around them is a blank line going in:
+        // the file grew by a line that neither string spells. Without context
+        // it is an empty file written empty, which changed no lines and must
+        // not be counted as one.
+        if detail.old_string.is_empty() && detail.new_string.is_empty() {
+            if !detail.context_before.is_empty() || !detail.context_after.is_empty() {
+                stat.added += 1;
             }
-            stat.removed += line_count(&detail.old_string);
-            stat.added += line_count(&detail.new_string);
+            continue;
         }
-        Some(stat)
+        stat.removed += line_count(&detail.old_string);
+        stat.added += line_count(&detail.new_string);
+    }
+    Some(stat)
+}
+
+/// The text one call produced, when it produced text.
+///
+/// A command answers with what it printed, preferring the runtime's
+/// ANSI-stripped rendering and falling back to the raw bytes it captured; a
+/// tool whose whole result is preformatted text answers with that text.
+/// Everything else answers `None`, and so does a call that printed nothing.
+pub fn tool_output_text(raw_output: &str) -> Option<String> {
+    let text = match parsed_output(raw_output)? {
+        ToolOutput::Bash(bash) => {
+            if bash.output_for_prompt.is_empty() {
+                String::from_utf8_lossy(&bash.output).into_owned()
+            } else {
+                bash.output_for_prompt
+            }
+        }
+        ToolOutput::Text(text) => text.text,
+        _ => return None,
+    };
+    (!text.is_empty()).then_some(text)
+}
+
+impl ToolEvent {
+    /// [`tool_edit_stat`] over this event's own output.
+    pub fn edit_stat(&self) -> Option<ToolEditStat> {
+        tool_edit_stat(self.raw_output.as_deref()?)
     }
 
-    /// The text the call produced, when it produced text.
-    ///
-    /// A command answers with what it printed, preferring the runtime's
-    /// ANSI-stripped rendering and falling back to the raw bytes it captured;
-    /// a tool whose whole result is preformatted text answers with that text.
-    /// Everything else answers `None`, and so does a call that printed
-    /// nothing.
+    /// [`tool_output_text`] over this event's own output.
     pub fn output_text(&self) -> Option<String> {
-        let text = match parsed_output(self.raw_output.as_deref()?)? {
-            ToolOutput::Bash(bash) => {
-                if bash.output_for_prompt.is_empty() {
-                    String::from_utf8_lossy(&bash.output).into_owned()
-                } else {
-                    bash.output_for_prompt
-                }
-            }
-            ToolOutput::Text(text) => text.text,
-            _ => return None,
-        };
-        (!text.is_empty()).then_some(text)
+        tool_output_text(self.raw_output.as_deref()?)
     }
 }
 
@@ -237,6 +251,24 @@ mod tests {
             event(Some(edits(vec![detail("a", "b", false)]))).output_text(),
             None
         );
+    }
+
+    #[test]
+    fn output_carried_through_a_hosts_own_storage_reads_back_without_its_event() {
+        let stored = serde_json::to_string(&edits(vec![detail("a\nb\n", "c\n", false)]))
+            .expect("the runtime output encodes");
+        assert_eq!(
+            tool_edit_stat(&stored),
+            Some(ToolEditStat {
+                added: 1,
+                removed: 2
+            })
+        );
+        let printed =
+            serde_json::to_string(&bash("done\n", "done\n")).expect("the runtime output encodes");
+        assert_eq!(tool_output_text(&printed), Some("done\n".to_owned()));
+        assert_eq!(tool_edit_stat("not json at all"), None);
+        assert_eq!(tool_output_text("not json at all"), None);
     }
 
     #[test]
