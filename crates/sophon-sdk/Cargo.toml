@@ -30,6 +30,7 @@ uuid = { workspace = true }
 xai-agent-lifecycle = { workspace = true }
 xai-grok-mcp = { workspace = true }
 xai-grok-shell = { workspace = true }
+xai-grok-tools = { workspace = true }
 
 # Only used by `OsLivenessProbe`, which asks whether a recorded pid still names
 # a live process. There is no portable std equivalent.
